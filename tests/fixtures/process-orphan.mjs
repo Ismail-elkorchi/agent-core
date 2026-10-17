@@ -17,7 +17,6 @@ const manager = new LocalCommandExecution({
 });
 const plan = await manager.plan({
   command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('setInterval(()=>{},1000)')}`,
-  mode: 'background',
   rootedDirectory: '.',
   pty: false,
   timeoutMs: 60_000,

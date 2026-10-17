@@ -209,7 +209,6 @@ test('terminal-state recovery rejects missing, malformed, stale, unauthenticated
 function request(rootedDirectory, source, overrides = {}) {
   return {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(source)}`,
-    mode: 'background',
     rootedDirectory,
     pty: false,
     timeoutMs: 5_000,

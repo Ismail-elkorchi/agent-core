@@ -55,7 +55,7 @@ export const writeStdinTool = defineTool({
         inputChanged = true;
       }
       const result = await executor.query(
-        input.processId, input.outputTokenBudget, input.yieldMs, input.afterCursor, owner
+        input.processId, input.outputTokenBudget, input.yieldMs, input.afterCursor, owner, context.observationSignal
       );
       return processObservation(result);
     } catch (error) {

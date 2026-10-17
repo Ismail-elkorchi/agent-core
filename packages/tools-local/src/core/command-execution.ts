@@ -87,7 +87,6 @@ interface QueuedProgress {
 interface ManagedProcess {
   readonly id: string;
   readonly command: string;
-  readonly mode: CommandExecutionPlanRequest['mode'];
   readonly owner: CommandExecutionOwner;
   readonly rootPath: string;
   readonly tree: SupervisedProcessTree;
@@ -263,6 +262,7 @@ export class LocalCommandExecution implements CommandExecution {
     workingDirectory: string
   ): Promise<CommandStartResult> {
     await this.ready;
+    options.signal?.throwIfAborted();
     if (this.reconciliation.unresolved.length > 0)
       return { kind: 'not_started', diagnostic: 'Process lifetime is unresolved for this command authority. Inspect Processes and reconcile the blocking records before starting a command.' };
     if (this.active.size >= this.limits.maxActiveProcesses)
@@ -301,7 +301,6 @@ export class LocalCommandExecution implements CommandExecution {
     const record: ManagedProcess = {
       id,
       command: request.command,
-      mode: request.mode,
       owner: request.owner,
       rootPath: this.options.rootedFileAuthority.identity.canonicalPath,
       tree,
@@ -328,7 +327,7 @@ export class LocalCommandExecution implements CommandExecution {
       startupComplete: false,
       startupFailed: false,
       ...(options.onProgress ? { onProgress: options.onProgress } : {}),
-      ...(options.lease && request.mode === 'foreground' ? { lease: options.lease } : {})
+      ...(options.lease ? { lease: options.lease } : {})
     };
     this.active.set(id, record);
     this.reservedCapturedBytes += this.options.maxCapturedBytes;
@@ -358,6 +357,7 @@ export class LocalCommandExecution implements CommandExecution {
       await this.options.onSupervisorCheckpoint?.('supervisor_ready', id);
       await this.persistLedger(this.runningLedgerEntry(record, osPid));
       await this.options.onSupervisorCheckpoint?.('ledger_persisted', id);
+      options.lease?.transferToResource(id, processScope(id));
       await tree.release();
       await this.options.onSupervisorCheckpoint?.('released', id);
       record.startupComplete = true;
@@ -368,6 +368,7 @@ export class LocalCommandExecution implements CommandExecution {
       this.reservedCapturedBytes -= this.options.maxCapturedBytes;
       tree.stop('SIGKILL');
       await tree.settle();
+      options.lease?.release();
       await this.removeSupervisorFiles(id);
       throw error;
     }
@@ -408,14 +409,7 @@ export class LocalCommandExecution implements CommandExecution {
       options.signal.addEventListener('abort', record.abortListener, { once: true });
       if (options.signal.aborted) record.abortListener();
     }
-    if (request.mode === 'foreground') {
-      await tree.settle();
-      await this.finish(record);
-      return { kind: 'started', result: await this.query(id, request.outputTokenBudget, 0, 0, request.owner) };
-    }
-    await this.waitForActivity(record, request.yieldMs, 0);
-    // Supervision owns the admitted background lifetime; its startup lease is finished.
-    options.lease?.release();
+    await this.waitForActivity(record, request.yieldMs, 0, options.observationSignal);
     return { kind: 'started', result: await this.query(id, request.outputTokenBudget, 0, 0, request.owner) };
   }
 
@@ -424,7 +418,8 @@ export class LocalCommandExecution implements CommandExecution {
     outputTokenBudget: number,
     yieldMs = 0,
     afterCursor = 0,
-    requester?: CommandExecutionOwner
+    requester?: CommandExecutionOwner,
+    observationSignal?: AbortSignal
   ): Promise<CommandExecutionResult> {
     if (!Number.isSafeInteger(outputTokenBudget) || outputTokenBudget < 0)
       throw new RangeError('Output budget must be a nonnegative safe integer.');
@@ -448,7 +443,7 @@ export class LocalCommandExecution implements CommandExecution {
     if (!Number.isSafeInteger(afterCursor) || afterCursor < 0 || afterCursor > record.cursor)
       throw new CommandProcessOperationRejectedError(processId, 'invalid_cursor');
     if (record.status === 'running' && record.cursor === afterCursor && yieldMs > 0)
-      await this.waitForActivity(record, yieldMs, afterCursor);
+      await this.waitForActivity(record, yieldMs, afterCursor, observationSignal);
     const cursorExpired = afterCursor < record.oldestCursor;
     const useCapture = cursorExpired && afterCursor === 0;
     const effectiveCursor = useCapture ? 0 : cursorExpired ? record.oldestCursor : afterCursor;
@@ -541,7 +536,8 @@ export class LocalCommandExecution implements CommandExecution {
 
   async terminate(
     processId: string,
-    requester?: CommandExecutionOwner
+    requester?: CommandExecutionOwner,
+    observationSignal?: AbortSignal
   ): Promise<CommandExecutionResult> {
     await this.ready;
     if (!this.active.has(processId) && !this.completed.has(processId))
@@ -557,8 +553,7 @@ export class LocalCommandExecution implements CommandExecution {
         });
       this.requestTermination(record, 'stopped');
     }
-    await record.tree.settle();
-    await this.finish(record);
+    await this.waitForTermination(record, observationSignal);
     return this.query(processId, 4_000, 0, 0, requester);
   }
 
@@ -994,19 +989,37 @@ export class LocalCommandExecution implements CommandExecution {
   private waitForActivity(
     record: ManagedProcess,
     yieldMs: number,
-    afterCursor: number
+    afterCursor: number,
+    observationSignal?: AbortSignal
   ): Promise<void> {
-    if (yieldMs <= 0 || record.status !== 'running' || record.cursor > afterCursor)
+    if (observationSignal?.aborted || yieldMs <= 0 || record.status !== 'running' || record.cursor > afterCursor)
       return Promise.resolve();
     return new Promise((resolve) => {
       const finish = () => {
         clearTimeout(timer);
         record.activityWaiters.delete(finish);
+        observationSignal?.removeEventListener('abort', finish);
         resolve();
       };
       const timer = setTimeout(finish, yieldMs);
       record.activityWaiters.add(finish);
+      observationSignal?.addEventListener('abort', finish, { once: true });
+      if (observationSignal?.aborted) finish();
     });
+  }
+
+  private async waitForTermination(record: ManagedProcess, observationSignal?: AbortSignal): Promise<void> {
+    const settlement = record.tree.settle().then(() => this.finish(record));
+    if (!observationSignal) { await settlement; return; }
+    let remove = (): void => undefined;
+    const yielded = new Promise<void>((resolve) => {
+      const finish = () => { resolve(); };
+      observationSignal.addEventListener('abort', finish, { once: true });
+      remove = () => { observationSignal.removeEventListener('abort', finish); };
+      if (observationSignal.aborted) finish();
+    });
+    try { await Promise.race([settlement, yielded]); }
+    finally { remove(); }
   }
 
   private signalActivity(record: ManagedProcess): void {
@@ -1015,9 +1028,8 @@ export class LocalCommandExecution implements CommandExecution {
 
   private runningLedgerEntry(record: ManagedProcess, osPid: number): ProcessLedgerEntry {
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       processId: record.id,
-      mode: record.mode,
       supervisorPid: osPid,
       supervisorIdentity: record.tree.supervision.identity,
       supervisorEndpoint: record.tree.supervision.endpoint,
@@ -1096,16 +1108,12 @@ export class LocalCommandExecution implements CommandExecution {
         }));
         this.recovered.delete(processId);
         this.recoveredEntries.delete(processId);
-        if (entry?.mode === 'background') {
-          this.resourceLeases.releaseResource(processId);
-        } else {
-          this.resourceLeases.restoreResource(processId, {
-            accesses: [{ mode: 'execute', scope: processScope() }],
-            lockScopes: ['files'],
-            recovery: { kind: 'unknown' }
-          }, processScope(processId));
-          this.resourceLeases.failResource(processId, new Error(`Process lifetime needs reconciliation: ${diagnostic}`));
-        }
+        this.resourceLeases.restoreResource(processId, {
+          accesses: [{ mode: 'execute', scope: processScope() }],
+          lockScopes: ['files'],
+          recovery: { kind: 'unknown' }
+        }, processScope(processId));
+        this.resourceLeases.failResource(processId, new Error(`Process lifetime needs reconciliation: ${diagnostic}`));
       }
     }
     return Object.freeze({ resolved: Object.freeze(resolved), unresolved: Object.freeze(unresolved) });

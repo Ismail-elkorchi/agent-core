@@ -31,6 +31,8 @@ export class ToolInputError extends Error {
 export interface ToolExecutionContext {
   policy: ToolPolicy;
   signal?: AbortSignal;
+  /** Runtime-owned request to yield observation promptly without cancelling the resource. */
+  observationSignal?: AbortSignal;
   services?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   invocation?: ToolInvocationContext;

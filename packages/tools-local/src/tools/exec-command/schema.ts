@@ -13,11 +13,11 @@ export function execCommandSchema(ptySupported: boolean) {
         'Directory relative to the workspace root. Use "." for the root; absolute paths are not accepted.'
       ),
     ...(ptySupported ? { pty: z.boolean().default(false) } : {}),
-    background: z.boolean().default(false).describe(
-      'Return a process handle only when the task requires interactive input or work while this command remains active. Otherwise wait for exit or timeout.'
+    yieldMs: z.int().min(0).default(1_000).describe(
+      'Observation wait limit; returns on fresh output, termination, steering, or this limit. A running result includes the process handle for later control.'
     ),
     timeoutMs: z.int().min(1).default(60_000).describe(
-      'Maximum process lifetime, including background execution. The runtime enforces its limits and returns the effective deadline for an active process.'
+      'Maximum process lifetime, independent of observation waits. The runtime enforces its limits and returns the effective deadline for an active process.'
     ),
     outputTokenBudget: z.int().min(64).default(4_000).describe('Approximate output bound. Large results may be excerpts or pages; returned coverage and inline gaps identify omissions.')
   });

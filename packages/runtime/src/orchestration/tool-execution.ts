@@ -13,6 +13,7 @@ import {
   releaseToolCallPlan,
   releaseToolInvocation,
   runtimeErrorObservation,
+  resourceBlockedObservation,
   updateToolObservation,
   startToolCallPlan,
   type CompiledToolDefinition,
@@ -500,9 +501,11 @@ async function startCall(
     } catch (error) {
       if (input.toolContext.signal.aborted) throw error;
       // No invocation has started: a failed resource admission cannot have executed the tool.
-      const observation = updateToolObservation(runtimeErrorObservation(call.name, error), {
-        execution: { state: 'not_started' }
-      });
+      const observation = error instanceof ResourceAdmissionYield
+        ? resourceBlockedObservation(call.name, error.blocker, error.waitMs, error.blockingResourceIds)
+        : updateToolObservation(runtimeErrorObservation(call.name, error), {
+            execution: { state: 'not_started' }
+          });
       const committed = await commitObservation(input, phase, call, plan, observation);
       const settled: AgentToolCallState = Object.freeze({
         stage: 'settled', plan: callState.plan, toolAttempt: callState.toolAttempt,
@@ -820,6 +823,12 @@ async function authorize(input: ToolExecutionInput, plan: ToolCallPlan) {
   );
 }
 
+class ResourceAdmissionYield extends Error {
+  constructor(readonly blocker: 'steering' | 'timeout', readonly waitMs: number, readonly blockingResourceIds: readonly string[]) {
+    super(`Resource admission yielded: ${blocker}.`);
+  }
+}
+
 async function acquireLease(
   input: ToolExecutionInput,
   phase: AgentToolPhase,
@@ -827,23 +836,43 @@ async function acquireLease(
   call: ToolCall,
   state: Extract<AgentToolCallState, { readonly stage: 'effect_ready' }>
 ) {
-  if (input.resourceLeases?.wouldWait(state.plan.effects)) {
+  const coordinator = input.resourceLeases;
+  if (!coordinator) return undefined;
+  const owner = `${input.runId}:${phase.toolBatchId}:${String(callIndex)}`;
+  // Freely available operations, notably exact resource controls, remain dispatchable.
+  if (!coordinator.wouldWait(state.plan.effects))
+    return coordinator.acquire(state.plan.effects, owner, input.toolContext.signal);
+  const startedAt = performance.now();
+  const waiting = new AbortController();
+  const observationSignal = input.toolContext.observationSignal;
+  const yieldToSteering = () => {
+    waiting.abort(new ResourceAdmissionYield('steering', performance.now() - startedAt, coordinator.blockingResourceIds(state.plan.effects)));
+  };
+  const cancel = () => { waiting.abort(input.toolContext.signal.reason); };
+  observationSignal?.addEventListener('abort', yieldToSteering, { once: true });
+  input.toolContext.signal.addEventListener('abort', cancel, { once: true });
+  const timer = setTimeout(() => {
+    waiting.abort(new ResourceAdmissionYield('timeout', performance.now() - startedAt, coordinator.blockingResourceIds(state.plan.effects)));
+  }, 1000);
+  try {
+    if (input.toolContext.signal.aborted) cancel();
+    else if (observationSignal?.aborted) yieldToSteering();
     await input.emit({
       type: 'tool.updated',
       ...attemptIdentity(phase, callIndex, call, state.toolAttempt),
       toolName: call.name,
       progress: {
-        type: 'status',
-        stage: 'resource_lease_waiting',
+        type: 'status', stage: 'resource_lease_waiting',
         message: 'Waiting for an operation holding conflicting resources.'
       }
     });
+    // Pass cancellation to the coordinator itself so rejected waits cannot acquire later.
+    return await coordinator.acquire(state.plan.effects, owner, waiting.signal);
+  } finally {
+    clearTimeout(timer);
+    observationSignal?.removeEventListener('abort', yieldToSteering);
+    input.toolContext.signal.removeEventListener('abort', cancel);
   }
-  return input.resourceLeases?.acquire(
-    state.plan.effects,
-    `${input.runId}:${phase.toolBatchId}:${String(callIndex)}`,
-    input.toolContext.signal
-  );
 }
 
 async function commitObservation(

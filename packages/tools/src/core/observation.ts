@@ -9,6 +9,7 @@ import type {
   MissingServiceToolFailureOutput,
   PolicyToolFailureOutput,
   RuntimeErrorToolFailureOutput,
+  ResourceBlockedToolFailureOutput,
   ToolCall,
   ToolContent,
   ToolDefinition,
@@ -136,6 +137,24 @@ export function missingServiceObservation(
     ...(Object.keys(ownedDetails).length > 0 ? { details: ownedDetails } : {})
   });
 }
+/** Resource admission ended without starting the requested effect. */
+export function resourceBlockedObservation(
+  toolName: string,
+  blocker: 'steering' | 'timeout',
+  waitMs: number,
+  blockingResourceIds: readonly string[]
+): ToolFailureObservation<ResourceBlockedToolFailureOutput> {
+  if (!Number.isFinite(waitMs) || waitMs < 0) throw new Error('Invalid resource wait duration.');
+  const summary = blocker === 'steering'
+    ? `Tool ${toolName} did not start: resource wait yielded to steering.`
+    : `Tool ${toolName} did not start: conflicting resources remained busy.`;
+  return ownFailureObservation({
+    kind: 'failure', execution: { state: 'not_started' }, summary,
+    scope: failureScope(),
+    output: Object.freeze({ reason: 'resource_blocked', blocker, waitMs, blockingResourceIds })
+  });
+}
+
 export function runtimeErrorObservation(
   toolName: string,
   error: unknown,
@@ -366,6 +385,14 @@ function parseFailureOutput(value: JsonObject): ToolFailureOutput {
         service: value.service,
         ...(jsonObject(value.details) ? { details: value.details } : {})
       });
+    case 'resource_blocked':
+      exactFailure(value, ['reason', 'blocker', 'waitMs', 'blockingResourceIds']);
+      if ((value.blocker !== 'steering' && value.blocker !== 'timeout') ||
+          typeof value.waitMs !== 'number' || !Number.isFinite(value.waitMs) || value.waitMs < 0 ||
+          !Array.isArray(value.blockingResourceIds) || value.blockingResourceIds.length > 8 ||
+          !value.blockingResourceIds.every((id): id is string => typeof id === 'string' && id.length > 0 && id.length <= 256)) break;
+      return Object.freeze({ reason: 'resource_blocked', blocker: value.blocker, waitMs: value.waitMs,
+        blockingResourceIds: Object.freeze([...value.blockingResourceIds]) });
     case 'runtime_error':
       exactFailure(value, ['reason', 'error', 'details']);
       if (
@@ -638,6 +665,9 @@ export function encodeToolFailureOutput(output: ToolFailureOutput): JsonObject {
     });
   if (output.reason === 'invalid_output')
     return Object.freeze({ ...common, issues: encodeValidationIssues(output.issues) });
+  if (output.reason === 'resource_blocked')
+    return Object.freeze({ ...common, blocker: output.blocker, waitMs: output.waitMs,
+      blockingResourceIds: [...output.blockingResourceIds] });
   if (output.reason === 'missing_service')
     return Object.freeze({
       ...common,

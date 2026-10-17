@@ -27,7 +27,7 @@ import {
 } from '@agent-core/tools-local';
 import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
 import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
-import { isCommandExecution, planToolCall, releaseToolCallPlan, renderCommandOutput } from '@agent-core/tools';
+import { CommandProcessOperationRejectedError, isCommandExecution, planToolCall, releaseToolCallPlan, renderCommandOutput } from '@agent-core/tools';
 
 const tools = [execCommandTool, writeStdinTool, stopProcessTool];
 const policy = { allowedRisks: ['read', 'execute'] };
@@ -46,6 +46,30 @@ async function startCommand(execution, request, options = {}) {
   const started = await execution.start(plan, options);
   assert.equal(started.kind, 'started', started.diagnostic);
   return started.result;
+}
+
+async function settledCommandResult(execution, result, budget = 4_000) {
+  while (result.status === 'running')
+    result = await execution.query(result.processId, budget, 100, result.cursorEnd);
+  return execution.query(result.processId, budget, 0, 0);
+}
+
+async function startSettledCommand(execution, request, options = {}) {
+  return settledCommandResult(execution, await startCommand(execution, request, options), request.outputTokenBudget);
+}
+
+async function invokeSettledCommand(call, selectedTools, context) {
+  let result = await invokeToolCall(call, selectedTools, context);
+  if (result.kind !== 'result') return result;
+  while (result.output.status === 'running')
+    result = await invokeToolCall(jsonToolCall('write_stdin', {
+      processId: result.output.processId, afterCursor: result.output.cursorEnd,
+      yieldMs: 100, outputTokenBudget: call.input.value.outputTokenBudget ?? 4_000
+    }), selectedTools, context);
+  return invokeToolCall(jsonToolCall('write_stdin', {
+    processId: result.output.processId, afterCursor: 0, yieldMs: 0,
+    outputTokenBudget: call.input.value.outputTokenBudget ?? 4_000
+  }), selectedTools, context);
 }
 
 async function processContext(options = {}, owner = invocation) {
@@ -181,7 +205,6 @@ test('local process inspection and durable terminal handoff report the owned com
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`;
   let result = await startCommand(execution, {
     command,
-    mode: 'background',
     rootedDirectory: '.',
     pty: false,
     timeoutMs: 5_000,
@@ -228,7 +251,6 @@ test('command execution keeps the admitted physical working directory across a p
   });
   let result = await startCommand(execution, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("require('node:fs').writeFileSync('marker.txt', 'inside')")}`,
-    mode: 'background',
     rootedDirectory: 'work',
     pty: false,
     timeoutMs: 5_000,
@@ -248,7 +270,7 @@ test('persistent processes support polling and stdin without replaying prior out
   const { context, manager } = await processContext();
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('ready\\n'); process.stdin.setEncoding('utf8'); process.stdin.on('data', d => process.stdout.write('echo:' + d)); process.stdin.on('end', () => process.exit(0));")}`;
   const started = await invokeToolCall(
-    jsonToolCall('exec_command', { command, background: true }),
+    jsonToolCall('exec_command', { command }),
     tools,
     context
   );
@@ -286,7 +308,7 @@ test('stop_process terminates an owned process tree without a shell stop command
   const { context } = await processContext();
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("console.log('started'); setInterval(() => {}, 1000)")}`;
   const started = await invokeToolCall(
-    jsonToolCall('exec_command', { command, background: true, timeoutMs: 60_000 }),
+    jsonToolCall('exec_command', { command, timeoutMs: 60_000 }),
     tools,
     context
   );
@@ -300,7 +322,7 @@ test('stop_process terminates an owned process tree without a shell stop command
 
 test('a nonzero command exit is a negative tool result, not a tool failure', async () => {
   const { context } = await processContext();
-  const result = await invokeToolCall(
+  const result = await invokeSettledCommand(
     jsonToolCall('exec_command', {
       command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('process.exit(7)')}`
     }),
@@ -313,7 +335,7 @@ test('a nonzero command exit is a negative tool result, not a tool failure', asy
   assert.equal(result.output.exitCode, 7);
 });
 
-test('foreground commands retain the file lease until exit or timeout without process controls', async (t) => {
+test('commands retain the file lease until exit or timeout', async (t) => {
   const { context, manager, root } = await processContext();
   t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
   const read = { accesses: [{ mode: 'read', scope: 'files/a.txt' }], lockScopes: [] };
@@ -326,7 +348,7 @@ test('foreground commands retain the file lease until exit or timeout without pr
       startupBlocks.push(manager.resourceLeases.wouldWait(read));
     }
   };
-  const completed = await invokeToolCall(
+  const completed = await invokeSettledCommand(
     jsonToolCall('exec_command', {
       command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('first\\n'); setTimeout(() => { process.stdout.write('last\\n'); process.exit(0); }, 150)")}`,
       timeoutMs: 5_000
@@ -339,7 +361,7 @@ test('foreground commands retain the file lease until exit or timeout without pr
   assert.equal(completed.execution.state, 'settled');
   assert.equal(manager.resourceLeases.wouldWait(read), false);
 
-  const timedOut = await invokeToolCall(
+  const timedOut = await invokeSettledCommand(
     jsonToolCall('exec_command', {
       command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('setInterval(() => {}, 1000)')}`,
       timeoutMs: 500
@@ -359,7 +381,7 @@ test('stop_process force-kills descendants that ignore graceful termination', as
     "console.log(process.pid); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)";
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
   const started = await invokeToolCall(
-    jsonToolCall('exec_command', { command, background: true, timeoutMs: 60_000 }),
+    jsonToolCall('exec_command', { command, timeoutMs: 60_000 }),
     tools,
     context
   );
@@ -377,7 +399,7 @@ test('stop_process force-kills descendants that ignore graceful termination', as
 test('bounded output retains the true start and true tail and stores an artifact', async () => {
   const { context, artifacts } = await processContext({ maxCapturedBytes: 160, tailBytes: 64, maxPendingOutputBytes: 160 });
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('START-' + 'x'.repeat(5000) + '-END')")}`;
-  const result = await invokeToolCall(
+  const result = await invokeSettledCommand(
     jsonToolCall('exec_command', { command, outputTokenBudget: 64 }),
     tools,
     context
@@ -415,7 +437,6 @@ test('process polls use stable cursors, preserve split UTF-8, and retain termina
   let started = await invokeToolCall(
     jsonToolCall('exec_command', {
       command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
-      background: true
     }),
     tools,
     context
@@ -455,7 +476,7 @@ test(
     });
     const noisy = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('x'.repeat(5000)); setInterval(()=>{},1000)")}`;
     let first = await invokeToolCall(
-      jsonToolCall('exec_command', { command: noisy, background: true }),
+      jsonToolCall('exec_command', { command: noisy }),
       tools,
       context
     );
@@ -478,7 +499,7 @@ test(
     );
     assert.equal(expired.output.cursorExpired, true);
     const limited = await invokeToolCall(
-      jsonToolCall('exec_command', { command: noisy, background: true }),
+      jsonToolCall('exec_command', { command: noisy }),
       tools,
       context
     );
@@ -501,7 +522,7 @@ test('process ownership and run cleanup cannot affect another run', async () => 
   const { context, manager } = await processContext({}, ownerA);
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify('setInterval(()=>{},1000)')}`;
   const started = await invokeToolCall(
-    jsonToolCall('exec_command', { command, background: true }),
+    jsonToolCall('exec_command', { command }),
     tools,
     context
   );
@@ -533,7 +554,6 @@ test('natural termination is reported once whether or not the process was polled
         : `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`;
     let result = await startCommand(manager, {
       command,
-      mode: 'background',
       rootedDirectory: '.',
       pty: false,
       timeoutMs: 60_000,
@@ -574,7 +594,6 @@ test('terminal records release capture budgets before late acknowledgment', asyn
     };
     let result = await startCommand(manager, {
       command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('x'.repeat(800))")}`,
-      mode: 'background',
       rootedDirectory: '.',
       pty: false,
       timeoutMs: 5_000,
@@ -613,7 +632,6 @@ test('ledger cleanup residue does not change a terminal result and is retried on
   });
   let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`,
-    mode: 'background',
     rootedDirectory: '.',
     pty: false,
     timeoutMs: 5_000,
@@ -648,7 +666,6 @@ test('public process redaction detects a secret split across output chunks', asy
   const script = `process.stdout.write('API_TO'); setTimeout(()=>process.stdout.write('KEN=${secret}'), 20)`;
   let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
-    mode: 'background',
     rootedDirectory: '.',
     pty: false,
     timeoutMs: 5_000,
@@ -677,7 +694,6 @@ test('public process logs preserve large original output without serialization m
   const outputBytes = 4_300_000;
   let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`process.stdout.write('x'.repeat(${String(outputBytes)}))`)}`,
-    mode: 'background',
     rootedDirectory: '.',
     pty: false,
     timeoutMs: 10_000,
@@ -703,7 +719,6 @@ test('process output keeps raw protected bytes internal and exposes only a redac
   const secret = 'super-secret-value';
   let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`process.stdout.write('API_TOKEN=${secret}')`)}`,
-    mode: 'background',
     rootedDirectory: '.',
     pty: false,
     timeoutMs: 60_000,
@@ -749,7 +764,6 @@ test('asynchronous process progress is ordered, bounded, and catches callback fa
       manager,
       {
         command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
-        mode: 'background',
         rootedDirectory: '.',
         pty: false,
         timeoutMs: 60_000,
@@ -830,7 +844,6 @@ test('a terminal poll waits for accepted asynchronous progress delivery', async 
     manager,
     {
       command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`,
-      mode: 'background',
       rootedDirectory: '.',
       pty: false,
       timeoutMs: 5_000,
@@ -869,7 +882,6 @@ test('process ledger restores unreported terminal records across manager restart
   });
   const started = await startCommand(first, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`,
-    mode: 'background',
     rootedDirectory: '.',
     pty: false,
     timeoutMs: 60_000,
@@ -928,8 +940,8 @@ test('startup reconciliation stops an orphaned child process tree and resolves i
   assert((await readdir(ledgerDirectory)).every(name => name.endsWith('.terminal.json')));
 });
 
-for (const mode of ['foreground', 'background', 'incompatible']) {
-  test(`${mode}: unauthenticated reconciliation preserves process uncertainty and the admitted lease scope`, async () => {
+for (const recordKind of ['current', 'incompatible']) {
+  test(`${recordKind}: unauthenticated reconciliation preserves process uncertainty and the admitted lease scope`, async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'agent-core-process-pid-reuse-'));
     const ledgerDirectory = path.join(root, 'processes');
     await mkdir(ledgerDirectory, { recursive: true });
@@ -937,9 +949,8 @@ for (const mode of ['foreground', 'background', 'incompatible']) {
     await writeFile(
       path.join(ledgerDirectory, `${processId}.json`),
       JSON.stringify({
-        schemaVersion: 1,
+        schemaVersion: recordKind === 'incompatible' ? 1 : 2,
         processId,
-        ...(mode === 'incompatible' ? {} : { mode }),
         supervisorPid: process.pid,
         supervisorIdentity: 'supervisor_22222222-2222-4222-8222-222222222222',
         supervisorEndpoint:
@@ -968,20 +979,19 @@ for (const mode of ['foreground', 'background', 'incompatible']) {
     await host.ready();
     const reconciliation = await host.reconciliation();
     assert.equal(reconciliation.unresolved.length, 1);
-    assert.equal(reconciliation.unresolved[0].rootPath, mode === 'incompatible' ? '*' : root);
-    assert.equal(host.commandExecution.resourceLeases.activeCount(), mode === 'background' ? 0 : 1);
+    assert.equal(reconciliation.unresolved[0].rootPath, recordKind === 'incompatible' ? '*' : root);
+    assert.equal(host.commandExecution.resourceLeases.activeCount(), 1);
     assert.equal(
       host.commandExecution.resourceLeases.wouldWait({
         accesses: [{ mode: 'write', scope: 'files/a.txt' }],
         lockScopes: ['files/a.txt'],
         recovery: { kind: 'unknown' }
       }),
-      mode !== 'background'
+      true
     );
     assert.doesNotThrow(() => process.kill(process.pid, 0), 'the reused PID remains untouched');
     const refused = await host.commandExecution.start(await host.commandExecution.plan({
         command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('process.exit(0)')}`,
-        mode: 'background',
         rootedDirectory: '.',
         pty: false,
         timeoutMs: 1_000,
@@ -998,7 +1008,7 @@ for (const mode of ['foreground', 'background', 'incompatible']) {
     assert.equal(refused.kind, 'not_started');
     assert.match(refused.diagnostic, /lifetime is unresolved/u);
 
-    if (mode === 'incompatible') assert.match(reconciliation.unresolved[0].diagnostic, /mode/);
+    if (recordKind === 'incompatible') assert.match(reconciliation.unresolved[0].diagnostic, /schemaVersion|version/);
     await rm(path.join(ledgerDirectory, `${processId}.json`));
     const changed = await host.commandExecution.retryReconciliation();
     assert.equal(changed.unresolved.length, 1, 'missing evidence cannot prove release');
@@ -1008,9 +1018,9 @@ for (const mode of ['foreground', 'background', 'incompatible']) {
     assert.equal(resolved.unresolved.length, 0);
     assert.equal(host.commandExecution.resourceLeases.activeCount(), 0);
     assert.deepEqual((await host.commandExecution.reconcile()).unresolved, []);
-    const next = await startCommand(host.commandExecution, {
-      command: 'printf recovered', mode: 'foreground', rootedDirectory: '.', pty: false,
-      timeoutMs: 5_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation
+    const next = await startSettledCommand(host.commandExecution, {
+      command: 'printf recovered', rootedDirectory: '.', pty: false,
+      timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner: invocation
     });
     assert.equal(next.status, 'exited');
     await host.commandExecution.acknowledgeTerminalReport(next.processId);
@@ -1102,7 +1112,7 @@ test('local host durably hands recovered terminal reports to old runs during sta
 test('output budgets preserve gaps, UTF-8 and empty-view coverage independently of retained capture', async (t) => {
   const { context, manager, root } = await processContext({ maxCapturedBytes: 160, tailBytes: 64, maxPendingOutputBytes: 160 });
   t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
-  const result = await invokeToolCall(jsonToolCall('exec_command', {
+  const result = await invokeSettledCommand(jsonToolCall('exec_command', {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('START-' + '🙂'.repeat(4000) + '-END')")}`,
     outputTokenBudget: 64
   }), tools, context);
@@ -1124,15 +1134,15 @@ test('planning owns an immutable execution request before callers can mutate it'
   const { manager, root } = await processContext();
   t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
   const owner = { ...invocation };
-  const request = { command: 'printf original', mode: 'foreground', rootedDirectory: '.', pty: false,
-    timeoutMs: 5000, yieldMs: 0, outputTokenBudget: 1000, owner };
+  const request = { command: 'printf original', rootedDirectory: '.', pty: false,
+    timeoutMs: 5000, yieldMs: 1_000, outputTokenBudget: 1000, owner };
   const planning = manager.plan(request);
   request.command = 'printf changed';
-  request.mode = 'background';
+  request.yieldMs = 0;
   owner.ownerId = 'changed-owner';
   const started = await manager.start(await planning);
   assert.equal(started.kind, 'started');
-  const result = started.result;
+  const result = await settledCommandResult(manager, started.result);
   assert.equal(result.combined.segments.join(''), 'original');
   assert.equal(result.owner.ownerId, invocation.ownerId);
   assert.equal(Object.hasOwn(result.owner, 'requestAttempt'), false);
@@ -1142,7 +1152,7 @@ test('stream completeness is measured against its own offsets when capture keeps
   const { context, manager, root } = await processContext({ maxCapturedBytes: 160, tailBytes: 64, maxPendingOutputBytes: 160 });
   t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
   const script = "process.stdout.write('A'.repeat(4000)); setTimeout(() => process.stderr.write('B'.repeat(4000)), 100)";
-  const result = await invokeToolCall(jsonToolCall('exec_command', {
+  const result = await invokeSettledCommand(jsonToolCall('exec_command', {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
     outputTokenBudget: 4000
   }), tools, context);
@@ -1159,7 +1169,7 @@ test('redaction precedes output selection and cannot expose a detached credentia
   const { context, manager, artifacts, root } = await processContext({ maxCapturedBytes: 160, tailBytes: 64, maxPendingOutputBytes: 160 });
   t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
   const script = "process.stdout.write('API_TOKEN=' + 'a'.repeat(4000) + 'sensitive-suffix')";
-  const result = await invokeToolCall(jsonToolCall('exec_command', {
+  const result = await invokeSettledCommand(jsonToolCall('exec_command', {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`, outputTokenBudget: 64
   }), tools, context);
   assert.equal(result.kind, 'result', result.summary);
@@ -1179,9 +1189,9 @@ test('authenticated process settlement is independent of incompatible output met
     const first = new LocalCommandExecution(options);
     let second;
     t.after(async () => { await first.close(); await second?.close(); files.close(); await rm(root, { recursive: true, force: true }); });
-    const request = { command: 'printf original', mode: 'foreground', rootedDirectory: '.', pty: false,
-      timeoutMs: 5_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation };
-    const result = await startCommand(first, request);
+    const request = { command: 'printf original', rootedDirectory: '.', pty: false,
+      timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner: invocation };
+    const result = await startSettledCommand(first, request);
     await first.unreportedTerminalProcesses(invocation.ownerId);
     const outputPath = path.join(ledgerDirectory, `${result.processId}.terminal.json`);
     if (output === 'missing') await rm(outputPath);
@@ -1198,7 +1208,7 @@ test('authenticated process settlement is independent of incompatible output met
     assert.equal(report.result.originalOutput.kind, 'unavailable');
     assert.match(report.result.originalOutput.diagnostic, /output/);
     assert.equal(second.resourceLeases.activeCount(), 0);
-    const next = await startCommand(second, { ...request, command: 'printf next' });
+    const next = await startSettledCommand(second, { ...request, command: 'printf next' });
     assert.equal(next.combined.segments.join(''), 'next');
     await second.acknowledgeTerminalReport(report.result.processId);
     await second.acknowledgeTerminalReport(next.processId);
@@ -1212,7 +1222,7 @@ test('retrying recovery leaves a currently managed process running', async (t) =
     rootedFileAuthority: files, ledgerDirectory: path.join(root, 'processes'),
     ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   t.after(async () => { await manager.close(); files.close(); await rm(root, { recursive: true, force: true }); });
-  const running = await startCommand(manager, { command: 'sleep 30', mode: 'background', rootedDirectory: '.', pty: false,
+  const running = await startCommand(manager, { command: 'sleep 30', rootedDirectory: '.', pty: false,
     timeoutMs: 60_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation });
   assert.equal(running.status, 'running');
   assert.deepEqual((await manager.retryReconciliation()).unresolved, []);
@@ -1235,8 +1245,8 @@ test('terminal handoff retries use stable evidence and retain it until durable a
   const first = new LocalCommandExecution(options);
   let second;
   t.after(async () => { await first.close(); await second?.close(); files.close(); await rm(root, { recursive: true, force: true }); });
-  const result = await startCommand(first, { command: 'printf evidence', mode: 'foreground', rootedDirectory: '.', pty: false,
-    timeoutMs: 5_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation });
+  const result = await startSettledCommand(first, { command: 'printf evidence', rootedDirectory: '.', pty: false,
+    timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner: invocation });
   const [original] = await first.unreportedTerminalProcesses(invocation.ownerId);
   assert.deepEqual(await first.unreportedTerminalProcesses(invocation.ownerId), [original]);
   assert.equal(deliveries.length, 1);
@@ -1265,15 +1275,15 @@ test('an output receipt write failure cannot erase a known terminal outcome', as
       await mkdir(blockedPath);
     } });
   t.after(async () => { await manager.close(); files.close(); await rm(root, { recursive: true, force: true }); });
-  const request = { command: 'printf result', mode: 'foreground', rootedDirectory: '.', pty: false,
-    timeoutMs: 5_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation };
-  const result = await startCommand(manager, request);
+  const request = { command: 'printf result', rootedDirectory: '.', pty: false,
+    timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner: invocation };
+  const result = await startSettledCommand(manager, request);
   assert.equal(result.status, 'exited');
   assert.equal(result.exitCode, 0);
   assert.match(result.diagnostic, /terminal record storage failed/);
   const [report] = await manager.disposeOwner(invocation.ownerId);
   assert.equal(report.result.status, 'exited');
-  const next = await startCommand(manager, request);
+  const next = await startSettledCommand(manager, request);
   assert.equal(next.status, 'exited');
   await rm(blockedPath, { recursive: true });
   await manager.acknowledgeTerminalReport(result.processId);
@@ -1292,9 +1302,9 @@ test('acknowledged terminal processes survive buffer expiration and restart with
   const manager = new LocalCommandExecution(options);
   let reopened;
   t.after(async () => { await manager.close(); await reopened?.close(); files.close(); await rm(root, { recursive: true, force: true }); });
-  const request = { command: 'printf original', mode: 'foreground', rootedDirectory: '.', pty: false,
-    timeoutMs: 5_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation };
-  const original = await startCommand(manager, request);
+  const request = { command: 'printf original', rootedDirectory: '.', pty: false,
+    timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner: invocation };
+  const original = await startSettledCommand(manager, request);
   await new Promise(resolve => setTimeout(resolve, 80));
   assert.deepEqual(await manager.unreportedTerminalProcesses(invocation.ownerId), []);
   const terminal = await manager.query(original.processId, 100, 0, original.cursorEnd, invocation);
@@ -1313,7 +1323,7 @@ test('acknowledged terminal processes survive buffer expiration and restart with
   await assert.rejects(manager.query(original.processId, 100, 0, 999, invocation), /Invalid process output cursor/);
   assert.equal((await manager.terminate(original.processId, invocation)).status, 'exited');
   await assert.rejects(manager.terminate(original.processId, { ...invocation, ownerId: 'foreign' }), /another resource owner/);
-  const next = await startCommand(manager, request);
+  const next = await startSettledCommand(manager, request);
   assert.equal(next.status, 'exited', 'expired buffers release capture reservations');
   assert.equal(reports.length, 2);
   reopened = new LocalCommandExecution(options);
@@ -1339,10 +1349,9 @@ test('late output recovery preserves redaction, UTF-8 ranges and terminal truth 
     maxCapturedBytes: 512, tailBytes: 128 });
   t.after(async () => { await manager.close(); files.close(); await rm(root, { recursive: true, force: true }); });
   const source = 'API_TOKEN=private-secret\n' + '改😀'.repeat(400) + '-TAIL';
-  const result = await startCommand(manager, {
+  const result = await startSettledCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`process.stdout.write(${JSON.stringify(source)})`)}`,
-    mode: 'foreground',
-    rootedDirectory: '.', pty: false, timeoutMs: 5_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation
+    rootedDirectory: '.', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner: invocation
   });
   const suffixCursor = Buffer.byteLength('API_TOKEN=');
   const liveSuffix = await manager.query(result.processId, 1000, 0, suffixCursor, invocation);
@@ -1390,7 +1399,7 @@ test('active commands expose their effective deadline and rejected writes return
   const before = Date.now();
   const started = await invokeToolCall(jsonToolCall('exec_command', {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
-    background: true, timeoutMs: 5_000
+    timeoutMs: 5_000
   }), tools, context);
   assert.equal(started.kind, 'result');
   assert.equal(started.output.status, 'running');
@@ -1441,7 +1450,7 @@ test('quiet process waits stay bounded and report no fresh output without claimi
     await rm(root, { recursive: true, force: true });
   });
   const started = await invokeToolCall(jsonToolCall('exec_command', {
-    command: 'sleep 30', background: true, timeoutMs: 60_000
+    command: 'sleep 30', timeoutMs: 60_000
   }), tools, context);
   assert.equal(started.kind, 'result', JSON.stringify(started));
   const before = performance.now();
@@ -1473,7 +1482,7 @@ test('long activity waits wake for fresh input output, exit, and owner cancellat
         "process.stdout.write('ready\\n'); process.stdin.on('data', d => process.stdout.write(d)); process.stdin.on('end', () => process.exit(0));"
       )}`;
       const started = await invokeToolCall(jsonToolCall('exec_command', {
-        command, background: true, timeoutMs: 60_000
+        command, timeoutMs: 60_000
       }), tools, context);
       assert.equal(started.kind, 'result', JSON.stringify(started));
       assert.match(started.output.combined.segments.join(''), /ready/);
@@ -1543,4 +1552,58 @@ test('requested long process waits retain the configured yield bound', async () 
     assert.equal(canonical.yieldMs, expected);
     assert.equal(canonical.afterCursor, 0);
   }
+});
+
+test('exec_command exposes a bounded observation window without execution modes', async () => {
+  const decoded = execCommandTool.decodeInput({ kind: 'json', value: { command: 'printf ready' } });
+  assert.equal(decoded.ok, true);
+  assert.equal(decoded.input.yieldMs, 1_000);
+  assert.equal(Object.hasOwn(execCommandTool.jsonSchema.properties, 'background'), false);
+  assert.equal(execCommandTool.decodeInput({ kind: 'json', value: { command: 'true', background: true } }).ok, false);
+  for (const yieldMs of [-1, 0.5])
+    assert.equal(execCommandTool.decodeInput({ kind: 'json', value: { command: 'true', yieldMs } }).ok, false);
+});
+
+test('steering interrupts launch and query observation without terminating the owned process or releasing its lease', async t => {
+  const { manager, root } = await processContext();
+  t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
+  const lease = await manager.resourceLeases.acquire({
+    accesses: [{ mode: 'execute', scope: 'processes' }], lockScopes: ['files']
+  }, invocation.ownerId);
+  const result = await startCommand(manager, {
+    command: 'sleep 30', rootedDirectory: '.', pty: false,
+    timeoutMs: 60_000, yieldMs: 30_000, outputTokenBudget: 100, owner: invocation
+  }, { lease, observationSignal: AbortSignal.abort('steer launch') });
+  assert.equal(result.status, 'running');
+  assert.equal(manager.activeCount(), 1);
+  assert.equal(manager.resourceLeases.wouldWait({
+    accesses: [{ mode: 'write', scope: 'files/note.txt' }], lockScopes: ['files/note.txt']
+  }), true);
+  const controller = new AbortController();
+  const before = performance.now();
+  const pending = manager.query(result.processId, 100, 30_000, result.cursorEnd, invocation, controller.signal);
+  setTimeout(() => controller.abort('steer query'), 25);
+  const queried = await pending;
+  assert(performance.now() - before < 5_000);
+  assert.equal(queried.status, 'running');
+  assert.equal(manager.activeCount(), 1);
+  assert.equal(manager.resourceLeases.activeCount(), 1);
+  await manager.terminate(result.processId, invocation);
+  assert.equal(manager.resourceLeases.activeCount(), 0);
+});
+
+
+test('a yielded stop preserves active execution when its output cursor is rejected', async t => {
+  const { context, manager, root } = await processContext();
+  t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
+  let stopped = 0;
+  manager.terminate = async () => { stopped += 1; return { status: 'running' }; };
+  manager.query = async processId => { throw new CommandProcessOperationRejectedError(processId, 'invalid_cursor'); };
+  const result = await invokeToolCall(jsonToolCall('stop_process', {
+    processId: 'proc_11111111-1111-4111-8111-111111111111', afterCursor: 999
+  }), tools, { ...context, observationSignal: AbortSignal.abort('steer') });
+  assert.equal(stopped, 1);
+  assert.equal(result.kind, 'failure');
+  assert.equal(result.execution.state, 'active');
+  assert.equal(result.output.details.cause, 'invalid_cursor');
 });

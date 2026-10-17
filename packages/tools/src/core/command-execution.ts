@@ -51,7 +51,6 @@ export interface CommandExecutionDescriptor {
 
 export interface CommandExecutionPlanRequest {
   readonly command: string;
-  readonly mode: 'foreground' | 'background';
   /** Canonical path relative to the command authority's adopted root. */
   readonly rootedDirectory: string;
   readonly pty: boolean;
@@ -63,6 +62,8 @@ export interface CommandExecutionPlanRequest {
 
 export interface StartCommandExecutionOptions {
   readonly signal?: AbortSignal;
+  /** Yield observation without cancelling the supervised process. */
+  readonly observationSignal?: AbortSignal;
   readonly lease?: ToolResourceLease;
   readonly onProgress?: (progress: ToolProgress) => void | Promise<void>;
 }
@@ -204,7 +205,8 @@ export interface CommandExecution {
     outputTokenBudget: number,
     yieldMs?: number,
     afterCursor?: number,
-    requester?: CommandExecutionOwner
+    requester?: CommandExecutionOwner,
+    observationSignal?: AbortSignal
   ): Promise<CommandExecutionResult>;
   writeInput(processId: string, text: string, requester?: CommandExecutionOwner): Promise<void>;
   closeInput(processId: string, requester?: CommandExecutionOwner): Promise<void>;
@@ -213,7 +215,7 @@ export interface CommandExecution {
     size: CommandTerminalSize,
     requester?: CommandExecutionOwner
   ): Promise<void>;
-  terminate(processId: string, requester?: CommandExecutionOwner): Promise<CommandExecutionResult>;
+  terminate(processId: string, requester?: CommandExecutionOwner, observationSignal?: AbortSignal): Promise<CommandExecutionResult>;
   disposeOwner(ownerId: string): Promise<readonly CommandExecutionReport[]>;
   recoveredTerminalReports(): readonly CommandExecutionReport[];
   acknowledgeTerminalReport(processId: string): Promise<void>;
@@ -239,7 +241,6 @@ export function ownCommandExecutionRequest(request: CommandExecutionPlanRequest)
   const { ownerId, runId, turnId, toolBatchId, callIndex } = request.owner;
   return Object.freeze({
     command: request.command,
-    mode: request.mode,
     rootedDirectory: request.rootedDirectory,
     pty: request.pty,
     timeoutMs: request.timeoutMs,
@@ -352,10 +353,11 @@ function requireCommandExecutionPlan(plan: CommandExecutionPlan, authority: Comm
 }
 
 function validateCommandExecutionPlanRequest(request: CommandExecutionPlanRequest): void {
+  const fields = ['command', 'rootedDirectory', 'pty', 'timeoutMs', 'yieldMs', 'outputTokenBudget', 'owner'];
+  if (Object.keys(request).some((field) => !fields.includes(field)))
+    throw new TypeError('Command execution request contains unsupported fields.');
   if (typeof request.command !== 'string' || request.command.length === 0)
     throw new TypeError('Command must be non-empty.');
-  if (!['foreground', 'background'].includes(request.mode))
-    throw new TypeError('Command mode must be foreground or background.');
   if (typeof request.rootedDirectory !== 'string')
     throw new TypeError('Command rooted directory must be a string.');
   if (typeof request.pty !== 'boolean')

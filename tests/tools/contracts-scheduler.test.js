@@ -807,3 +807,21 @@ test('a failed retained resource rejects dependent work without releasing uncert
   recovered.release();
   assert.equal(coordinator.activeCount(), 0);
 });
+
+test('resource blocker diagnostics expose bounded exact handles without lease-owner parsing', async () => {
+  const coordinator = new ResourceLeaseCoordinator();
+  const read = { accesses: [{ mode: 'read', scope: 'files/a.txt' }], lockScopes: [] };
+  const unowned = await coordinator.acquire({ accesses: [{ mode: 'write', scope: 'files/a.txt' }], lockScopes: [] }, 'not:a:resource');
+  assert.deepEqual(coordinator.blockingResourceIds(read), []);
+  unowned.release();
+  for (let index = 0; index < 10; index += 1)
+    coordinator.restoreResource(`process-${index}`, { accesses: [{ mode: 'execute', scope: 'processes' }], lockScopes: ['files'] }, `processes/process-${index}`);
+  const ids = coordinator.blockingResourceIds(read);
+  assert.deepEqual(ids, Array.from({ length: 8 }, (_, index) => `process-${index}`));
+  assert.ok(Object.isFrozen(ids));
+  for (let index = 0; index < 10; index += 1) coordinator.releaseResource(`process-${index}`);
+  coordinator.restoreResource('process-exact', { accesses: [{ mode: 'execute', scope: 'processes' }], lockScopes: ['files'] }, 'processes/process-exact');
+  assert.deepEqual(coordinator.blockingResourceIds({ accesses: [{ mode: 'execute', scope: 'processes/process-exact' }], lockScopes: ['processes/process-exact'] }), []);
+  coordinator.releaseResource('process-exact');
+  assert.deepEqual(coordinator.blockingResourceIds(read), []);
+});

@@ -27,7 +27,7 @@ export function createExecCommandTool(
     name: 'exec_command',
     implementationId: 'agent-core.exec-command.v1',
     description:
-      'Run a command to exit or timeout while streaming progress. Background commands return a process handle for later interaction.',
+      'Start one supervised command and observe output for a bounded wait. Running commands return a process handle for later observation, input, or stopping.',
     schema: execCommandSchema(ptySupported),
     outputSchema: execCommandOutputSchema,
     buildModelContent: buildProcessContent,
@@ -59,13 +59,11 @@ export function createExecCommandTool(
         'CommandExecution'
       );
       const owner = processOwner(context);
-      const background = input.background;
       const request = Object.freeze({
         ...input,
-        background,
         pty: 'pty' in input && input.pty === true,
         workdir,
-        yieldMs: background ? Math.min(1_000, limits.maxYieldMs) : 0,
+        yieldMs: clampRequestedLimit(input.yieldMs, limits.maxYieldMs),
         timeoutMs: clampRequestedLimit(input.timeoutMs, limits.maxTimeoutMs),
         outputTokenBudget: clampRequestedLimit(input.outputTokenBudget, limits.maxOutputTokens),
         owner
@@ -86,7 +84,6 @@ export function createExecCommandTool(
       const { executor, ...request } = input;
       const reservation = await planCommandExecution(executor, {
         command: request.command,
-        mode: request.background ? 'background' : 'foreground',
         rootedDirectory: request.workdir,
         pty: request.pty,
         timeoutMs: request.timeoutMs,
@@ -118,6 +115,7 @@ async function executeCommand(
   try {
     const started = await startCommandExecutionPlan(input.executor, input.reservation, {
       ...(context.signal ? { signal: context.signal } : {}),
+      ...(context.observationSignal ? { observationSignal: context.observationSignal } : {}),
       ...(context.resourceLease ? { lease: context.resourceLease } : {}),
       onProgress: (progress) => context.emitProgress?.(progress)
     });
@@ -165,9 +163,8 @@ async function executeCommand(
   };
 }
 export const execCommandTool = createExecCommandTool();
-interface CommandInput extends Omit<CommandExecutionPlanRequest, 'rootedDirectory' | 'mode'> {
+interface CommandInput extends Omit<CommandExecutionPlanRequest, 'rootedDirectory'> {
   readonly workdir: string;
-  readonly background: boolean;
   readonly executor: CommandExecution;
 }
 
@@ -177,7 +174,7 @@ function commandSnapshot(input: CommandInput) {
     workdir: input.workdir,
     pty: input.pty,
     timeoutMs: input.timeoutMs,
-    background: input.background,
+    yieldMs: input.yieldMs,
     outputTokenBudget: input.outputTokenBudget
   };
 }

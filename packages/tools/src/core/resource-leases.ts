@@ -54,6 +54,17 @@ export class ResourceLeaseCoordinator {
     );
   }
 
+  /** At most eight exact resource handles currently blocking these effects; unnamed leases are omitted. */
+  blockingResourceIds(effects: ToolEffects): readonly string[] {
+    const resources = new Set<string>();
+    for (const lease of this.active.values()) {
+      if (lease.resourceId !== undefined && lease.resourceId.length <= 256 && leasesConflict(lease, effects))
+        resources.add(lease.resourceId);
+      if (resources.size === 8) break;
+    }
+    return Object.freeze([...resources]);
+  }
+
   releaseResource(resourceId: string): void {
     for (const active of this.active.values())
       if (active.resourceId === resourceId) this.releaseLease(active.id);

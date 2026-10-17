@@ -126,7 +126,8 @@ export type ToolFailureReason =
   | 'invalid_arguments'
   | 'invalid_output'
   | 'missing_service'
-  | 'runtime_error';
+  | 'runtime_error'
+  | 'resource_blocked';
 export interface BaseToolFailureOutput {
   readonly reason: ToolFailureReason;
 }
@@ -171,13 +172,21 @@ export interface RuntimeErrorToolFailureOutput extends BaseToolFailureOutput {
   readonly error: string;
   readonly details?: JsonObject;
 }
+export interface ResourceBlockedToolFailureOutput extends BaseToolFailureOutput {
+  readonly reason: 'resource_blocked';
+  readonly blocker: 'steering' | 'timeout';
+  readonly waitMs: number;
+  /** Bounded exact handles, when resource-owned leases are the blockers. */
+  readonly blockingResourceIds: readonly string[];
+}
 export type ToolFailureOutput =
   | UnknownToolFailureOutput
   | PolicyToolFailureOutput
   | InvalidArgumentsToolFailureOutput
   | InvalidOutputToolFailureOutput
   | MissingServiceToolFailureOutput
-  | RuntimeErrorToolFailureOutput;
+  | RuntimeErrorToolFailureOutput
+  | ResourceBlockedToolFailureOutput;
 
 export interface ToolExecutionBinding<TOutput = unknown> {
   readonly snapshot: JsonValue;

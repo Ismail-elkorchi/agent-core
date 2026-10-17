@@ -119,7 +119,7 @@ async function records(events, runId) {
 }
 const longCommand = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("console.log('started'); setInterval(()=>{},1000)")}`;
 
-test('an admitted background process allows subsequent reads, edits and foreground commands', async (t) => {
+test('a running process blocks conflicting file operations and new commands but permits exact process controls', async (t) => {
   const state = await setup();
   t.after(async () => { await state.manager.close(); await rm(state.root, { recursive: true, force: true }); });
   await writeFile(path.join(state.root, 'source.txt'), 'Original source\n');
@@ -128,10 +128,10 @@ test('an admitted background process allows subsequent reads, edits and foregrou
     assert.equal(state.manager.activeCount(), 1);
     assert.equal(state.manager.resourceLeases.wouldWait({
       accesses: [{ mode: 'write', scope: 'files/added.txt' }], lockScopes: ['files/added.txt']
-    }), false);
+    }), true);
   };
   const provider = new Provider([
-    toolResponse('exec_command', { command: longCommand, background: true }),
+    toolResponse('exec_command', { command: longCommand }),
     async () => {
       assertRunning();
       processId = (await state.manager.listProcesses())[0].processId;
@@ -145,7 +145,7 @@ test('an admitted background process allows subsequent reads, edits and foregrou
     },
     async () => {
       assertRunning();
-      assert.equal(await readFile(path.join(state.root, 'added.txt'), 'utf8'), 'Independent edit\n');
+      await assert.rejects(readFile(path.join(state.root, 'added.txt'), 'utf8'), /ENOENT/);
       return toolResponse('exec_command', { command: 'printf independent' });
     },
     () => {
@@ -163,7 +163,16 @@ test('an admitted background process allows subsequent reads, edits and foregrou
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(state.manager.activeCount(), 0);
   const journal = await records(state.events, result.terminal.runId);
-  assert.equal(journal.filter((event) => event.type === 'tool.started').length, 5);
+  const observations = await Promise.all(journal.filter(event => event.type === 'tool.ended')
+    .map(event => resolveToolObservation(event.observation, state.artifacts)));
+  assert.equal(observations.length, 5);
+  for (const observation of observations.slice(1, 4)) {
+    assert.equal(observation.kind, 'failure');
+    assert.equal(observation.execution.state, 'not_started');
+    assert.equal(observation.output.reason, 'resource_blocked');
+    assert.deepEqual(observation.output.blockingResourceIds, [processId]);
+  }
+  assert.equal(observations[4].output.status, 'stopped');
 });
 
 const approvalTool = defineTool({
@@ -194,7 +203,7 @@ const approvalTool = defineTool({
 test('a run stops and persists its active process before durable approval suspension', async () => {
   const state = await setup();
   const provider = new Provider([
-    toolResponse('exec_command', { command: longCommand, background: true }),
+    toolResponse('exec_command', { command: longCommand }),
     toolResponse('approval_write', {})
   ]);
   const agent = createRuntime({
@@ -220,7 +229,7 @@ test('abort and unknown provider outcome both clean active run processes before 
   for (const mode of ['abort', 'failure']) {
     const state = await setup();
     const provider = new Provider([
-      toolResponse('exec_command', { command: longCommand, background: true }),
+      toolResponse('exec_command', { command: longCommand }),
       ...(mode === 'failure' ? [new Error('provider failed')] : [done])
     ]);
     let control;
@@ -393,7 +402,6 @@ test('two runtimes sharing one manager clean only their own processes', async ()
   };
   const plan = await state.manager.plan({
     command: longCommand,
-    mode: 'background',
     rootedDirectory: '.',
     pty: false,
     timeoutMs: 60_000,
@@ -430,7 +438,7 @@ test('an explicitly admitted work owner keeps a process across runs with its ori
   const first = await new AgentRuntime({ maxOutputTokens: 64,
     ...options,
     provider: new Provider([
-      toolResponse('exec_command', { command: longCommand, background: true }),
+      toolResponse('exec_command', { command: longCommand }),
       done
     ]),
     tools: [execCommandTool]
@@ -558,4 +566,113 @@ test('an uncertain stop reports its diagnostic immediately and recovers by query
   assert.equal(result.terminal.executionStatus, 'completed', JSON.stringify(result.terminal));
   assert.equal(stopAttempts, 1, 'recovery must not repeat the stop effect');
   await state.manager.close();
+});
+
+for (const blocker of ['steering', 'timeout']) {
+  test(`resource admission ${blocker} settles not_started without abandoning a queued lease`, async (t) => {
+    const state = await setup();
+    t.after(async () => { await state.manager.close(); await rm(state.root, { recursive: true, force: true }); });
+    const leases = state.manager.resourceLeases;
+    leases.restoreResource('busy-process', {
+      accesses: [{ mode: 'execute', scope: 'processes' }], lockScopes: ['files'], recovery: { kind: 'unknown' }
+    }, 'processes/busy-process');
+    let handle;
+    const provider = new Provider([toolResponse('exec_command', { command: 'printf must-not-run' }), done]);
+    const agent = createRuntime({ ...state, provider, tools: [execCommandTool],
+      onProgress(event) {
+        if (blocker === 'steering' && event.type === 'tool.updated' && event.progress.stage === 'resource_lease_waiting')
+          handle.injectSteering({ instruction: 'Stop waiting and reconsider.' });
+      }
+    });
+    handle = agent.run({ runId: `blocked-${blocker}`, task: 'run a command' });
+    const result = await handle.result;
+    assert.equal(result.state, 'ended');
+    assert.equal(result.terminal.executionStatus, 'completed');
+    const persisted = await records(state.events, `blocked-${blocker}`);
+    assert.equal(persisted.filter(event => event.type === 'tool.started').length, 0);
+    const ended = persisted.find(event => event.type === 'tool.ended');
+    const observation = await resolveToolObservation(ended.observation, state.artifacts);
+    assert.equal(observation.execution.state, 'not_started');
+    assert.equal(observation.output.reason, 'resource_blocked');
+    assert.equal(observation.output.blocker, blocker);
+    assert.deepEqual(observation.output.blockingResourceIds, ['busy-process']);
+    assert.equal(state.manager.activeCount(), 0);
+    leases.releaseResource('busy-process');
+    assert.equal(leases.activeCount(), 0, 'a rejected waiter cannot acquire after the blocker releases');
+  });
+}
+
+test('steering yields observations, stays latched for batch dispatch, and resets at next model boundary', async (t) => {
+  const state = await setup();
+  t.after(async () => { await state.manager.close(); await rm(state.root, { recursive: true, force: true }); });
+  let handle;
+  let invoked = 0;
+  const observer = defineTool({
+    name: 'observe', implementationId: 'tests/observe-yield@1', description: 'observe',
+    schema: z.strictObject({}), outputSchema: z.strictObject({}),
+    effectEnvelope: { accesses: [{ mode: 'read', scope: 'observations' }], lockScopes: [] },
+    canonicalizeInput: input => input,
+    deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'observations' }], lockScopes: [], recovery: { kind: 'unknown' } }),
+    async invoke(_input, context) {
+      invoked += 1;
+      assert.equal(context.signal.aborted, false);
+      if (invoked === 1) {
+        assert.equal(context.observationSignal.aborted, false);
+        const yielded = new Promise(resolve => context.observationSignal.addEventListener('abort', resolve, { once: true }));
+        handle.injectSteering({ instruction: 'Reconsider after observing.' });
+        await yielded;
+      } else assert.equal(context.observationSignal.aborted, invoked === 2);
+      return { kind: 'result', summary: 'observed', scope: { resources: ['observations'], coverage: 'complete' }, output: {} };
+    }
+  });
+  const batch = toolResponse('observe', {});
+  batch.toolCalls.push({ ...batch.toolCalls[0], id: 'observe-second' });
+  const provider = new Provider([batch, async (request) => {
+    assert.equal(invoked, 2, 'the ordinary batch must settle before the next model request');
+    assert.match(JSON.stringify(request), /Reconsider after observing/);
+    return toolResponse('observe', {});
+  }, done]);
+  handle = createRuntime({ ...state, provider, tools: [observer] }).run({ runId: 'observation-yield', task: 'observe twice' });
+  const result = await handle.result;
+  assert.equal(result.terminal.executionStatus, 'completed');
+  assert.equal(invoked, 3);
+});
+
+test('steering accepted with a final response cannot yield observations in the next run', async (t) => {
+  const state = await setup();
+  t.after(async () => { await state.manager.close(); await rm(state.root, { recursive: true, force: true }); });
+  let firstHandle;
+  let observed = false;
+  const observer = defineTool({
+    name: 'observe_next_run', implementationId: 'tests/observe-next-run@1', description: 'observe',
+    schema: z.strictObject({}), outputSchema: z.strictObject({}),
+    effectEnvelope: { accesses: [{ mode: 'read', scope: 'observations' }], lockScopes: [] },
+    canonicalizeInput: input => input,
+    deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'observations' }], lockScopes: [], recovery: { kind: 'unknown' } }),
+    async invoke(_input, context) {
+      assert.equal(context.observationSignal.aborted, false);
+      assert.equal(context.signal.aborted, false);
+      const outcome = await Promise.race([
+        new Promise(resolve => setTimeout(() => resolve('wait_completed'), 25)),
+        new Promise(resolve => context.observationSignal.addEventListener('abort', () => resolve('yielded'), { once: true }))
+      ]);
+      assert.equal(outcome, 'wait_completed');
+      observed = true;
+      return { kind: 'result', summary: 'observed', scope: { resources: ['observations'], coverage: 'complete' }, output: {} };
+    }
+  });
+  const provider = new Provider([
+    () => { firstHandle.injectSteering({ instruction: 'Instruction for the finishing run only.' }); return done; },
+    request => {
+      assert.doesNotMatch(JSON.stringify(request), /Instruction for the finishing run only/);
+      return toolResponse('observe_next_run', {});
+    }, done
+  ]);
+  const agent = createRuntime({ ...state, provider, tools: [observer] });
+  firstHandle = agent.run({ runId: 'late-steering-first', task: 'finish now' });
+  const first = await firstHandle.result;
+  assert.equal(first.terminal.executionStatus, 'completed');
+  const second = await agent.run({ runId: 'late-steering-second', task: 'observe normally' }).result;
+  assert.equal(second.terminal.executionStatus, 'completed');
+  assert.equal(observed, true);
 });

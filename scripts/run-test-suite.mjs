@@ -14,6 +14,7 @@ const linuxRootCapabilityTests = new Set(
     'tests/tools/edit-text.test.js',
     'tests/tools/file-tools.test.js',
     'tests/tools/process-lifecycle-fault-matrix.test.js',
+    'tests/tools/process-observation-yield.test.js',
     'tests/tools/process-tools.test.js',
     'tests/tools/read-observed-facts.test.js',
     'tests/tools/runtime-process-cleanup.test.js'

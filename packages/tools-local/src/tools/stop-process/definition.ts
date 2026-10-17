@@ -44,17 +44,17 @@ export const stopProcessTool = defineTool({
   async invoke(input, context) {
     const executor = commandExecutor(context);
     const owner = processOwner(context);
-    let terminationConfirmed = false;
+    let terminationState: 'not_started' | 'active' | 'settled' = 'not_started';
     try {
-      await executor.terminate(input.processId, owner);
-      terminationConfirmed = true;
+      const result = await executor.terminate(input.processId, owner, context.observationSignal);
+      terminationState = result.status === 'running' ? 'active' : 'settled';
       return processObservation(await executor.query(
         input.processId, input.outputTokenBudget, 0, input.afterCursor, owner
       ));
     } catch (error) {
       if (error instanceof CommandProcessOperationRejectedError)
         return processOperationRejectedObservation(error, executor, owner, input.outputTokenBudget,
-          terminationConfirmed ? 'settled' : 'not_started');
+          terminationState);
       throw error;
     }
   }

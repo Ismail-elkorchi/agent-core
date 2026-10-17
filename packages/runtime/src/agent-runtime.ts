@@ -195,7 +195,7 @@ export interface AgentRuntimeOptions {
     | readonly CompiledToolDefinition[]
     | Promise<readonly CompiledToolDefinition[]>;
   readonly toolBoundary: ToolAuthorizationBoundary;
-  readonly toolContext?: Omit<ToolExecutionContext, 'policy' | 'signal'>;
+  readonly toolContext?: Omit<ToolExecutionContext, 'policy' | 'signal' | 'observationSignal'>;
   readonly toolResourceLeases?: ResourceLeaseCoordinator;
   readonly resources?: ExecutionResources;
   readonly inferenceOwnerId?: string;
@@ -456,6 +456,7 @@ export class AgentRuntime {
   private readonly steerQueue: (AgentSteeringReceipt & {
     readonly instruction: string;
   })[] = [];
+  private observationController = new AbortController();
   private activeAbortController: AbortController | undefined;
   private activeRunId: string | undefined;
   private activeRunDriver: AgentRunDriver | undefined;
@@ -765,7 +766,12 @@ export class AgentRuntime {
       cleanupExternalAbort();
       removeRunItems(this.steerQueue, runId);
       if (this.activeAbortController === abortController) this.activeAbortController = undefined;
-      if (this.activeRunId === runId) this.activeRunId = undefined;
+      if (this.activeRunId === runId) {
+        this.activeRunId = undefined;
+        // A run may end after accepting steering without another model boundary.
+        // Its observation yield belongs to that run, never to the next one.
+        this.observationController = new AbortController();
+      }
       if (this.activeRunReady === runReady) {
         this.activeRunDriver = undefined;
         this.activeRunReady = undefined;
@@ -949,7 +955,12 @@ export class AgentRuntime {
       cleanupExternalAbort();
       removeRunItems(this.steerQueue, runId);
       if (this.activeAbortController === abortController) this.activeAbortController = undefined;
-      if (this.activeRunId === runId) this.activeRunId = undefined;
+      if (this.activeRunId === runId) {
+        this.activeRunId = undefined;
+        // A run may end after accepting steering without another model boundary.
+        // Its observation yield belongs to that run, never to the next one.
+        this.observationController = new AbortController();
+      }
       if (this.activeRunReady === runReady) {
         this.activeRunDriver = undefined;
         this.activeRunReady = undefined;
@@ -4486,6 +4497,7 @@ export class AgentRuntime {
       ...(Object.keys(services).length > 0 ? { services } : {}),
       policy: this.toolPolicy,
       signal,
+      observationSignal: this.observationController.signal,
       boundary: this.options.toolBoundary,
       ...(this.options.resources?.lifetime.kind === 'owner'
         ? { resourceOwnerId: this.options.resources.lifetime.ownerId }
@@ -4566,6 +4578,9 @@ export class AgentRuntime {
     await this.steeringWrites;
     const selected = this.steerQueue.filter((item) => item.runId === runId);
     removeRunItems(this.steerQueue, runId);
+    // Rotate only at the model boundary. Calls dispatched after steering was accepted
+    // must still see the latched yield, including calls in the same ordinary batch.
+    if (selected.length > 0) this.observationController = new AbortController();
     if (!this.nativeSteering) return selected.map((item) => item.instruction);
     for (const item of selected) await this.nativeSteering.accept(item.id, item.instruction);
     return (await this.nativeSteering.nextRequestInputs()).map((item) => item.content);
@@ -4590,6 +4605,7 @@ export class AgentRuntime {
     });
     this.steeringReceipts.set(receipt.id, { ...receipt, instruction: input.instruction });
     this.steerQueue.push({ ...receipt, instruction: input.instruction });
+    this.observationController.abort('Steering accepted; yield the current observation.');
     const steering = this.nativeSteering;
     if (steering)
       this.steeringWrites = this.steeringWrites.then(() =>

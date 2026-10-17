@@ -51,7 +51,7 @@ export async function processOperationRejectedObservation(
   executor: CommandExecution,
   owner: CommandExecutionOwner,
   outputTokenBudget: number,
-  execution: 'not_started' | 'settled' = 'not_started'
+  execution: 'not_started' | 'active' | 'settled' = 'not_started'
 ) {
   // Only not_running establishes a known, authorized process with a terminal outcome.
   const process = error.reason === 'not_running'
