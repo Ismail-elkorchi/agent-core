@@ -309,6 +309,11 @@ export function assertModelRequestSupported(profile: ModelProfile, request: Mode
       if (!(protocol?.inputKinds ?? ['text']).includes(part.type))
         issues.push(`Input kind ${part.type} is not supported by ${profile.id}.`);
   }
+  if (request.tools?.some(tool => tool.deferLoading) && !protocol?.deferredTools)
+    issues.push('Deferred tools are not declared for this endpoint/model.');
+  if ((request.tools?.some(tool => tool.allowedCallers?.includes('programmatic')) || request.messages.some(item =>
+    (item.role === 'tool' && item.caller !== undefined) || (item.role === 'assistant' && item.toolCalls?.some(call => call.caller !== undefined) === true))) && !protocol?.programmaticTools)
+    issues.push('Programmatic tools are not declared for this endpoint/model.');
   if (request.tools?.some((tool) => tool.async) && !protocol?.asyncTools)
     issues.push('Asynchronous tools are not declared for this endpoint/model.');
   if (
@@ -446,6 +451,7 @@ function decodeFreshMessage(value: unknown, index: number): ModelInputItem {
         'toolName',
         'toolCallId',
         'toolCallType',
+        'caller',
         'images',
         'parts'
       ]) ||
@@ -459,6 +465,7 @@ function decodeFreshMessage(value: unknown, index: number): ModelInputItem {
       ...common,
       toolName: value.toolName,
       toolCallType: value.toolCallType,
+      ...(value.caller === undefined ? {} : { caller: parseModelToolCaller(value.caller) }),
       ...(typeof value.toolCallId === 'string' ? { toolCallId: value.toolCallId } : {}),
       ...(value.images === undefined ? {} : { images: parseModelImages(value.images, path) })
     });
@@ -549,11 +556,12 @@ function ownedJsonObject(value: unknown): value is JsonObject {
 
 function decodeModelTool(value: unknown): ModelTool {
   if (!isRecord(value)) throw new Error('Tool must be an object.');
+  const exposure = decodeToolExposure(value);
   if (value.async !== undefined && typeof value.async !== 'boolean')
     throw new Error('Tool async must be boolean.');
   if (value.type === 'function') {
     if (
-      !onlyKeys(value, ['type', 'function', 'async']) ||
+      !onlyKeys(value, ['type', 'function', 'async', 'deferLoading', 'allowedCallers', 'outputSchema']) ||
       !isRecord(value.function) ||
       !onlyKeys(value.function, ['name', 'description', 'parameters']) ||
       typeof value.function.name !== 'string' ||
@@ -567,6 +575,7 @@ function decodeModelTool(value: unknown): ModelTool {
         : parseJsonObject(value.function.parameters, MODEL_JSON_LIMITS);
     return Object.freeze({
       type: 'function',
+      ...exposure,
       ...(typeof value.async === 'boolean' ? { async: value.async } : {}),
       function: Object.freeze({
         name: value.function.name,
@@ -579,7 +588,7 @@ function decodeModelTool(value: unknown): ModelTool {
   }
   if (
     value.type !== 'custom' ||
-    !onlyKeys(value, ['type', 'name', 'description', 'format', 'async']) ||
+    !onlyKeys(value, ['type', 'name', 'description', 'format', 'async', 'deferLoading', 'allowedCallers', 'outputSchema']) ||
     typeof value.name !== 'string' ||
     value.name.trim().length === 0 ||
     (value.description !== undefined && typeof value.description !== 'string') ||
@@ -604,6 +613,7 @@ function decodeModelTool(value: unknown): ModelTool {
   if (!format) throw new Error('Custom tool format is invalid.');
   return Object.freeze({
     type: 'custom',
+    ...exposure,
     ...(typeof value.async === 'boolean' ? { async: value.async } : {}),
     name: value.name,
     ...(typeof value.description === 'string' ? { description: value.description } : {}),
@@ -652,12 +662,14 @@ export function parseModelTerminationReason(value: unknown): ModelTerminationRea
 export function parseModelToolCall(value: unknown): ModelToolCall {
   if (!isRecord(value)) throw contract('Invalid model tool call.', ['Expected an object.']);
   const issues: string[] = [];
+  if (!onlyKeys(value, ['type', 'id', 'name', 'input', 'async', 'caller']))
+    issues.push('Tool call contains unsupported fields.');
   let jsonInput: JsonObject | undefined;
   const name = typeof value.name === 'string' ? value.name : '';
   nonempty(name, 'name', issues);
   if (value.id !== undefined && typeof value.id !== 'string') issues.push('id must be a string.');
   if (value.type !== 'function' && value.type !== 'custom') issues.push('type must be function or custom.');
-  if (!isRecord(value.input) || (value.input.kind !== 'json' && value.input.kind !== 'text'))
+  if (!isRecord(value.input) || !onlyKeys(value.input, ['kind', 'value']) || (value.input.kind !== 'json' && value.input.kind !== 'text'))
     issues.push('input is invalid.');
   else if (value.input.kind === 'text') {
     if (typeof value.input.value !== 'string') issues.push('input value is invalid.');
@@ -677,6 +689,7 @@ export function parseModelToolCall(value: unknown): ModelToolCall {
   if (value.async !== undefined && typeof value.async !== 'boolean')
     throw contract('Invalid tool call.', ['async must be boolean.']);
   const identity = {
+    ...(value.caller === undefined ? {} : { caller: parseModelToolCaller(value.caller) }),
     ...(typeof value.async === 'boolean' ? { async: value.async } : {}),
     ...(typeof value.id === 'string' ? { id: value.id } : {}),
     name
@@ -1353,6 +1366,7 @@ function decodeStringMetadata(value: unknown): Readonly<Record<string, string>> 
 }
 function isModelTerminationReason(value: unknown): value is ModelTerminationReason {
   return (
+    value === 'continuation' ||
     value === 'stop' ||
     value === 'tool_calls' ||
     value === 'output_limit' ||
@@ -1482,4 +1496,21 @@ function encodeImageBytes(bytes: Uint8Array): string {
   for (let offset = 0; offset < bytes.length; offset += 24_576)
     chunks.push(btoa(String.fromCharCode(...bytes.subarray(offset, offset + 24_576))));
   return chunks.join('');
+}
+
+export function parseModelToolCaller(value: unknown): import('./index.js').ModelToolCaller {
+  const caller = parseJsonObject(value, MODEL_JSON_LIMITS);
+  if (!onlyKeys(caller, ['type', 'callerId']) || caller.type !== 'programmatic' || typeof caller.callerId !== 'string' || !caller.callerId.trim() || caller.callerId.length > 1024)
+    throw contract('Invalid programmatic tool caller.', ['A bounded provider program identity is required.']);
+  return Object.freeze({ type: 'programmatic', callerId: caller.callerId });
+}
+function decodeToolExposure(value: Record<string, unknown>): import('./index.js').ModelToolExposure {
+  if (value.deferLoading !== undefined && typeof value.deferLoading !== 'boolean') throw new Error('Invalid deferred tool mode.');
+  const modes = value.allowedCallers;
+  if (modes !== undefined && (!Array.isArray(modes) || modes.length === 0 || modes.length > 2 || new Set(modes).size !== modes.length || modes.some(mode => mode !== 'direct' && mode !== 'programmatic'))) throw new Error('Invalid allowed tool callers.');
+  return Object.freeze({
+    ...(value.deferLoading === undefined ? {} : { deferLoading: value.deferLoading }),
+    ...(modes === undefined ? {} : { allowedCallers: Object.freeze([...(modes as ('direct'|'programmatic')[])]) }),
+    ...(value.outputSchema === undefined ? {} : { outputSchema: parseJsonObject(value.outputSchema, MODEL_JSON_LIMITS) })
+  });
 }

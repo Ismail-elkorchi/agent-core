@@ -1,0 +1,19 @@
+{
+  "name": "@agent-core/tools-mcp",
+  "version": "0.2.0",
+  "description": "Bounded MCP 2026-07-28 tool catalog adapter for Agent Core.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js", "./node": "./dist/node.js" },
+  "files": ["dist", "README.md"],
+  "engines": { "node": ">=24.8.0" },
+  "dependencies": {
+    "@agent-core/json": "0.2.0",
+    "@agent-core/persistence": "0.2.0",
+    "@agent-core/tools": "0.2.0",
+    "@modelcontextprotocol/client": "2.3.1",
+    "ajv": "8.18.0",
+    "zod": "^4.4.3"
+  }
+}

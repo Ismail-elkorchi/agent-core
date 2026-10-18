@@ -26,8 +26,8 @@ README for preparation, sandbox requirements, task provenance and reports.
   a new allowance. `evaluation-accounting-contract.test.js` exercises the
   public contracts across primary and context-recovery invocation purposes.
 
-The Coding Agent CLI currently exposes run limits, not configuration of the
-session inference budget. The evaluator partitions its task allowance among
+The Coding Agent CLI exposes run limits and `--inference-budget` for the
+continuing session owner. The evaluator partitions its task allowance among
 scripted runs and also bounds provider requests; it does not substitute a
 second inference accounting engine. A provider invocation can incur charges
 before usage is reported. Known-cost limits with missing prices cannot provide

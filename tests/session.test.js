@@ -677,7 +677,7 @@ async function acceptApprovalRun(runs, runId) {
     toolBatchId: 'batch',
     calls: [call],
     modelCalls: [{ type: 'function', id: call.id, name: call.name, input: call.input }],
-    source: { responseId: 'response', catalog: { revision: hashJson(entries), entries } },
+    source: { responseId: 'response', catalog: { format: 'agent-core.tool-catalog/2', revision: hashJson({ format: 'agent-core.tool-catalog/2', entries }), entries } },
     callStates: [{ stage: 'ready' }],
     maxConcurrency: 1,
     instructions: [],

@@ -1,3 +1,4 @@
+import { responsesCallerWire, responsesExposure, isResponsesToolProtocol, validateResponsesToolProtocol } from './advanced-tools.js';
 import { canonicalJsonString, parseJsonObject } from '@agent-core/json';
 import {
   ModelProviderError,
@@ -19,6 +20,8 @@ export function responsesInput(
 ): { instructions: string; input: unknown[] } {
   const input: unknown[] = [];
   const instructions: string[] = [];
+  const calls = new Map(request.messages.flatMap(item => item.role === 'assistant'
+    ? (item.toolCalls ?? []).filter(call => call.id).map(call => [call.id, call] as const) : []));
   for (const item of request.messages) {
     if (item.role === 'system' && systemInstructions) {
       instructions.push(item.content);
@@ -28,11 +31,11 @@ export function responsesInput(
     }
     if (item.role === 'protocol') {
       if (
-        item.state.kind !== 'responses.reasoning' ||
+        !['responses.reasoning', 'responses.tools'].includes(item.state.kind) ||
         !Array.isArray(item.state.data.items)
       )
         throw invalid(provider, 'Unsupported Responses protocol state.');
-      input.push(...responsesReasoningItems(item.state.data.items, provider));
+      input.push(...(item.state.kind === 'responses.tools' ? (item.state.data.items as readonly ResponsesOutputItem[]).map(value => { validateResponsesToolProtocol(value, provider); return value; }) : responsesReasoningItems(item.state.data.items, provider)));
       continue;
     }
     if (item.role === 'control') {
@@ -43,10 +46,14 @@ export function responsesInput(
     }
     if (item.role === 'tool') {
       if (!item.toolCallId) throw invalid(provider, 'Tool results require the original call identity.');
+      const original = calls.get(item.toolCallId);
+      if (original && canonicalJsonString(original.caller ?? null) !== canonicalJsonString(item.caller ?? null))
+        throw invalid(provider, 'Tool results must preserve the original program caller.');
       input.push({
         type: item.toolCallType === 'custom' ? 'custom_tool_call_output' : 'function_call_output',
         call_id: item.toolCallId,
-        output: item.content
+        output: item.content,
+        ...(item.caller ? { caller: responsesCallerWire(item.caller) } : {})
       });
       if (item.images?.length || item.parts?.length)
         input.push({ role: 'user', content: responsesContent({ ...item, content: '' }, provider) });
@@ -64,7 +71,7 @@ export function responsesInput(
 }
 export function responsesToolCall(call: ModelToolCall, provider: string): Record<string, unknown> {
   if (!call.id) throw invalid(provider, 'Responses tool calls require the original call identity.');
-  const asyncField = call.async === undefined ? {} : { async: call.async };
+  const asyncField = { ...(call.async === undefined ? {} : { async: call.async }), ...(call.caller ? { caller: responsesCallerWire(call.caller) } : {}) };
   return call.type === 'custom'
     ? {
         ...asyncField,
@@ -126,8 +133,13 @@ export async function responsesOutput(options: {
   items: readonly ResponsesOutputItem[];
 }): Promise<readonly ModelOutputItem[]> {
   const output: ModelOutputItem[] = [];
+  const exposure = responsesExposure(options.request, options.provider);
   for (const item of options.items) {
-    if (item.type === 'reasoning') {
+    if (isResponsesToolProtocol(item)) {
+      exposure.observe(item);
+      const state = await createProviderContextState({ provider: options.provider, protocolRevision: options.protocolRevision, endpoint: options.endpoint, request: { ...options.request, messages: [...options.request.messages, ...modelOutputToInput(output)] }, requestId: options.requestId, kind: 'responses.tools', requiresExactPrefix: false, data: { items: [item] } });
+      output.push({ type: 'protocol', state });
+    } else if (item.type === 'reasoning') {
       const prefix = [...options.request.messages, ...modelOutputToInput(output)];
       const state = await createProviderContextState({
         provider: options.provider,
@@ -156,10 +168,14 @@ export async function responsesOutput(options: {
           options.provider,
           'Provider returned an asynchronous call that was not advertised as asynchronous.'
         );
+      const caller = exposure.assertCall(item);
+      if (item.type === 'function_call' && item.arguments !== undefined && typeof item.arguments !== 'string')
+        throw invalidOutput(options.provider, 'Function call arguments must be a JSON string.');
       const toolCall: ModelToolCall =
         item.type === 'custom_tool_call'
           ? {
               ...(typeof item.async === 'boolean' ? { async: item.async } : {}),
+              ...(caller ? { caller } : {}),
               id: item.call_id,
               name: item.name,
               type: 'custom',
@@ -167,10 +183,11 @@ export async function responsesOutput(options: {
             }
           : {
               ...(typeof item.async === 'boolean' ? { async: item.async } : {}),
+              ...(caller ? { caller } : {}),
               id: item.call_id,
               name: item.name,
               type: 'function',
-              input: { kind: 'json', value: parseJsonObject(JSON.parse(item.arguments ?? '{}') as unknown) }
+              input: { kind: 'json', value: parseJsonObject(JSON.parse(typeof item.arguments === 'string' ? item.arguments : '{}') as unknown) }
             };
       output.push({ type: 'tool_call', toolCall });
     } else if (item.type === 'message' || item.role === 'assistant') {

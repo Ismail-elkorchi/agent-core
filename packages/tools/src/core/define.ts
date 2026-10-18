@@ -7,6 +7,7 @@ import type {
   ToolDefinition,
   ToolEffectRecoveryResult,
   ToolInput,
+  ToolInvocationMode,
   ToolObservationInput,
   ToolPromptGuide,
   ToolRequirements,
@@ -22,6 +23,9 @@ import {
   type ToolEffects
 } from './authorization.js';
 import { markCompiledTool, type CompiledToolDefinition } from './compiled.js';
+import { compileOutputJsonSchema, normalizeToolInvocationModes } from './contract.js';
+import { validateToolRequirements } from './resources.js';
+import { exportToolJsonSchema } from './json-schema.js';
 
 interface ToolOptions<Schema extends z.ZodType, TCanonicalInput, TOutput> {
   name: string;
@@ -30,6 +34,7 @@ interface ToolOptions<Schema extends z.ZodType, TCanonicalInput, TOutput> {
   promptGuide?: ToolPromptGuide;
   schema: Schema;
   outputSchema: z.ZodType<TOutput>;
+  invocationModes?: readonly ToolInvocationMode[];
   textInput?: Omit<ToolTextInputDefinition<z.output<Schema>>, 'decode'> & {
     decode(text: string): z.input<Schema>;
   };
@@ -82,21 +87,9 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
   definition: DefineToolOptions<Schema, TCanonicalInput, TOutput>
 ): CompiledToolDefinition<z.output<Schema>, TCanonicalInput, TOutput> {
   const snapshotInput = definition.snapshotInput ?? ((input: TCanonicalInput) => input);
-  const requirements = definition.requirements
-    ? Object.freeze({
-        ...(definition.requirements.services
-          ? { services: Object.freeze([...definition.requirements.services]) }
-          : {}),
-        ...(definition.requirements.modelInputModalities
-          ? {
-              modelInputModalities: Object.freeze([...definition.requirements.modelInputModalities])
-            }
-          : {}),
-        ...(definition.requirements.hostCapabilities
-          ? { hostCapabilities: Object.freeze([...definition.requirements.hostCapabilities]) }
-          : {})
-      })
-    : undefined;
+  const requirements = validateToolRequirements(definition.requirements);
+  const schema = definition.schema;
+  const outputSchema = definition.outputSchema;
   const textInput: ToolTextInputDefinition<z.output<Schema>> | undefined = definition.textInput
     ? {
         format: definition.textInput.format,
@@ -107,7 +100,7 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
           ? { promptGuide: definition.textInput.promptGuide }
           : {}),
         decode(text) {
-          return definition.schema.parse(definition.textInput?.decode(text));
+          return schema.parse(definition.textInput?.decode(text));
         }
       }
     : undefined;
@@ -116,13 +109,15 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
     implementationId: definition.implementationId,
     description: definition.description,
     ...(definition.promptGuide ? { promptGuide: definition.promptGuide } : {}),
-    jsonSchema: parseJsonObject(toToolJsonSchema(definition.schema), {
+    jsonSchema: parseJsonObject(exportToolJsonSchema(schema, true), {
       maxDepth: 64,
       maxCollectionEntries: 50_000,
       maxStringBytes: 1_000_000,
       maxTotalBytes: 4_000_000
     }),
-    outputSchema: definition.outputSchema,
+    outputSchema,
+    outputJsonSchema: compileOutputJsonSchema(outputSchema),
+    invocationModes: normalizeToolInvocationModes(definition.invocationModes),
     ...(textInput ? { textInput } : {}),
     effectEnvelope: validateToolEffectEnvelope(definition.effectEnvelope),
     ...(requirements ? { requirements } : {}),
@@ -160,7 +155,7 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
           )
         };
       }
-      const parsed = definition.schema.safeParse(candidate);
+      const parsed = schema.safeParse(candidate);
       if (!parsed.success) {
         return {
           ok: false,
@@ -196,45 +191,4 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
     }
   };
   return markCompiledTool(Object.freeze(tool));
-}
-
-function toToolJsonSchema(schema: z.ZodType): Record<string, unknown> {
-  const normalized = normalizeJsonSchema(z.toJSONSchema(schema));
-  if (!isJsonObject(normalized))
-    throw new Error('Tool schema conversion did not produce a JSON object.');
-  const jsonSchema = normalized;
-  delete jsonSchema.$schema;
-  return jsonSchema;
-}
-
-function normalizeJsonSchema(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(normalizeJsonSchema);
-  }
-  if (!isJsonObject(value)) {
-    return value;
-  }
-  const normalized = Object.fromEntries(
-    Object.entries(value).map(([key, item]) => [key, normalizeJsonSchema(item)])
-  );
-  const properties = normalized.properties;
-  if (isJsonObject(properties) && Array.isArray(normalized.required)) {
-    const required = normalized.required.filter((item): item is string => {
-      return typeof item === 'string' && !hasDefault(properties[item]);
-    });
-    if (required.length > 0) {
-      normalized.required = required;
-    } else {
-      delete normalized.required;
-    }
-  }
-  return normalized;
-}
-
-function hasDefault(value: unknown): boolean {
-  return isJsonObject(value) && Object.prototype.hasOwnProperty.call(value, 'default');
-}
-
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

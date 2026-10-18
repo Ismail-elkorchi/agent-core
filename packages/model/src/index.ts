@@ -74,6 +74,7 @@ export interface ModelAssistantInput extends ModelInputBase {
   readonly images?: never;
 }
 export interface ModelToolResultInput extends ModelInputBase {
+  readonly caller?: ModelToolCaller;
   readonly role: 'tool';
   readonly toolName: string;
   readonly toolCallId?: string;
@@ -287,9 +288,20 @@ export type ModelToolInput =
 
 export type ModelToolKind = 'function' | 'custom';
 
+/** Provider-validated relationship to a hosted program, preserved verbatim on delivery. */
+export interface ModelToolCaller {
+  readonly type: 'programmatic';
+  readonly callerId: string;
+}
+export interface ModelToolExposure {
+  readonly deferLoading?: boolean;
+  readonly allowedCallers?: readonly ('direct' | 'programmatic')[];
+  readonly outputSchema?: JsonObject;
+}
+
 export type ModelTool = ModelFunctionTool | ModelCustomTool;
 
-export interface ModelFunctionTool {
+export interface ModelFunctionTool extends ModelToolExposure {
   readonly type: 'function';
   readonly async?: boolean;
   readonly function: {
@@ -303,7 +315,7 @@ export type ModelCustomToolFormat =
   | { type: 'text' }
   | { type: 'grammar'; syntax: string; definition: string };
 
-export interface ModelCustomTool {
+export interface ModelCustomTool extends ModelToolExposure {
   readonly async?: boolean;
   readonly type: 'custom';
   readonly name: string;
@@ -312,6 +324,7 @@ export interface ModelCustomTool {
 }
 
 export interface ModelFunctionToolCall {
+  readonly caller?: ModelToolCaller;
   readonly async?: boolean;
   readonly id?: string;
   readonly type: 'function';
@@ -320,6 +333,7 @@ export interface ModelFunctionToolCall {
 }
 
 export interface ModelCustomToolCall {
+  readonly caller?: ModelToolCaller;
   readonly async?: boolean;
   readonly id?: string;
   readonly type: 'custom';
@@ -348,7 +362,7 @@ export interface ModelResponse {
   readonly raw?: JsonValue;
 }
 
-export type ModelTerminationReason = 'stop' | 'tool_calls' | 'output_limit' | 'content_filter' | 'unknown';
+export type ModelTerminationReason = 'continuation' | 'stop' | 'tool_calls' | 'output_limit' | 'content_filter' | 'unknown';
 
 /** Adapter-owned protocol material. Payloads must never be exposed by ordinary history reads. */
 export interface ProviderContextState {
@@ -399,6 +413,8 @@ export interface ModelProtocolCapabilities {
   readonly state: 'none' | 'exact';
   readonly continuation: 'replay' | 'exact_prefix';
   readonly asyncTools: boolean;
+  readonly deferredTools?: boolean;
+  readonly programmaticTools?: boolean;
   readonly steering: 'next_request' | 'native';
 /** Starting a fresh request may discard prior native state only after all protocol obligations settle. */
   readonly contextReset: 'fresh_request' | 'unsupported';

@@ -36,7 +36,7 @@ const acceptance = (runId = 'run-run') => ({
 const sourceFor = (calls) => {
   const entries = [{ name: 'read', implementationId: 'read-v1', definitionHash: 'b'.repeat(64) }];
   return {
-    source: { responseId: 'response-1', catalog: { revision: hashJson(entries), entries } },
+    source: { responseId: 'response-1', catalog: { format: 'agent-core.tool-catalog/2', revision: hashJson({ format: 'agent-core.tool-catalog/2', entries }), entries } },
     modelCalls: calls.map((call) => ({
       id: call.id,
       name: call.name,

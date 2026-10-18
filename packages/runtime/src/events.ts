@@ -347,6 +347,7 @@ export type AgentEvent =
       readonly effectId: string;
       readonly responseId: string;
       readonly response: ModelResponse;
+      readonly programReceiptsThrough?: number;
       readonly providerState?: AgentProviderStateReference;
     } & AgentTurnIdentity)
   | ({
@@ -360,6 +361,7 @@ export type AgentEvent =
     } & AgentTurnIdentity)
   | ({
       readonly type: 'observation.record.created';
+      readonly programId?: string;
       readonly id: string;
       readonly toolName: string;
       readonly call: ToolCall;
@@ -425,6 +427,7 @@ export type AgentEvent =
       readonly type: 'tool.ended';
       readonly toolName: string;
       readonly observation: StoredToolObservation;
+      readonly programId?: string;
     } & AgentToolCallAttemptIdentity & RecordedToolModelContent);
 
 export type AgentAuditEvent = Exclude<AgentEvent, { readonly type: 'run.state.transitioned' }>;
@@ -544,7 +547,8 @@ export const agentEventCodec: EventCodec<AgentEvent> = {
   metadataIndexes: [
     { field: 'exchangeId' },
     { type: 'turn.snapshot.created', field: 'recoveryBoundary' },
-    { type: 'resource.released', field: 'resourceOwnerId' }
+    { type: 'resource.released', field: 'resourceOwnerId' },
+    { type: 'observation.record.created', field: 'programReceipt' }
   ],
   metadata: (event) => {
     const exchange = 'turnId' in event && 'requestAttempt' in event
@@ -571,13 +575,14 @@ export const agentEventCodec: EventCodec<AgentEvent> = {
         description: event.toolCall.name, callIndex: String(event.callIndex), toolBatchId: event.toolBatchId,
         identity: `tool_call:${event.toolBatchId}:${String(event.callIndex)}`
       };
-      case 'tool.ended': return {
+      case 'tool.ended': return event.programId ? { programId: event.programId, toolName: event.toolName } : {
         ...exchange, sourceType: 'observation', toolName: event.toolName,
         description: `${event.toolName}: ${event.observation.summary}`.slice(0, 200),
         callIndex: String(event.callIndex), toolBatchId: event.toolBatchId,
         identity: `observation:${event.turnId}:${String(event.requestAttempt)}:${event.toolBatchId}:${String(event.callIndex)}:${String(event.toolAttempt)}`
       };
-      case 'observation.record.created': return { ...exchange, toolName: event.toolName };
+      case 'observation.record.created': return { ...exchange, toolName: event.toolName,
+        ...(event.programId ? { programReceipt: 'true' } : {}) };
       case 'turn.snapshot.created': return { exchangeId: `assistant:${event.snapshot.turnId}:${String(event.snapshot.requestAttempt)}:ended`, ...(event.snapshot.contextRecovery ? { contextRecovery: 'true', ...(event.snapshot.contextRecovery.recoveryBoundary ? { recoveryBoundary: event.snapshot.contextRecovery.recoveryBoundary } : {}) } : {}) };
       default: return {};
     }
@@ -990,7 +995,7 @@ const AGENT_EVENT_DECODERS = {
     });
   },
   'provider.attempt.settled': (value) => {
-    exact(value, ['type', ...TURN_KEYS, 'effectId', 'responseId', 'response', 'providerState']);
+    exact(value, ['type', ...TURN_KEYS, 'effectId', 'responseId', 'response', 'providerState', 'programReceiptsThrough']);
     const providerState =
       value.providerState === undefined
         ? undefined
@@ -1006,6 +1011,7 @@ const AGENT_EVENT_DECODERS = {
       effectId: requiredString(value.effectId, 'effectId'),
       responseId: requiredString(value.responseId, 'responseId'),
       response,
+      ...(value.programReceiptsThrough === undefined ? {} : { programReceiptsThrough: nonnegativeInteger(value.programReceiptsThrough, 'programReceiptsThrough') }),
       ...(providerState ? { providerState } : {})
     });
   },
@@ -1029,6 +1035,7 @@ const AGENT_EVENT_DECODERS = {
   'observation.record.created': (value) => {
     exact(value, [
       'type',
+      'programId',
       ...TOOL_ATTEMPT_KEYS,
       'id',
       'toolName',
@@ -1052,6 +1059,7 @@ const AGENT_EVENT_DECODERS = {
     );
     return Object.freeze({
       type: 'observation.record.created',
+      ...(value.programId === undefined ? {} : { programId: requiredString(value.programId, 'programId') }),
       ...decodeToolAttemptIdentity(value),
       id: requiredString(value.id, 'id'),
       toolName: requiredString(value.toolName, 'toolName'),
@@ -1172,7 +1180,7 @@ const AGENT_EVENT_DECODERS = {
     });
   },
   'tool.ended': (value) => {
-    exact(value, ['type', ...TOOL_ATTEMPT_KEYS, 'toolName', 'observation', 'modelContent', 'modelContentRef']);
+    exact(value, ['type', ...TOOL_ATTEMPT_KEYS, 'toolName', 'observation', 'modelContent', 'modelContentRef', 'programId']);
     if (value.modelContent === undefined && value.modelContentRef === undefined)
       throw malformed('Incompatible settled observation: recorded model content is required.');
     return Object.freeze({
@@ -1180,6 +1188,7 @@ const AGENT_EVENT_DECODERS = {
       ...decodeToolAttemptIdentity(value),
       toolName: requiredString(value.toolName, 'toolName'),
       observation: decodeStoredToolObservation(value.observation),
+      ...(value.programId === undefined ? {} : { programId: requiredString(value.programId, 'programId') }),
       ...decodeRecordedContent(value)
     });
   }
@@ -1212,6 +1221,7 @@ const TOOL_CALL_TYPES = ['function', 'custom'] as const;
 const AUTHORIZATION_DECISIONS = ['allow', 'deny', 'require_approval'] as const;
 const APPROVAL_DECISIONS = ['allow', 'deny'] as const;
 const TERMINATION_REASONS = [
+  'continuation',
   'stop',
   'tool_calls',
   'output_limit',
@@ -1494,6 +1504,7 @@ function decodeInferenceRequestFingerprint(
     'configuredContextIds',
     'providerContextIds',
     'runContextIds',
+    'programReceiptsThrough',
     'effectiveInstructionHash',
     'modelWindowHistoryHash',
     'modelToolSchemasHash',
@@ -1520,6 +1531,7 @@ function decodeInferenceRequestFingerprint(
     ),
     providerContextIds: stringArray(object.providerContextIds, 'fingerprint.providerContextIds'),
     runContextIds: stringArray(object.runContextIds, 'fingerprint.runContextIds'),
+    ...(object.programReceiptsThrough === undefined ? {} : { programReceiptsThrough: nonnegativeInteger(object.programReceiptsThrough, 'fingerprint.programReceiptsThrough') }),
     effectiveInstructionHash: requiredString(
       object.effectiveInstructionHash,
       'fingerprint.effectiveInstructionHash'

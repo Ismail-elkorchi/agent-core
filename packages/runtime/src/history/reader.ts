@@ -1630,6 +1630,8 @@ function publicText(entry: SessionBranchEntry): string {
         ...(entry.originalArtifact ? { originalArtifact: entry.originalArtifact } : {}),
         artifacts: entry.artifacts?.filter((ref) => ref.visibility === 'public')
       });
+    case 'tool_catalog_selection':
+      return JSON.stringify(entry.selection);
     case 'model_settings':
       return JSON.stringify({
         provider: entry.provider,

@@ -508,7 +508,7 @@ test('image and presenter assembly failures happen after durable tool truth and 
       implementationId: `tests/${scenario.name}@1`,
       description: scenario.name,
       jsonSchema: { type: 'object' },
-      outputSchema: z.unknown(),
+      outputSchema: z.json(),
       effectEnvelope: { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'] },
       ...(scenario.profile ? { requirements: { modelInputModalities: ['image'] } } : {}),
       ...(scenario.buildModelContent ? { buildModelContent: scenario.buildModelContent } : {}),
@@ -619,7 +619,7 @@ test('session and observation-record assembly failures do not reclassify a compl
       implementationId: 'tests/assembly-effect@1',
       description: 'assembly effect',
       jsonSchema: { type: 'object' },
-      outputSchema: z.unknown(),
+      outputSchema: z.json(),
       effectEnvelope: { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'] },
       decodeInput() {
         return { ok: true, input: {} };
@@ -2007,6 +2007,7 @@ test('durable approval resumes after repository reopen and rejects changed polic
     tools: [tool],
     toolPolicy: { allowedRisks: ['read'] }
   });
+  const beforePolicyRejection = await repositories.events.tail(suspended.runId);
   await assert.rejects(
     async () =>
       (
@@ -2017,8 +2018,10 @@ test('durable approval resumes after repository reopen and rejects changed polic
           decision: 'allow'
         })
       ).result,
-    /different runtime implementation or configuration/
+    /different runtime configuration/
   );
+  assert.deepEqual(await repositories.events.tail(suspended.runId), beforePolicyRejection,
+    'changed authority is rejected without claiming a new driver or changing the ledger');
   assert.equal(preparationReleases, 1);
   assert.equal(
     (await eventsFor(repositories.events, suspended.runId)).filter(
@@ -2479,7 +2482,7 @@ test('semantic tool audit events cannot advance authoritative per-call recovery 
     implementationId: 'tests/unknown-recovery@1',
     description: 'unknown recovery fixture',
     jsonSchema: { type: 'object' },
-    outputSchema: z.unknown(),
+    outputSchema: z.json(),
     effectEnvelope: { accesses: effects.accesses, lockScopes: effects.lockScopes },
     decodeInput() {
       return { ok: true, input: {} };

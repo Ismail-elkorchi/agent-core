@@ -1,3 +1,4 @@
+import { parseJsonObject } from '@agent-core/json';
 import { classifyModelHttpFailure, type ModelProviderError, type ModelUsage } from '@agent-core/model';
 
 export const DEFAULT_SSE_BUFFER_BYTES = 1_048_576;
@@ -41,9 +42,9 @@ export interface ResponsesOutputItem extends Readonly<Record<string, unknown>> {
   readonly status?: string;
   readonly role?: string;
   readonly content?: readonly ResponsesContentPart[];
-  readonly call_id?: string;
+  readonly call_id?: string | null;
   readonly name?: string;
-  readonly arguments?: string;
+  readonly arguments?: unknown;
   readonly input?: string;
   readonly summary?: readonly ResponsesContentPart[] | string;
   readonly encrypted_content?: string;
@@ -388,9 +389,11 @@ function decodeResponsesOutputItem(value: unknown, label: string): ResponsesOutp
     ...optionalStringProperty(record, 'status', label),
     ...optionalStringProperty(record, 'role', label),
     ...(content === undefined ? {} : { content }),
-    ...optionalStringProperty(record, 'call_id', label),
+    ...(record.call_id === null && (record.type === 'tool_search_call' || record.type === 'tool_search_output')
+      ? { call_id: null } : optionalStringProperty(record, 'call_id', label)),
     ...optionalStringProperty(record, 'name', label),
-    ...optionalStringProperty(record, 'arguments', label),
+    ...(record.type === 'tool_search_call' && record.arguments !== undefined
+      ? { arguments: parseJsonObject(record.arguments) } : optionalStringProperty(record, 'arguments', label)),
     ...optionalStringProperty(record, 'input', label),
     ...(summary === undefined ? {} : { summary }),
     ...optionalStringProperty(record, 'encrypted_content', label),
@@ -588,3 +591,5 @@ export {
   responsesOpaqueProtocolPayloads
 } from './model-items.js';
 export { responsesTool } from './tools.js';
+
+export { responsesCaller, responsesCallerWire } from './advanced-tools.js';

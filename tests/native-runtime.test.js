@@ -15,7 +15,7 @@ import {
   ContextService,
   agentEventCodec
 } from '@agent-core/runtime';
-import { adoptToolDefinition } from '@agent-core/tools';
+import { adoptToolDefinition, ToolCatalog, captureToolSourceSnapshot, describeCatalogTool } from '@agent-core/tools';
 
 class Socket extends EventEmitter {
   readyState = 1;
@@ -144,7 +144,7 @@ test(
             );
             assert.deepEqual(
               body.tools.map((tool) => tool.name),
-              ['fast']
+              ['fast', 'tool_catalog_discover']
             );
             ws.feed(
               { type: 'response.created', response: { id: 'r2', previous_response_id: 'r1' } },
@@ -182,6 +182,20 @@ test(
     const fastTool = tool('fast', async () => {
       catalogChanged = true;
     });
+    const source = {
+      id: 'native-fixture',
+      async snapshot() {
+        return captureToolSourceSnapshot({ sourceId: this.id, bindingRevision: 'account-1',
+          tools: (catalogChanged ? [fastTool] : [slowTool, fastTool]).map(tool =>
+            describeCatalogTool({ sourceId: this.id, bindingRevision: 'account-1', toolId: tool.name, tool })) });
+      },
+      async load(reference) { return reference.toolId === 'fast' ? fastTool : slowTool; }
+    };
+    const toolCatalog = new ToolCatalog({ sources: [source] });
+    const discovered = await toolCatalog.discover();
+    await toolCatalog.select(discovered.items.map(item => item.reference), {
+      expectedOwnerId: toolCatalog.selection().ownerId,
+      expectedSelectionRevision: discovered.selectionRevision, operationId: 'initial-selection' });
     const runtime = new AgentRuntime({
       provider,
       model: 'gpt-6-astra',
@@ -192,8 +206,7 @@ test(
         artifacts,
         budget: { maxInvocations: 3 }
       }),
-      tools: [slowTool, fastTool],
-      toolCatalogProvider: () => (catalogChanged ? [fastTool] : [slowTool, fastTool]),
+      toolCatalog,
       toolBoundary: { authorizationPolicyId: 'tests/native', executionTargetId: 'tests/native' },
       repositories: { events, artifacts }
     });

@@ -1,3 +1,6 @@
+import { createProgramResult } from './program-result.js';
+import { ProgramExecutionCoordinator } from './program-execution.js';
+import type { ProgramExecutionHost, RuntimeProgramRunner } from './program-contracts.js';
 import { serializeToolModelContent } from '@agent-core/tools';
 import { issueEffectStartTicket, startExternalEffect } from '@agent-core/effects';
 import { hashJson, type EventRepository } from '@agent-core/persistence';
@@ -47,6 +50,7 @@ import {
 import { AgentToolStartBlockedError } from '../run/control/driver.js';
 import {
   isToolCallStartable,
+  toolInvocationCaller,
   type AgentToolCallPlanRecord,
   type AgentToolCallState,
   type AgentToolPhase,
@@ -69,9 +73,15 @@ export interface ToolExecutionInput {
   readonly events: Pick<EventRepository<AgentEvent>, 'referenceByKey' | 'readReference'>;
   readonly driverGeneration: number;
   readonly resolveTools: (source: ToolCatalogSnapshot) => readonly CompiledToolDefinition[];
-  readonly currentTools: () =>
+  readonly currentTools: (phase: AgentToolPhase) =>
     readonly CompiledToolDefinition[] | Promise<readonly CompiledToolDefinition[]>;
   readonly toolContext: ToolPlanningContext;
+  readonly programRunner?: RuntimeProgramRunner;
+  readonly nativeProgrammaticTools?: boolean;
+  readonly artifactRepository?: import('@agent-core/persistence').ArtifactRepository;
+  readonly admitProgramCall?: (batch: AgentToolPhase, tools: readonly CompiledToolDefinition[]) => Promise<void>;
+  readonly yieldProgramCall?: (target: { toolBatchId: string; callIndex: number }) => Promise<void>;
+  readonly interruptProgramCall?: (target: { toolBatchId: string; callIndex: number }) => Promise<void>;
   readonly authorizer?: ToolAuthorizer;
   readonly contextPrerequisite?: ToolContextPrerequisite;
   readonly resourceLeases?: ResourceLeaseCoordinator;
@@ -131,7 +141,11 @@ export class ToolCallExecutor {
   private readonly stepping = new Set<string>();
   private readonly preparedPresentations = new Set<string>();
 
-  constructor(private readonly input: ToolExecutionInput) {}
+  private readonly programs: ProgramExecutionCoordinator | undefined;
+
+  constructor(private readonly input: ToolExecutionInput) {
+    this.programs = input.programRunner ? new ProgramExecutionCoordinator(input, target => this.step(target)) : undefined;
+  }
 
   async step(
     target: Pick<AgentToolTarget, 'toolBatchId' | 'callIndex'>
@@ -169,6 +183,14 @@ export class ToolCallExecutor {
           : Object.freeze({ kind: 'blocked', reason: 'dependencies' });
       }
       if (call.stage === 'effect_ready') {
+        if (this.input.programRunner?.toolName === phase.calls[target.callIndex]?.name && !phase.source.program) {
+          const runningPrograms = this.input.state().toolBatches.flatMap(batch => batch.calls.flatMap((entry, index) =>
+            !batch.source.program && entry.name === this.input.programRunner?.toolName &&
+            (['effect_pending', 'outcome_unknown'].includes(batch.callStates[index]?.stage ?? '') ||
+              this.active.has(callKey({ toolBatchId: batch.toolBatchId, callIndex: index }))) ? [entry] : []));
+          if (runningPrograms.length >= (this.input.programRunner?.maxConcurrentPrograms ?? 1))
+            return Object.freeze({ kind: 'blocked', reason: 'dependencies' });
+        }
         if (
           !isToolCallStartable(
             phase,
@@ -182,7 +204,9 @@ export class ToolCallExecutor {
         const retained = this.retainedPlans.get(key);
         this.retainedPlans.delete(key);
         // Lease waits and the effect itself stay outside the provider reader and driver queue.
-        const completion = startCall(this.input, phase, target.callIndex, retained)
+        const completion = startCall(this.input, phase, target.callIndex, retained,
+          this.input.programRunner?.toolName === phase.calls[target.callIndex]?.name && !phase.source.program
+            ? this.programs?.host(phase, target.callIndex, call.toolAttempt) : undefined)
           .then((started) => started.completion)
           .then((result) => {
             if (result.committed) this.observations.set(key, result.committed);
@@ -195,7 +219,7 @@ export class ToolCallExecutor {
         return Object.freeze({ kind: 'started', completion });
       }
       if ((call.stage === 'settled' || call.stage === 'recording') &&
-          this.input.stagePresentations?.(phase) && !this.preparedPresentations.has(phase.toolBatchId)) {
+          !phase.source.program && this.input.stagePresentations?.(phase) && !this.preparedPresentations.has(phase.toolBatchId)) {
         if (phase.callStates.some(item => !['settled', 'recording', 'recorded', 'resolved', 'cancelled'].includes(item.stage)))
           return Object.freeze({ kind: 'blocked', reason: 'dependencies' });
         const observations = [];
@@ -259,6 +283,15 @@ export class ToolCallExecutor {
     }
   }
 
+  async settleProgramParents(reason: 'approval_required' | 'tool_outcome_unknown'): Promise<void> {
+    this.programs?.quiesce(reason);
+    const name = this.input.programRunner?.toolName;
+    if (!name) return;
+    const parents = this.input.state().toolBatches.flatMap(batch => batch.calls.flatMap((call, index) =>
+      call.name === name && !batch.source.program ? [this.active.get(callKey({ toolBatchId: batch.toolBatchId, callIndex: index }))] : []));
+    await Promise.all(parents.filter((value): value is Promise<ToolCallCompletion> => value !== undefined));
+  }
+
   async release(): Promise<void> {
     const plans = [...this.retainedPlans.values()];
     this.retainedPlans.clear();
@@ -295,7 +328,7 @@ async function callAvailable(
 ): Promise<boolean> {
   const entry = phase.source.catalog.entries.find((item) => item.name === call.name);
   if (!entry) return false;
-  return (await input.currentTools()).some(
+  return (await input.currentTools(phase)).some(
     (tool) =>
       tool.name === entry.name &&
       tool.implementationId === entry.implementationId &&
@@ -305,7 +338,8 @@ async function callAvailable(
 
 async function contextPrerequisiteObservation(
   input: ToolExecutionInput,
-  plan: ToolCallPlan
+  plan: ToolCallPlan,
+  context: ToolPlanningContext
 ): Promise<ToolObservation | undefined> {
   if (!input.contextPrerequisite) return undefined;
   const prerequisite = await input.contextPrerequisite({
@@ -313,7 +347,7 @@ async function contextPrerequisiteObservation(
     toolImplementationId: plan.toolImplementationId,
     input: plan.canonicalSnapshot,
     effects: plan.effects,
-    context: input.toolContext
+    context
   });
   if (!prerequisite) return undefined;
   return contextRequiredObservation(prerequisite.summary, prerequisite.context);
@@ -359,7 +393,7 @@ async function planAndAuthorizeCall(
   const callPlan = result.plan;
   assertToolDependencies(callPlan.effects, callIndex, phase.calls.length);
   retainedPlans.set(key, callPlan);
-  const currentAuthorization = await authorize(input, callPlan);
+  const currentAuthorization = await authorize(input, callPlan, planningContext(input, phase, callIndex, call));
   const storedApproval =
     ready.approved?.approval.fingerprint === callPlan.fingerprint &&
     ready.approved.approval.policyHash === hashJson(input.toolContext.policy) &&
@@ -486,7 +520,8 @@ async function startCall(
   input: ToolExecutionInput,
   phase: AgentToolPhase,
   callIndex: number,
-  retained: ToolCallPlan | undefined
+  retained: ToolCallPlan | undefined,
+  programHost?: ProgramExecutionHost
 ): Promise<{ readonly completion: Promise<ToolCallCompletion> }> {
   const call = requireCall(phase, callIndex);
   const callState = phase.callStates[callIndex];
@@ -546,7 +581,7 @@ async function startCall(
     }
     // The admitted plan owns its canonical source snapshot. Recheck current policy after
     // the lease without replacing that snapshot with a newly captured history or resource view.
-    const authorization = await authorize(input, plan);
+    const authorization = await authorize(input, plan, planningContext(input, phase, callIndex, call, callState.toolAttempt));
     const approved = callState.plan.approval;
     const approvedNow =
       approved?.fingerprint === plan.fingerprint &&
@@ -568,7 +603,7 @@ async function startCall(
       await releaseToolCallPlan(plan);
       return { completion: Promise.resolve({ outcome: 'owned' }) };
     }
-    const prerequisite = await contextPrerequisiteObservation(input, plan);
+    const prerequisite = await contextPrerequisiteObservation(input, plan, planningContext(input, phase, callIndex, call, callState.toolAttempt));
     if (prerequisite) {
       const committed = await commitObservation(input, phase, call, undefined, prerequisite);
       const state: AgentToolCallState = Object.freeze({
@@ -639,7 +674,8 @@ async function startCall(
         callState,
         plan,
         invocation,
-        lease
+        lease,
+        programHost
       )
     });
   } catch (error) {
@@ -660,11 +696,13 @@ async function executeStartedCall(
   callState: Extract<AgentToolCallState, { readonly stage: 'effect_ready' }>,
   plan: ToolCallPlan,
   invocation: ToolInvocation,
-  lease: Awaited<ReturnType<ResourceLeaseCoordinator['acquire']>> | undefined
+  lease: Awaited<ReturnType<ResourceLeaseCoordinator['acquire']>> | undefined,
+  programHost?: ProgramExecutionHost
 ): Promise<ToolCallCompletion> {
   try {
     const observation = await invokeToolCallPlan(invocation, {
       ...input.toolContext,
+      ...(programHost ? { services: { ...input.toolContext.services, programExecution: programHost } } : {}),
       ...(lease ? { resourceLease: lease } : {}),
       emitProgress: (progress) =>
         input.emit({
@@ -806,14 +844,14 @@ async function requireMatchingPlan(
   return plan;
 }
 
-async function authorize(input: ToolExecutionInput, plan: ToolCallPlan) {
+async function authorize(input: ToolExecutionInput, plan: ToolCallPlan, context: ToolPlanningContext) {
   const request = {
     call: plan.call,
     toolImplementationId: plan.toolImplementationId,
     input: plan.canonicalSnapshot,
     effects: plan.effects,
     fingerprint: plan.fingerprint,
-    context: input.toolContext
+    context
   };
   return (
     enforceAllowedEffects(request) ??
@@ -916,6 +954,7 @@ async function appendToolEnded(
       ...identity,
       toolName: call.name,
       observation: state.settlement.original,
+      ...(phase.source.program ? { programId: phase.source.program.id } : {}),
       ...(state.settlement.modelContentRef
         ? { modelContentRef: state.settlement.modelContentRef }
         : { modelContent: state.settlement.modelContent })
@@ -947,6 +986,22 @@ async function recordObservation(
   committed: CommittedToolObservation
 ): Promise<void> {
   const identity = attemptIdentity(phase, callIndex, call, state.toolAttempt);
+  const modelCaller = phase.modelCalls[callIndex]?.caller;
+  if (phase.source.program) {
+    const key = toolEventKey(input.runId, identity, 'observation');
+    if (await input.events.referenceByKey(input.runId, key)) return;
+    const result = await createProgramResult({ runId: input.runId, toolBatchId: phase.toolBatchId,
+      ...(call.id ? { callId: call.id } : {}), toolName: call.name, settlement: state.settlement,
+      ...(input.artifactRepository ? { artifacts: input.artifactRepository } : {}) });
+    await input.append({ type: 'observation.record.created', ...identity, programId: phase.source.program.id,
+      id: committed.id, toolName: call.name, call, toolCallType: call.input.kind === 'text' ? 'custom' : 'function',
+      observedFacts: [], kind: committed.original.kind, summary: committed.original.summary,
+      modelContent: [{ type: 'text', text: JSON.stringify({ programId: phase.source.program.id,
+        parent: phase.source.program.parent, receipt: result.receipt }) }] }, key);
+    return;
+  }
+  const structuredProgramResult = !!phase.modelCalls[callIndex]?.caller || (input.nativeProgrammaticTools === true &&
+    call.input.kind === 'json' && sourceTools(input, phase, call).some(tool => tool.invocationModes.includes('programmatic')));
   const previous = await input.events.referenceByKey(input.runId, toolEventKey(input.runId, identity, 'observation'));
   if (previous) {
     const event = (await input.events.readReference(previous)).event;
@@ -957,6 +1012,18 @@ async function recordObservation(
     delete withoutReference.modelContentRef;
     committed = { ...withoutReference, modelContent: event.modelContent ?? [],
       ...(event.modelContentRef ? { modelContentRef: event.modelContentRef } : {}) };
+  } else if (structuredProgramResult) {
+    // A provider-hosted program consumes exact typed JSON, never display text or an excerpt.
+    const result = await createProgramResult({ runId: input.runId, toolBatchId: phase.toolBatchId,
+      ...(call.id ? { callId: call.id } : {}), toolName: call.name, settlement: state.settlement,
+      ...(input.artifactRepository ? { artifacts: input.artifactRepository } : {}) });
+    const modelContent = Object.freeze([{ type: 'text' as const, text: JSON.stringify(result) }]);
+    const modelContentRef = await input.artifactRepository?.store({ label: `${call.name}-program-result`,
+      mediaType: 'application/json', content: new TextEncoder().encode(JSON.stringify(modelContent)),
+      description: 'Exact structured program result delivery.' });
+    const original = { ...committed };
+    delete original.modelContentRef;
+    committed = { ...original, modelContent, ...(modelContentRef ? { modelContentRef } : {}) };
   }
   try {
     const record = await input.observationStore.projectToolObservation(committed);
@@ -1008,6 +1075,7 @@ async function recordObservation(
       toolName: record.toolName,
       ...(call.id ? { callId: call.id } : {}),
       toolCallType: call.input.kind === 'text' ? 'custom' : 'function',
+      ...(modelCaller ? { caller: modelCaller } : {}),
       immediateContent: serializeToolModelContent(record.modelContent),
       immediateImages: record.modelImages
     });
@@ -1026,12 +1094,14 @@ async function recordObservation(
       },
       toolEventKey(input.runId, identity, 'recording-failed')
     );
+    if (structuredProgramResult) throw error;
     const fallback = minimalToolResultContent(state.settlement.original, call.name, message);
     input.modelWindow.recordToolResult({
       turnIndex: phase.identity.turnIndex,
       toolName: call.name,
       ...(call.id ? { callId: call.id } : {}),
       toolCallType: call.input.kind === 'text' ? 'custom' : 'function',
+      ...(modelCaller ? { caller: modelCaller } : {}),
       immediateContent: fallback
     });
   }
@@ -1243,9 +1313,11 @@ function invocationIdentity(
           preconditions: state.effect.intent.recovery.preconditions
         })
       : undefined;
+  const caller = toolInvocationCaller(phase, callIndex);
   return {
     runId,
     ...attemptIdentity(phase, callIndex, call, toolAttempt),
+    ...(caller ? { caller } : {}),
     ...(recovery ? { recovery } : {})
   };
 }

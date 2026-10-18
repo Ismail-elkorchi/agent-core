@@ -66,12 +66,14 @@ export function parseModelProtocolCapabilities(value: unknown): ModelProtocolCap
     (record.state !== 'none' && record.state !== 'exact') ||
     (record.continuation !== 'replay' && record.continuation !== 'exact_prefix') ||
     typeof record.asyncTools !== 'boolean' ||
+    (record.deferredTools !== undefined && typeof record.deferredTools !== 'boolean') ||
+    (record.programmaticTools !== undefined && typeof record.programmaticTools !== 'boolean') ||
     (record.steering !== 'native' && record.steering !== 'next_request') ||
     (record.contextReset !== 'fresh_request' && record.contextReset !== 'unsupported') ||
     Object.keys(record).some((key) => ![
       'version', 'revision', 'endpoint', 'roles', 'developerRole', 'inputKinds', 'outputKinds',
       'state', 'continuation', 'asyncTools', 'steering', 'contextReset', 'toolChoice',
-      'counting', 'reasoningAccounting', 'reasoningPrefix'
+      'counting', 'reasoningAccounting', 'reasoningPrefix', 'deferredTools', 'programmaticTools'
     ].includes(key)) ||
     (record.counting !== 'estimate' && record.counting !== 'provider') ||
     (record.developerRole !== undefined &&
@@ -112,6 +114,8 @@ export function parseModelProtocolCapabilities(value: unknown): ModelProtocolCap
     state: record.state,
     continuation: record.continuation,
     asyncTools: record.asyncTools,
+    ...(typeof record.deferredTools === 'boolean' ? { deferredTools: record.deferredTools } : {}),
+    ...(typeof record.programmaticTools === 'boolean' ? { programmaticTools: record.programmaticTools } : {}),
     steering: record.steering,
     contextReset: record.contextReset,
     counting: record.counting,

@@ -61,6 +61,7 @@ export interface RecordModelOutputInput {
 }
 
 export interface RecordToolResultInput {
+  readonly caller?: import('@agent-core/model').ModelToolCaller;
   readonly source?: EventReference;
   readonly observationId?: string;
   turnIndex: number;
@@ -166,6 +167,11 @@ export class ModelWindow {
   }
 
   recordToolResult(input: RecordToolResultInput): void {
+    if (!input.caller && input.callId) {
+      const origin = this.activeItems.flatMap(item => item.kind === 'message' && item.message.role === 'assistant'
+        ? item.message.toolCalls ?? [] : []).find(call => call.id === input.callId);
+      if (origin?.caller) input = { ...input, caller: origin.caller };
+    }
     if (input.observationId) {
       const previous = this.activeItems.find(item => item.id === input.observationId);
       if (previous) {
@@ -410,6 +416,7 @@ function sameToolCall(left: ModelToolCall, right: ModelToolCall): boolean {
 function toolResultMessage(input: RecordToolResultInput): ModelInputItem {
   return Object.freeze({
     role: 'tool',
+    ...(input.caller ? { caller: input.caller } : {}),
     toolName: input.toolName,
     toolCallType: input.toolCallType,
     content: input.immediateContent,

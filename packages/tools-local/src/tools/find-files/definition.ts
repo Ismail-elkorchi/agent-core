@@ -16,6 +16,7 @@ export const findFilesTool = defineTool({
   description: 'Find rooted files or directories using the common glob and ignore semantics.',
   schema: findFilesInputSchema,
   outputSchema: findFilesOutputSchema,
+  invocationModes: ['direct', 'programmatic'],
   buildModelContent: buildPathSelectionContent,
   requirements: { services: ['localToolConfiguration'] },
   effectEnvelope: { accesses: [{ mode: 'read', scope: 'files' }], lockScopes: [] },

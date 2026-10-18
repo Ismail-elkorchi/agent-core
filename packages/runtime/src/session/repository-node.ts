@@ -1,3 +1,5 @@
+import { decodeSessionToolCatalogSelection } from './tool-catalog.js';
+import { parseToolCatalogSelection, type ToolCatalogSelectionState } from '@agent-core/tools';
 import { createSessionRunFinalizationConfirmation, decodeSessionRunFinalizationConfirmation } from './finalization-confirmation.js';
 import { recordedModelSelection } from '../orchestration/model-change.js';
 import { protectedInferenceInput } from '../inference/input.js';
@@ -134,7 +136,7 @@ export class JsonlSessionRepository implements SessionRepository {
         const header: SessionHeader = Object.freeze({
           type: 'session',
           version: 1,
-          format: 'agent-core.session/6',
+          format: 'agent-core.session/7',
           sessionStateStorage: 'session',
           id,
           timestamp: new Date().toISOString(),
@@ -167,6 +169,37 @@ export class JsonlSessionRepository implements SessionRepository {
   async currentModelSettings(session: SessionDescriptor): Promise<ModelSelection | undefined> {
     const entry = await this.branchIndex(session.id).currentModelSettings(session);
     return entry === undefined ? this.branchIndex(session.id).initialModelSettings(session) : recordedModelSelection([entry]);
+  }
+  async currentToolCatalogSelection(session: SessionDescriptor): Promise<ToolCatalogSelectionState> {
+    const state = await this.branchIndex(session.id).toolCatalogSelection(session);
+    if (!state) throw new Error('Tool catalog selection is missing.');
+    return state;
+  }
+  findToolCatalogSelection(session: SessionDescriptor, operationId: string): Promise<ToolCatalogSelectionState | undefined> {
+    return this.branchIndex(session.id).toolCatalogSelection(session, operationId);
+  }
+  saveToolCatalogSelection(session: SessionDescriptor, input: Parameters<SessionRepository['saveToolCatalogSelection']>[1], options: Parameters<SessionRepository['saveToolCatalogSelection']>[2] = {}): Promise<ToolCatalogSelectionState> {
+    const selection = parseToolCatalogSelection(input.selection);
+    return this.enqueue(session.id, () => this.withSessionLock(session.id, async () => {
+      const state = await this.branchIndex(session.id).descriptor(session.header.binding);
+      assertDescriptor(session, state);
+      const current = await this.currentToolCatalogSelection(session);
+      if (input.ownerId !== current.ownerId) throw new PersistenceConflictError('Tool catalog branch changed.');
+      const previous = await this.findToolCatalogSelection(session, input.operationId);
+      if (previous) {
+        if (previous.selection.revision !== selection.revision) throw new PersistenceConflictError('Tool catalog operation changed.');
+        return previous;
+      }
+      if (input.expectedRevision !== current.selection.revision) throw new PersistenceConflictError('Tool catalog selection changed.');
+      const snapshot = await this.branchIndex(session.id).snapshot(session);
+      const entry = decodeSessionToolCatalogSelection({ ...baseEntry(state.leafId), type: 'tool_catalog_selection',
+        branchId: snapshot.branchId, operationId: input.operationId, selection });
+      const publish = async () => {
+        await this.appendRecord(session.id, state, entry);
+        return Object.freeze({ ownerId: current.ownerId, selection });
+      };
+      return options.withOwnership ? options.withOwnership(publish) : publish();
+    }));
   }
   async committedRetainedStateBytes(session: SessionDescriptor): Promise<number> {
     return (await this.branchIndex(session.id).checked(session)).retainedStateBytes;
@@ -293,7 +326,8 @@ export class JsonlSessionRepository implements SessionRepository {
           entry.type !== 'branch' &&
           entry.type !== 'model_settings' &&
           entry.type !== 'context_transition' &&
-          entry.type !== 'session_state_batch'
+          entry.type !== 'session_state_batch' &&
+          entry.type !== 'tool_catalog_selection'
       )
     );
   }
@@ -981,6 +1015,7 @@ function parseBranchEntry(value: JsonValue): SessionBranchEntry {
   }
   if (value.type === 'context_transition') return decodeContextTransitionEntry(value);
   if (value.type === 'session_state_batch') return decodeSessionStateBatchEntry(value);
+  if (value.type === 'tool_catalog_selection') return decodeSessionToolCatalogSelection(value);
   throw new Error(
     `Unsupported or malformed session entry: ${typeof value.type === 'string' ? value.type : 'unknown'}`
   );
@@ -1052,7 +1087,7 @@ const SESSION_HEADER_FIELDS = new Set([
 function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader {
   if (
     !isJsonObject(value) ||
-    value.format !== 'agent-core.session/6' ||
+    value.format !== 'agent-core.session/7' ||
     value.sessionStateStorage !== 'session'
   )
     throw new Error(
@@ -1074,7 +1109,7 @@ function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader 
   return Object.freeze({
     type: 'session',
     version: 1,
-    format: 'agent-core.session/6',
+    format: 'agent-core.session/7',
     sessionStateStorage: 'session',
     id: value.id,
     timestamp: value.timestamp,

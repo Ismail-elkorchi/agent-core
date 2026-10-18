@@ -1,3 +1,7 @@
+import { programResultSchema } from './program-result.js';
+import { contextControlRole } from '../context/recovery.js';
+import { isToolCatalogControl } from '../run/tool-discovery.js';
+import { type NativeToolExposure } from './native-tool-exposure.js';
 import { type PromptInstructionBlock } from '../inference/prompt-material.js';
 import { type PromptInstruction } from '../inference/model-request-assembler.js';
 import {
@@ -93,21 +97,47 @@ export function modelToolCallFromToolCall(toolCall: ToolCall): ModelToolCall {
   };
 }
 
-export function toolsForModel(tools: ToolDefinition[], modelProfile: ModelProfile): ModelTool[] {
-  return tools.map((tool) => modelToolForDefinition(tool, modelProfile));
+export function toolsForModel(tools: ToolDefinition[], modelProfile: ModelProfile, nativeToolExposure?: NativeToolExposure, eagerTool?: ToolDefinition): ModelTool[] {
+  const protocol = modelProfile.capabilities.protocol;
+  if (nativeToolExposure?.discovery && !protocol?.deferredTools)
+    throw new Error(`Native tool discovery is unsupported by ${modelProfile.id} on this endpoint.`);
+  if (nativeToolExposure?.programmatic && !protocol?.programmaticTools)
+    throw new Error(`Native programmatic tools are unsupported by ${modelProfile.id} on this endpoint.`);
+  return tools.filter(tool => tool.invocationModes.includes('direct') ||
+    (nativeToolExposure?.programmatic === true && tool.invocationModes.includes('programmatic')))
+    .map((tool) => modelToolForDefinition(tool, modelProfile, nativeToolExposure, eagerTool));
 }
 
 export function modelToolForDefinition(
   tool: ToolDefinition,
-  modelProfile: ModelProfile
+  modelProfile: ModelProfile,
+  nativeToolExposure?: NativeToolExposure,
+  eagerTool?: ToolDefinition
 ): ModelTool {
   const supportedInputs = modelProfile.capabilities.supportedToolInputs;
   const textInput = tool.textInput;
+  const programmatic = nativeToolExposure?.programmatic === true && tool.invocationModes.includes('programmatic');
+  // Control grants and the host's exact program orchestration definition stay
+  // available without discovery, including during bounded context recovery.
+  const eager = contextControlRole(tool) !== undefined || isToolCatalogControl(tool) || tool === eagerTool;
+  const exposure = {
+    ...(nativeToolExposure?.discovery && !eager ? { deferLoading: true } : {}),
+    ...(nativeToolExposure?.programmatic ? { allowedCallers: tool.invocationModes } : {})
+  };
+  // Native programs receive the runtime's structured durable result envelope.
+  // Prefer JSON input so Responses can advertise its supported function output schema.
+  if (programmatic && supportedInputs.some(input => input.kind === 'json')) return {
+    type: 'function', ...exposure,
+    ...(modelProfile.capabilities.protocol?.asyncTools ? { async: true } : {}),
+    outputSchema: programResultSchema(tool.outputJsonSchema),
+    function: { name: tool.name, description: tool.description, parameters: tool.jsonSchema }
+  };
   if (
     textInput?.format.type === 'grammar' &&
     supportsGrammar(textInput.format.syntax, supportedInputs)
   ) {
     return {
+      ...exposure,
       ...(modelProfile.capabilities.protocol?.asyncTools ? { async: true } : {}),
       type: 'custom',
       name: tool.name,
@@ -117,6 +147,7 @@ export function modelToolForDefinition(
   }
   if (tool.textInput && supportedInputs.some((input) => input.kind === 'text')) {
     return {
+      ...exposure,
       ...(modelProfile.capabilities.protocol?.asyncTools ? { async: true } : {}),
       type: 'custom',
       name: tool.name,
@@ -126,6 +157,7 @@ export function modelToolForDefinition(
   }
   if (supportedInputs.some((input) => input.kind === 'json')) {
     return {
+      ...exposure,
       ...(modelProfile.capabilities.protocol?.asyncTools ? { async: true } : {}),
       type: 'function',
       function: {

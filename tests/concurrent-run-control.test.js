@@ -80,7 +80,7 @@ function batch(
     maxConcurrency,
     instructions: [],
     modelInputModalities: ['text'],
-    source: { responseId: id, catalog: { revision: hashJson(entries), entries } },
+    source: { responseId: id, catalog: { format: 'agent-core.tool-catalog/2', revision: hashJson({ format: 'agent-core.tool-catalog/2', entries }), entries } },
     modelCalls: calls.map((call) => ({
       id: call.id,
       name: call.name,

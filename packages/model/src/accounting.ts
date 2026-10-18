@@ -526,7 +526,8 @@ function accountItems(
         name: item.name,
         toolName: item.toolName,
         toolCallId: item.toolCallId,
-        toolCallType: item.toolCallType
+        toolCallType: item.toolCallType,
+        ...(item.role === 'tool' && item.caller ? { caller: item.caller } : {})
       })
     );
     parts.push({ kind: 'framing', path, status: 'estimated', tokens: 4 });

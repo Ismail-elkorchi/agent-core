@@ -20,6 +20,7 @@ export const listDirectoryTool = defineTool({
   description: 'List a rooted directory as a sorted flat collection with explicit coverage.',
   schema: listDirectoryInputSchema,
   outputSchema: listDirectoryOutputSchema,
+  invocationModes: ['direct', 'programmatic'],
   buildModelContent: buildPathSelectionContent,
   requirements: {
     services: ['localToolConfiguration']

@@ -62,7 +62,7 @@ export async function inspectSessionOperational(input: {
       enforcement: input.profile.supportedParameters.includes('maxOutputTokens') ? 'provider-cap' as const : 'reservation-only' as const }),
     allowance: input.ownerId ? await input.inference.inspectOwnerAllowance(input.ownerId) : null,
     resources: input.resources ?? null,
-    meaning: 'Configured eligibility, context admission, invocation lifecycle, owner allowance and resources are independent observations, not an atomic snapshot or permission. Transactional admission and per-call authorization still apply.'
+    meaning: 'Configured eligibility, invocation routes, model-schema exposure, context admission, invocation lifecycle, owner allowance and resources are independent observations, not an atomic snapshot or permission. Portable program-only tools are executable without top-level model schemas; deferred schemas require hosted discovery. Transactional admission and per-call authorization still apply.'
   });
   const maxBytes = input.page?.maxBytes ?? 32768;
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 262144)

@@ -15,13 +15,15 @@ import {
   effectsConflict,
   type ToolCall,
   type ToolEffects,
-  type ToolObservation
+  type ToolObservation,
+  type ToolInvocationCaller
 } from '@agent-core/tools';
 import type {
   AgentApprovalBinding,
   AgentApprovalRequest,
   AgentEffectiveInstruction,
-  AgentTurnIdentity
+  AgentTurnIdentity,
+  AgentToolCallAttemptIdentity
 } from '../contracts.js';
 import { decodeToolCatalog, type ToolCatalogSnapshot } from '../tool-catalog.js';
 
@@ -53,6 +55,26 @@ export interface AgentToolResultDelivery {
   readonly successorResponseId?: string;
 }
 
+export interface AgentProgramSource {
+  readonly id: string;
+  readonly sourceDigest: string;
+  readonly parent: AgentToolCallAttemptIdentity & { readonly runId: string };
+}
+
+export type AgentToolSource = Readonly<{ readonly catalog: ToolCatalogSnapshot } & (
+  | { readonly responseId: string; readonly nativeCatalogIdentity?: string; readonly program?: never }
+  | { readonly program: AgentProgramSource; readonly responseId?: never; readonly nativeCatalogIdentity?: never }
+)>;
+
+/** Preserve the original caller at authorization, invocation, approval and recovery boundaries. */
+export function toolInvocationCaller(phase: AgentToolPhase, callIndex: number): ToolInvocationCaller | undefined {
+  if (phase.source.program) return Object.freeze({ kind: 'programmatic', programId: phase.source.program.id,
+    parent: phase.source.program.parent });
+  const caller = phase.modelCalls[callIndex]?.caller;
+  return caller ? Object.freeze({ kind: 'provider_programmatic', programId: caller.callerId,
+    providerResponseId: phase.source.responseId }) : undefined;
+}
+
 interface AgentToolBatchBase {
   readonly kind: 'tools';
   readonly identity: AgentTurnIdentity;
@@ -60,11 +82,7 @@ interface AgentToolBatchBase {
   readonly calls: readonly ToolCall[];
   readonly callStates: readonly AgentToolCallState[];
   readonly maxConcurrency: number;
-  readonly source: Readonly<{
-    readonly responseId: string;
-    readonly catalog: ToolCatalogSnapshot;
-    readonly nativeCatalogIdentity?: string;
-  }>;
+  readonly source: AgentToolSource;
   readonly modelCalls: readonly ModelToolCall[];
   readonly instructions: readonly AgentEffectiveInstruction[];
   readonly modelInputModalities: readonly string[];
@@ -348,23 +366,40 @@ function decodeCommon(value: JsonObject): Omit<AgentToolBatchBase, 'kind'> {
     throw new TypeError('phase.callStates must contain exactly one state per tool call.');
   const maxConcurrency = positiveInteger(value.maxConcurrency, 'phase.maxConcurrency');
   const sourceValue = object(value.source, 'tool source');
-  exact(sourceValue, ['responseId', 'catalog', 'nativeCatalogIdentity']);
-  const source = Object.freeze({
-    responseId: identifier(sourceValue.responseId, 'source.responseId'),
-    catalog: decodeToolCatalog(sourceValue.catalog),
-    ...(sourceValue.nativeCatalogIdentity === undefined
-      ? {}
-      : {
-          nativeCatalogIdentity: identifier(
-            sourceValue.nativeCatalogIdentity,
-            'source.nativeCatalogIdentity'
-          )
-        })
-  });
+  const source: AgentToolSource = sourceValue.program === undefined
+    ? (() => {
+        exact(sourceValue, ['responseId', 'catalog', 'nativeCatalogIdentity']);
+        return Object.freeze({
+          responseId: identifier(sourceValue.responseId, 'source.responseId'),
+          catalog: decodeToolCatalog(sourceValue.catalog),
+          ...(sourceValue.nativeCatalogIdentity === undefined ? {} : {
+            nativeCatalogIdentity: identifier(sourceValue.nativeCatalogIdentity, 'source.nativeCatalogIdentity')
+          })
+        });
+      })()
+    : (() => {
+        exact(sourceValue, ['program', 'catalog']);
+        const program = object(sourceValue.program, 'source.program');
+        exact(program, ['id', 'sourceDigest', 'parent']);
+        const parent = object(program.parent, 'source.program.parent');
+        exact(parent, ['runId', 'turnIndex', 'turnId', 'requestAttempt', 'toolBatchId', 'callIndex', 'callId', 'toolAttempt']);
+        const callId = optionalString(parent.callId, 'source.program.parent.callId');
+        return Object.freeze({ catalog: decodeToolCatalog(sourceValue.catalog), program: Object.freeze({
+          id: identifier(program.id, 'source.program.id'),
+          sourceDigest: digest(program.sourceDigest, 'source.program.sourceDigest'),
+          parent: Object.freeze({ ...decodeTurnIdentity(parent),
+            runId: identifier(parent.runId, 'source.program.parent.runId'),
+            toolBatchId: identifier(parent.toolBatchId, 'source.program.parent.toolBatchId'),
+            callIndex: nonnegativeInteger(parent.callIndex, 'source.program.parent.callIndex'),
+            toolAttempt: positiveInteger(parent.toolAttempt, 'source.program.parent.toolAttempt'),
+            ...(callId ? { callId } : {})
+          })
+        }) });
+      })();
   const modelCalls = Object.freeze(array(value.modelCalls, 'modelCalls').map(parseModelToolCall));
-  if (modelCalls.length !== calls.length)
+  if (source.program ? modelCalls.length !== 0 : modelCalls.length !== calls.length)
     throw new TypeError('Each call requires its original model call.');
-  for (const [index, call] of calls.entries()) {
+  for (const [index, call] of (source.program ? [] : calls).entries()) {
     const modelCall = modelCalls[index];
     if (
       !modelCall ||
@@ -413,8 +448,10 @@ export function isToolCallStartable(
   if (state?.stage !== 'effect_ready' || state.effect.ticket.driverGeneration !== driverGeneration)
     return false;
   const active = batches.flatMap((batch) =>
-    batch.callStates.flatMap((call) =>
-      call.stage === 'effect_pending' || call.stage === 'outcome_unknown' ? [call] : []
+    batch.callStates.flatMap((call, index) =>
+      (call.stage === 'effect_pending' || call.stage === 'outcome_unknown') &&
+      !batches.some(child => child.source.program?.parent.toolBatchId === batch.toolBatchId &&
+        child.source.program.parent.callIndex === index && call.stage === 'effect_pending') ? [call] : []
     )
   );
   const concurrency = Math.min(

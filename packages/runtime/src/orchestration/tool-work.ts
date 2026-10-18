@@ -42,7 +42,17 @@ export class ToolWorkPump {
       const approvals = state.toolBatches.flatMap((batch) =>
         batch.callStates.flatMap((call) => (call.stage === 'approval' ? [call.approval] : []))
       );
-      if (approvals.length) return { outcome: 'waiting_for_approval', approvals };
+      if (approvals.length) {
+        await this.executor.settleProgramParents('approval_required');
+        await this.advance();
+        return { outcome: 'waiting_for_approval', approvals };
+      }
+      if (state.toolBatches.some(batch => batch.source.program && batch.callStates.some(call => call.stage === 'outcome_unknown'))) {
+        await this.executor.settleProgramParents('tool_outcome_unknown');
+        await this.advance();
+        if (this.state().toolBatches.some(batch => batch.source.program && batch.callStates.some(call => call.stage === 'outcome_unknown')))
+          return { outcome: 'waiting_for_recovery' };
+      }
       if (this.lostOwnership) return { outcome: 'ownership_lost' };
       if (ready(state)) return { outcome: 'completed' };
       if (!this.active.size) return { outcome: 'waiting_for_recovery' };

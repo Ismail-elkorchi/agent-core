@@ -960,13 +960,17 @@ test('a later rejected proposal cannot erase a committed source-capacity repair'
   const result = await new AgentRuntime({ ...f.options, contextRenewal: { automatic: false } })
     .run({ runId, task: 'Keep the current task and release old sources.' }).result;
   const transitions = (await f.sessions.loadReplayState(f.session)).branch.filter(entry => entry.type === 'context_transition');
-  assert.equal(transitions.length, 1);
+  assert.equal(transitions.length, 1, JSON.stringify(result));
   const events = await Array.fromAsync(f.events.read(runId));
   assert.equal(events.filter(entry => entry.event.type === 'context.transition.rejected').length, 1);
   await f.context.assertSourceCapacity();
   assert.equal(f.context.resourcePolicy.maxSourceBytes, 120000);
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(turns, 2);
+  const assistant = (await f.sessions.loadReplayState(f.session)).branch.find(entry =>
+    entry.type === 'assistant' && entry.runId === runId && entry.content.startsWith('New source:'));
+  assert.ok(assistant);
+  assert.equal(assistant.output, undefined, 'Ordinary fallback content must not be duplicated into ordered output.');
 });
 
 function answerWithStateThenFinish(f) {

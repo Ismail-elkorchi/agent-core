@@ -269,6 +269,8 @@ export interface InferenceRequestFingerprintRecord extends AgentTurnIdentity {
   readonly configuredContextIds: readonly string[];
   readonly providerContextIds: readonly string[];
   readonly runContextIds: readonly string[];
+  /** Last local program receipt accounted for by this admitted inference. */
+  readonly programReceiptsThrough?: number;
   readonly effectiveInstructionHash: string;
   readonly modelWindowHistoryHash: string;
   readonly modelToolSchemasHash: string;

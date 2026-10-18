@@ -11,6 +11,7 @@ export const searchTextTool = defineTool({
   description: 'Search rooted text with ripgrep and report file, line, and occurrence counts.',
   schema: searchTextInputSchema,
   outputSchema: searchTextOutputSchema,
+  invocationModes: ['direct', 'programmatic'],
   buildModelContent: buildSearchTextContent,
   requirements: {
     services: ['localToolConfiguration']

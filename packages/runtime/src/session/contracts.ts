@@ -25,7 +25,7 @@ import type { SessionBinding, SessionBindingInput } from './binding.js';
 export type SessionHeader = Readonly<{
   readonly type: 'session';
   readonly version: 1;
-  readonly format: 'agent-core.session/6';
+  readonly format: 'agent-core.session/7';
   readonly sessionStateStorage: 'session';
   readonly id: string;
   readonly timestamp: string;
@@ -205,6 +205,13 @@ export type SessionContextTransitionEntry = BaseSessionEntry &
     readonly transition: ContextTransitionRecord;
   }>;
 
+export type SessionToolCatalogSelectionEntry = BaseSessionEntry & Readonly<{
+  readonly type: 'tool_catalog_selection';
+  readonly branchId: string;
+  readonly operationId: string;
+  readonly selection: import('@agent-core/tools').ToolCatalogSelection;
+}>;
+
 export type SessionStateBatchEntry = BaseSessionEntry & Readonly<{
   readonly type: 'session_state_batch';
   readonly batch: SessionStateBatchCommit;
@@ -242,7 +249,8 @@ export type SessionBranchEntry =
   | SessionBranchMarkerEntry
   | SessionModelSettingsEntry
   | SessionContextTransitionEntry
-  | SessionStateBatchEntry;
+  | SessionStateBatchEntry
+  | SessionToolCatalogSelectionEntry;
 
 export type SessionConversationItem =
   | SessionInputEntry
@@ -487,6 +495,9 @@ export interface SessionRepository {
   loadReplayState(session: SessionDescriptor, leafId?: string | null): Promise<SessionReplayState>;
   revision(session: SessionDescriptor): Promise<number>;
   currentModelSettings(session: SessionDescriptor): Promise<ModelSelection | undefined>;
+  currentToolCatalogSelection(session: SessionDescriptor): Promise<import('@agent-core/tools').ToolCatalogSelectionState>;
+  findToolCatalogSelection(session: SessionDescriptor, operationId: string): Promise<import('@agent-core/tools').ToolCatalogSelectionState | undefined>;
+  saveToolCatalogSelection(session: SessionDescriptor, input: Parameters<import('@agent-core/tools').ToolCatalogSelectionStore['save']>[0], options?: { readonly withOwnership?: (<T>(operation: () => Promise<T>) => Promise<T>) | undefined }): Promise<import('@agent-core/tools').ToolCatalogSelectionState>;
   /** Committed journal metadata and retained item content across every branch; excludes unreferenced staged artifacts. */
   committedRetainedStateBytes(session: SessionDescriptor): Promise<number>;
   findSessionStateBatch(session: SessionDescriptor, idempotencyKey: string): Promise<SessionStateBatchReceipt | undefined>;

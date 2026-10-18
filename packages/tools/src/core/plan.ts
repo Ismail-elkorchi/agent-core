@@ -23,6 +23,7 @@ import {
   invalidToolInputObservation,
   missingServiceObservation,
   parseToolObservation,
+  policyBlockedObservation,
   runtimeErrorObservation,
   unknownToolObservation
 } from './observation.js';
@@ -34,6 +35,7 @@ import {
   type ToolAuthorizationRequest
 } from './authorization.js';
 import { encodeToolPolicy } from './policy.js';
+import { toolDefinitionHash } from './contract.js';
 
 const TOOL_CALL_PLAN = Symbol('agent-core.plan-tool-call');
 const TOOL_INVOCATION = Symbol('agent-core.tool-invocation');
@@ -83,6 +85,18 @@ export async function planToolCall(
     throw new Error('Tool calls must be created or decoded before lifetime.');
   const tool = tools.find((candidate) => candidate.name === call.name);
   if (!tool) return { ok: false, observation: unknownToolObservation(call) };
+  const mode = context.invocation?.caller ? 'programmatic' : 'direct';
+  if (!tool.invocationModes.includes(mode))
+    return { ok: false, observation: policyBlockedObservation(
+      `Tool ${tool.name} does not allow ${mode} invocation.`,
+      { tool: tool.name, policyReason: 'invocation_mode', details: { mode } }
+    ) };
+  const caller = parseJsonValue(context.invocation?.caller ?? null);
+  const callerHash = hashJson(caller);
+  const assertCaller = (executionContext: ToolExecutionContext) => {
+    if (hashJson(parseJsonValue(executionContext.invocation?.caller ?? null)) !== callerHash)
+      throw new ToolInvocationAuthorityError('Tool invocation caller changed after authorization.');
+  };
   const lifetime = new PlanningLifetime();
   const planningContext: ToolCanonicalizationContext = Object.freeze({ ...context, lifetime });
   try {
@@ -123,20 +137,8 @@ export async function planToolCall(
       maxTotalBytes: 8_000_000
     });
     const fingerprintInput: JsonObject = Object.freeze({
-      tool: Object.freeze({
-        name: tool.name,
-        implementationId: tool.implementationId,
-        description: tool.description,
-        jsonSchema: tool.jsonSchema,
-        effectEnvelope: Object.freeze({
-          accesses: Object.freeze(
-            tool.effectEnvelope.accesses.map((access) =>
-              Object.freeze({ mode: access.mode, scope: access.scope })
-            )
-          ),
-          lockScopes: Object.freeze([...tool.effectEnvelope.lockScopes])
-        })
-      }),
+      definitionHash: toolDefinitionHash(tool),
+      caller,
       canonicalInput: canonicalSnapshot,
       effects: encodeToolEffects(effects),
       policy: encodeToolPolicy(context.policy),
@@ -163,6 +165,7 @@ export async function planToolCall(
               effect: Extract<EffectExecutionState, { readonly phase: 'started' }>,
               executionContext: ToolExecutionContext
             ) => {
+              assertCaller(executionContext);
               let result: unknown;
               try {
                 result = await recover(effect, executionContext);
@@ -178,6 +181,7 @@ export async function planToolCall(
           }
         : {}),
       invoke: async (executionContext: ToolExecutionContext) => {
+        assertCaller(executionContext);
         const observation = await binding.invoke(executionContext);
         try {
           return parseToolObservation(tool, observation);

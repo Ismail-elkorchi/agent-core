@@ -48,6 +48,15 @@
     },
     {
       "path": "packages/tui"
+    },
+    {
+      "path": "packages/tools-programmatic"
+    },
+    {
+      "path": "packages/tools-mcp"
+    },
+    {
+      "path": "packages/tools-web"
     }
   ]
 }

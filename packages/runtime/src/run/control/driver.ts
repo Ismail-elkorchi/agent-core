@@ -1262,6 +1262,9 @@ function advanceMatchesProcedure(
     case 'start_provider_request':
     case 'reconcile_provider_request':
     case 'consume_provider_settlement':
+    case 'continue_provider_program':
+    case 'admit_program_call':
+    case 'interrupt_program_call':
     case 'plan_tool_call':
     case 'start_tool_call':
     case 'reconcile_tool_call':
@@ -1294,6 +1297,20 @@ function assertWorkAdvance(
 ): void {
   const batches = advance.toolBatches ?? state.toolBatches;
   const requests = advance.providerRequests ?? state.providerRequests;
+  for (const added of batches.filter(batch => !state.toolBatches.some(previous => previous.toolBatchId === batch.toolBatchId))) {
+    if (!added.source.program) continue;
+    const { parent } = added.source.program;
+    const source = state.toolBatches.find(batch => batch.toolBatchId === parent.toolBatchId);
+    const invocation = source?.callStates[parent.callIndex];
+    if (procedure !== 'admit_program_call' || state.phase.kind !== 'active' || state.control.status !== 'owned' ||
+        parent.runId !== state.runId || !source || source.source.program ||
+        hashJson(source.identity) !== hashJson(added.identity) || parent.turnId !== source.identity.turnId ||
+        parent.requestAttempt !== source.identity.requestAttempt || invocation?.stage !== 'effect_pending' ||
+        invocation.toolAttempt !== parent.toolAttempt || invocation.plan.effects.accesses.length ||
+        invocation.plan.effects.lockScopes.length || added.modelCalls.length ||
+        added.callStates.some(call => call.stage !== 'ready'))
+      throw new TypeError('Program child admission has no matching active orchestration authority.');
+  }
   for (const batch of state.toolBatches) {
     const next = batches.find((item) => item.toolBatchId === batch.toolBatchId);
     if (!next) throw new TypeError('Retained tool work cannot be removed.');
@@ -1374,7 +1391,9 @@ function assertToolAdvance(
   next: AgentToolCallState
 ): void {
   const valid =
-    procedure === 'plan_tool_call'
+    procedure === 'interrupt_program_call'
+      ? ['ready', 'effect_ready'].includes(previous.stage) && next.stage === 'cancelled'
+      : procedure === 'plan_tool_call'
       ? previous.stage === 'ready' && ['effect_ready', 'settled', 'approval'].includes(next.stage)
       : procedure === 'start_tool_call'
         ? previous.stage === 'effect_ready' &&

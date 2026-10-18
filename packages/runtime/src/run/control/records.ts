@@ -81,7 +81,7 @@ export class AgentRunRecords {
     value: unknown
   ): Promise<AgentRunRecordRef> {
     // Each original has its own input bound. No aggregate historical quota is applied.
-    const envelope = parseJsonObject({ runId, kind, value });
+    const envelope = parseJsonObject({ format: 'agent-core.run-record/2', runId, kind, value });
     const artifact = await this.artifacts
       .storeProtected({
         label: `run-${kind}`,
@@ -111,9 +111,10 @@ export class AgentRunRecords {
       JSON.parse(new TextDecoder().decode(await this.artifacts.readVerified(reference.artifact)))
     );
     if (
+      envelope.format !== 'agent-core.run-record/2' ||
       envelope.runId !== runId ||
       envelope.kind !== kind ||
-      Object.keys(envelope).some((key) => !['runId', 'kind', 'value'].includes(key))
+      Object.keys(envelope).some((key) => !['format', 'runId', 'kind', 'value'].includes(key))
     )
       throw new Error('Run record scope or kind does not match its immutable reference.');
     if (envelope.value === undefined) throw new TypeError('Run record has no original value.');

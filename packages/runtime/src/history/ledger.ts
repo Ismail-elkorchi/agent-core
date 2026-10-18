@@ -10,6 +10,8 @@ export function publicEventEntry(
   outputs: ReadonlyMap<string, readonly ModelOutputItem[]>
 ): SessionBranchEntry | undefined {
   const event = record.event;
+  // Program children are retained in their own receipts, never fabricated as provider protocol results.
+  if ((event.type === 'tool.ended' || event.type === 'observation.record.created') && event.programId) return undefined;
   const source = Object.freeze({
     runId: record.runId,
     eventId: record.eventId,

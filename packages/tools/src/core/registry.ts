@@ -4,6 +4,8 @@ import { validateToolEffectEnvelope } from './authorization.js';
 import { isToolAvailable, type ToolPolicy } from './policy.js';
 import { validateToolRequirements } from './resources.js';
 import { isCompiledTool, markCompiledTool, type CompiledToolDefinition } from './compiled.js';
+import { compileOutputJsonSchema, normalizeToolInvocationModes } from './contract.js';
+import { hashJson } from '@agent-core/persistence';
 
 export class ToolRegistry {
   private readonly tools = new Map<string, CompiledToolDefinition>();
@@ -45,6 +47,10 @@ export function adoptToolDefinition(tool: unknown): CompiledToolDefinition {
   const description = nonEmpty(tool.description, 'description');
   if (!schema(tool.outputSchema))
     throw new Error('Tool ' + name + ' outputSchema must be a Zod schema.');
+  const outputJsonSchema = compileOutputJsonSchema(tool.outputSchema);
+  if (tool.outputJsonSchema !== undefined &&
+      hashJson(parseJsonObject(tool.outputJsonSchema)) !== hashJson(outputJsonSchema))
+    throw new Error('Tool ' + name + ' outputJsonSchema does not match its output validator.');
   for (const member of [
     'decodeInput',
     'canonicalizeInput',
@@ -83,6 +89,8 @@ export function adoptToolDefinition(tool: unknown): CompiledToolDefinition {
         : {}),
       jsonSchema,
       outputSchema: tool.outputSchema,
+      outputJsonSchema,
+      invocationModes: normalizeToolInvocationModes(tool.invocationModes),
       ...(textInput ? { textInput } : {}),
       effectEnvelope: validateToolEffectEnvelope(tool.effectEnvelope),
       ...(requirements !== undefined ? { requirements } : {}),
@@ -112,6 +120,8 @@ const KEYS = new Set([
   'promptGuide',
   'jsonSchema',
   'outputSchema',
+  'outputJsonSchema',
+  'invocationModes',
   'textInput',
   'effectEnvelope',
   'requirements',

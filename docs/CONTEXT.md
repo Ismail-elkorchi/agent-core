@@ -245,6 +245,16 @@ attempts and exhausted allowances produce durable, explicit suspension rather
 than resetting limits. Tool-result presentation bounds never alter authoritative
 observations or call/result pairing.
 
+Deferred tool selections are independent of admission. The host-granted
+`tool_catalog_select` control replaces the full exact selection, including an
+empty selection, so excessive schema growth can be reduced without erasing
+session history. Portable recovery may compile only granted control schemas.
+An exact native prefix instead retains the last accepted tool inventory and
+protocol obligations; failed admission of a fresh candidate never authorizes a
+reset. Missing or incompatible captured state produces an explicit continuity
+refusal. The next ordinary request still requires complete admission and every
+call rechecks current source bindings and permissions.
+
 No automatic summary, provider compaction, alternate transform engine, or
 oldest-source eviction runs between turns. A mandatory result that cannot fit
 remains an outstanding delivery obligation and a clear admission conflict.
@@ -268,7 +278,7 @@ or acknowledged delivery cannot be resent without evidence that it failed.
 ## Compatibility and evidence
 
 Execution and session formats are versioned. The item-state contract uses
-`agent-core.session/6`. This build cannot open, resume, or read historical content
+`agent-core.session/7`. This build cannot open, resume, or read historical content
 from earlier session formats. It rejects unsupported execution records and
 incompatible session headers without rewriting original journals. Reading those
 originals requires the matching earlier build; this build performs no conversion. It has no aliases, old-format readers, migrations, or

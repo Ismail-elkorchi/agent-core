@@ -400,7 +400,8 @@ export class NativeResponsesSession implements ModelProviderSession {
         source.responseId !== tool.source.responseId ||
         source.catalogIdentity !== tool.source.catalogIdentity ||
         item.toolName !== tool.call.name ||
-        item.toolCallType !== tool.call.type
+        item.toolCallType !== tool.call.type ||
+        !isDeepStrictEqual(item.caller, tool.call.caller)
       )
         throw failure(
           'invalid_request',
@@ -644,6 +645,10 @@ export class NativeResponsesSession implements ModelProviderSession {
           continue;
         }
         if (event.type === 'response.output_item.done') {
+          // Advanced calls depend on preceding native program/discovery state.
+          // Validate the complete ordered output before any such call can execute.
+          if (this.active.boundary.request.tools?.some(tool => tool.deferLoading === true || tool.allowedCallers?.includes('programmatic') === true))
+            continue;
           const payload = decodeResponsesPayload({ output: [event.item] });
           for (const item of await responsesOutput({
             protocolRevision: requiredProtocolRevision(
@@ -684,7 +689,13 @@ export class NativeResponsesSession implements ModelProviderSession {
             );
           terminalIds.add(response.requestId);
           responses.push(response);
-          for (const call of response.toolCalls ?? []) this.rememberCall(call);
+          for (const call of response.toolCalls ?? []) {
+            if (this.rememberCall(call)) yield {
+              type: 'tool_call', toolCall: call,
+              source: { responseId: this.active.boundary.responseId,
+                catalogIdentity: this.active.boundary.catalogIdentity, toolCallId: call.id ?? '' }
+            };
+          }
           this.active.terminal = true;
           this.logical = parseModelRequest({
             ...this.active.boundary.request,

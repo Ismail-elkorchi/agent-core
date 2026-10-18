@@ -130,7 +130,7 @@ test('jsonl: incompatible prior session format is rejected without altering sour
   const f = await fixture(t,'jsonl');
   const file = f.repository.location(f.session.id);
   const originalIndex = await readFile(`${file}.index`);
-  const prior = (await readFile(file,'utf8')).replace('agent-core.session/6','agent-core.session/5');
+  const prior = (await readFile(file,'utf8')).replace('agent-core.session/7','agent-core.session/6');
   await writeFile(file,prior);
   const restarted = new JsonlSessionRepository(f.root);
   await assert.rejects(restarted.open(f.session.id,binding),error => {

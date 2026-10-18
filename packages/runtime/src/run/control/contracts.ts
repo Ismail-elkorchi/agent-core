@@ -145,6 +145,9 @@ export type AgentRunProcedure =
   | 'start_provider_request'
   | 'reconcile_provider_request'
   | 'consume_provider_settlement'
+  | 'continue_provider_program'
+  | 'admit_program_call'
+  | 'interrupt_program_call'
   | 'plan_tool_call'
   | 'start_tool_call'
   | 'reconcile_tool_call'
@@ -355,7 +358,7 @@ export function outstandingToolObligations(state: AgentRunState): readonly Reado
   return Object.freeze(
     state.toolBatches.flatMap((batch) =>
       batch.callStates.flatMap((call, callIndex) => {
-        if (toolCallObligationResolved(call, batch.source.nativeCatalogIdentity))
+        if (batch.source.program || toolCallObligationResolved(call, batch.source.nativeCatalogIdentity))
           return [];
         const modelCall = batch.modelCalls[callIndex];
         return [

@@ -3,6 +3,7 @@ import { resolveToolModelContent } from './observation-source.js';
 import { NativeContextIncompatibilityError } from './model-change.js';
 import {
   modelOutputToInput,
+  modelResponseOutput,
   RequestTokenEstimator,
   assertModelRequestSupported,
   providerContextIncompatibility,
@@ -168,8 +169,8 @@ export async function rebuildModelWindowFromRepositories(input: {
             content
           });
       }
-      if (event.type === 'provider.attempt.settled' && event.response.output)
-        outputByTurn.set(`${event.turnId}:${String(event.requestAttempt)}`, event.response.output);
+      if (event.type === 'provider.attempt.settled')
+        outputByTurn.set(`${event.turnId}:${String(event.requestAttempt)}`, modelResponseOutput(event.response));
       const recordedOutput =
         'turnId' in event
           ? outputByTurn.get(`${event.turnId}:${String(event.requestAttempt)}`)
@@ -205,7 +206,7 @@ export async function rebuildModelWindowFromRepositories(input: {
           ...(output ? { output } : {})
         });
       } else if (
-        event.type === 'observation.record.created' &&
+        event.type === 'observation.record.created' && !event.programId &&
         (!selectedWindow ||
           retainedObservations.has(
             `${event.toolBatchId}:${String(event.callIndex)}:${String(event.toolAttempt)}`
@@ -502,6 +503,7 @@ export async function replaySourceEntries(
       record(key, {
         role: 'tool',
         toolName: entry.toolName,
+        ...(toolCall.caller ? { caller: toolCall.caller } : {}),
         ...(toolCall.id ? { toolCallId: toolCall.id } : {}),
         toolCallType: toolCall.input.kind === 'text' ? 'custom' : 'function',
         content: serializeToolModelContent(modelContent),
@@ -689,7 +691,7 @@ type SelectedObservation = Extract<SessionBranchEntry, { type: 'observation' }>;
 type SelectedAssistant = Extract<SessionBranchEntry, { type: 'assistant' }>;
 interface CorrelatedToolCall {
   readonly entry: SelectedToolCall;
-  readonly call: ModelToolCall;
+  call: ModelToolCall;
   result?: SelectedObservation;
 }
 function exchangeIdentity(entry: { runId: string; turnId: string; requestAttempt: number }): string {
@@ -751,6 +753,7 @@ function correlateToolExchanges(entries: readonly SessionBranchEntry[]) {
           original.type !== record.call.type || original.name !== record.call.name ||
           canonicalJsonString(original.input) !== canonicalJsonString(record.call.input))
         throw new Error('Selected assistant tool call does not match its recorded invocation.');
+      record.call = Object.freeze({ ...record.call, ...(original.caller ? { caller: original.caller } : {}) });
       outputCalls.set(output, record);
     }
   }

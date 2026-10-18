@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import ts from 'typescript';
 import { hashJson, InMemoryEventRepository } from '@agent-core/persistence';
 
 const root = path.resolve(import.meta.dirname, '..');
@@ -15,11 +16,29 @@ const production = readdirSync(path.join(root, 'packages'), { recursive: true, w
   )
   .map((entry) => path.join(entry.parentPath, entry.name));
 
+// Source strings evaluated in another realm do not carry host ownership proofs.
+// Inspect executable TypeScript, including template substitutions, rather than
+// treating embedded guest-language source or documentation as host operations.
+function hasHostIdentifier(source, name) {
+  const parsed = ts.createSourceFile('boundary.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  function visit(node) {
+    return (ts.isIdentifier(node) && node.text === name) || (ts.forEachChild(node, visit) ?? false);
+  }
+  return visit(parsed);
+}
+
+test('ownership rules inspect host operations rather than guest source strings', () => {
+  const guest = 'const guest = String.raw`function deepFreeze(value) { return Object.freeze(value); }`;';
+  assert.equal(hasHostIdentifier(guest, 'deepFreeze'), false);
+  assert.equal(hasHostIdentifier(`${guest}\nfunction deepFreeze(value) { return Object.freeze(value); }`, 'deepFreeze'), true);
+  assert.equal(hasHostIdentifier('const guest = `prefix ${deepFreeze(value)}`;', 'deepFreeze'), true);
+});
+
 test('production boundaries do not rebuild established ownership proofs', () => {
   const violations = [];
   for (const file of production) {
     const source = readFileSync(file, 'utf8');
-    if (/\bdeepFreeze\b/u.test(source)) violations.push(`${file}: generic deepFreeze`);
+    if (/\bdeepFreeze\b/u.test(source) && hasHostIdentifier(source, 'deepFreeze')) violations.push(`${file}: generic deepFreeze`);
     if (/\bas unknown as\b/u.test(source)) violations.push(`${file}: as unknown as`);
     if (/\b(?:hashRecord|stableStringify|validateToolDefinition)\b/u.test(source)) violations.push(`${file}: retired boundary abstraction`);
     for (const discarded of source.matchAll(/^\s*(?:parse|decode|normalize|sanitize|own|snapshot|clone)[A-Z][A-Za-z0-9_]*\([^;\n]*\);\s*$/gmu)) {

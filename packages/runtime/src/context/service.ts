@@ -560,7 +560,7 @@ export class ContextService {
           limit: this.resourcePolicy.maxSourceBytes,
           observedAtLeast: sourceBytes
         });
-      if (entry.type === 'context_transition' || entry.type === 'session_state_batch')
+      if (entry.type === 'context_transition' || entry.type === 'session_state_batch' || entry.type === 'tool_catalog_selection')
         throw new Error(
           'context_admission_failed: session state and window records are not selectable conversational contributions.'
         );
@@ -612,7 +612,7 @@ export class ContextService {
         cut.throughEntryId
       );
       for await (const entry of snapshot.entries)
-        if (!['branch', 'model_settings', 'context_transition', 'session_state_batch'].includes(entry.type) &&
+        if (!['branch', 'model_settings', 'context_transition', 'session_state_batch', 'tool_catalog_selection'].includes(entry.type) &&
             !retained.has(entry.entryId))
           throw new Error(
             'context_admission_failed: omitted history has no authorized available read capability.'

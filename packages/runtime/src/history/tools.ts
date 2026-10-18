@@ -42,6 +42,7 @@ export function createHistoryTools(options: {
             'observation',
             'branch',
             'model_settings',
+            'tool_catalog_selection',
             'context_transition',
             'session_state_batch'
           ])

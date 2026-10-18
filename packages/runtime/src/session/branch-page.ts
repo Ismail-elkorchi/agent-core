@@ -535,6 +535,8 @@ function branchEntryText(entry: SessionBranchEntry): string {
       return JSON.stringify(entry.call);
     case 'branch':
       return entry.label ?? '';
+    case 'tool_catalog_selection':
+      return JSON.stringify(entry.selection);
     case 'model_settings':
       return `${entry.provider}/${entry.model}`;
     case 'context_transition':

@@ -1,0 +1,18 @@
+{
+  "name": "@agent-core/tools-web",
+  "version": "0.2.0",
+  "description": "Optional bounded public-web source retrieval and search tools.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js", "./node": "./dist/node.js" },
+  "files": ["dist", "README.md"],
+  "engines": { "node": ">=24.8.0" },
+  "dependencies": {
+    "@agent-core/tools": "0.2.0",
+    "@agent-core/persistence": "0.2.0",
+    "@agent-core/json": "0.2.0",
+    "htmlparser2": "^10.0.0",
+    "zod": "^4.4.3"
+  }
+}

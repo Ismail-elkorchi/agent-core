@@ -104,11 +104,34 @@ export interface ToolInvocationContext {
   readonly callIndex: number;
   readonly callId?: string;
   readonly toolAttempt: number;
+  /** Host-created causal identity; never read from a tool's arguments. */
+  readonly caller?: ToolInvocationCaller;
   readonly recovery?: Readonly<{
     readonly kind: 'preconditioned_reexecution';
     readonly preconditions: readonly EffectResourcePrecondition[];
   }>;
 }
+
+export interface ToolProgrammaticCaller {
+  readonly kind: 'programmatic';
+  readonly programId: string;
+  readonly parent: Readonly<{
+    readonly runId: string;
+    readonly turnId: string;
+    readonly requestAttempt: number;
+    readonly toolBatchId: string;
+    readonly callIndex: number;
+    readonly toolAttempt: number;
+  }>;
+}
+
+export interface ToolProviderProgrammaticCaller {
+  readonly kind: 'provider_programmatic';
+  readonly programId: string;
+  readonly providerResponseId: string;
+}
+
+export type ToolInvocationCaller = ToolProgrammaticCaller | ToolProviderProgrammaticCaller;
 
 export type ToolServiceValidator<T> = (value: unknown) => value is T;
 

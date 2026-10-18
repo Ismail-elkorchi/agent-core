@@ -22,6 +22,7 @@ export class NativeToolDelivery {
     const results: ModelToolResultInput[] = [];
     const sourceCalls: ModelNativeToolCallIdentity[] = [];
     for (const batch of this.run.state().toolBatches) {
+      if (batch.source.program) continue;
       for (const [index, call] of batch.callStates.entries()) {
         if (call.stage !== 'recorded' || (call.delivery && call.delivery.status !== 'failed')) continue;
         const toolCallId = batch.modelCalls[index]?.id;
@@ -73,6 +74,7 @@ export class NativeToolDelivery {
 
   private target(source: ModelNativeToolCallIdentity): AgentToolTarget {
     for (const batch of this.run.state().toolBatches) {
+      if (batch.source.program) continue;
       if (
         batch.source.responseId !== source.responseId ||
         batch.source.nativeCatalogIdentity !== source.catalogIdentity

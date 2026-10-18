@@ -66,9 +66,20 @@ allowances and active operations with revision-bound pagination.
 without replacing an executing binding. Configuration is distinct from actual
 request admission and dispatch.
 
+`resolveEffectiveToolCatalog()` is the shared configured-eligibility projection.
+Supply the actual `modelProfile`, selected `nativeToolExposure`, and whether a
+host `programmaticRunner` is available. Unsupported native endpoint modes are
+rejected. Snapshots record effective `invocationModes`, the selected
+`programmaticRoute`, `modelCallable`, and `deferred` separately: a portable
+program-only tool can be available to child calls without a top-level model
+schema, while it is unavailable when no programmatic route exists. Exact host
+control grants and the optional exact `eagerTool` remain eagerly exposed under
+native discovery. Last-admitted inspection preserves the admitted route and
+exposure rather than substituting the current configuration.
+
 See [Composing persistent context](../../docs/CONTEXT.md) for exact tool inputs,
 per-item revision conflicts, attribution, bounds, view activation and recovery.
-The current session format is `agent-core.session/6`; incompatible originals are
+The current session format is `agent-core.session/7`; incompatible originals are
 rejected in place and require their matching earlier build to read. No migration,
 old-format reader, automatic summary or provider-compaction path is supplied.
 
@@ -88,3 +99,13 @@ When a mandatory native result itself exceeds actual capacity, the recorded resu
 its delivery obligation remain intact in a clear context conflict. Source selection
 cannot bypass that obligation; cancellation may be necessary when no lawful
 continuation fits. This is not a promise of universal automatic resumability.
+
+## Deferred tool catalog
+
+Supply `toolCatalog: new ToolCatalog({ tools, sources })` for deferred sources, or `tools` for an eager-only runtime. The runtime owns catalog refresh at admission and execution boundaries. A runtime with sources exposes `tool_catalog_discover` and `tool_catalog_select`; the latter atomically replaces the complete selected-reference list under the usual write-policy eligibility, with an empty array clearing it. Discovery pages inventory metadata or exact current selected references through `target: 'inventory' | 'selection'`. Their host-created identities authorize only their exact catalog bookkeeping scope, independently of application tool authority. Host inspection uses `resolveRuntimeToolCatalog()` to resolve the same definitions and stable control identities.
+
+When a session repository is configured, the runtime binds catalog selection to that session's existing journal and branch. There is no second catalog journal to configure. If the final source is removed, nonempty saved references keep discovery and selection controls available for inspection and clearing; unavailable implementations are never restored by those controls. Conditional writes and run ownership fence publication; restart restores exact selected references, and branches inherit only their ancestor selection. `SessionToolCatalogSelectionStore` exposes the same capability for explicit host composition.
+
+Loading is independent of request admission. It neither changes a previously admitted tool catalog nor permits a new tool in the same response batch. A successor must compile and pass admission before calling the loaded definition. Failed successor admission retains the saved selection without publishing it as last-admitted capability. Every later call also rechecks current exact definitions and eligibility, so removal, permission changes, and connection rebinding revoke new starts.
+
+The exact host-created selector is an eager bounded-recovery control. When selected schemas prevent admission, a portable recovery request can advertise only granted controls so the selection can shrink. Native exact-prefix recovery instead retains the last accepted inventory, configuration, and protocol prefix; a failed fresh proposal never grants permission to discard them. Missing or incompatible accepted state is an explicit continuity refusal.

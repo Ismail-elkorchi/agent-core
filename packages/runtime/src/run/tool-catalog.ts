@@ -1,6 +1,8 @@
 import { hashJson } from '@agent-core/persistence';
 import { parseJsonObject, type JsonValue } from '@agent-core/json';
-import type { CompiledToolDefinition } from '@agent-core/tools';
+import { toolDefinitionHash, type CompiledToolDefinition } from '@agent-core/tools';
+
+const TOOL_CATALOG_FORMAT = 'agent-core.tool-catalog/2';
 
 export interface ToolCatalogEntry {
   readonly name: string;
@@ -8,6 +10,7 @@ export interface ToolCatalogEntry {
   readonly definitionHash: string;
 }
 export interface ToolCatalogSnapshot {
+  readonly format: typeof TOOL_CATALOG_FORMAT;
   readonly revision: string;
   readonly entries: readonly ToolCatalogEntry[];
 }
@@ -17,33 +20,21 @@ export function captureToolCatalog(tools: readonly CompiledToolDefinition[]): To
       Object.freeze({
         name: tool.name,
         implementationId: tool.implementationId,
-        definitionHash: hashJson({
-          name: tool.name,
-          implementationId: tool.implementationId,
-          description: tool.description,
-          jsonSchema: tool.jsonSchema,
-          effectEnvelope: tool.effectEnvelope,
-          ...(tool.textInput
-            ? {
-                textInput: {
-                  description: tool.textInput.description ?? '',
-                  format: tool.textInput.format
-                }
-              }
-            : {})
-        })
+        definitionHash: toolDefinitionHash(tool)
       })
     )
   );
   return Object.freeze({
-    revision: hashJson(entries),
+    format: TOOL_CATALOG_FORMAT,
+    revision: hashJson({ format: TOOL_CATALOG_FORMAT, entries }),
     entries
   });
 }
 export function decodeToolCatalog(value: JsonValue | undefined): ToolCatalogSnapshot {
   const object = parseJsonObject(value);
   if (
-    Object.keys(object).some((key) => key !== 'revision' && key !== 'entries') ||
+    Object.keys(object).some((key) => !['format', 'revision', 'entries'].includes(key)) ||
+    object.format !== TOOL_CATALOG_FORMAT ||
     typeof object.revision !== 'string' ||
     !Array.isArray(object.entries)
   )
@@ -67,10 +58,10 @@ export function decodeToolCatalog(value: JsonValue | undefined): ToolCatalogSnap
   );
   if (
     new Set(entries.map((entry) => entry.name)).size !== entries.length ||
-    hashJson(entries) !== object.revision
+    hashJson({ format: TOOL_CATALOG_FORMAT, entries }) !== object.revision
   )
     throw new Error('Tool catalog revision mismatch.');
-  return Object.freeze({ revision: object.revision, entries });
+  return Object.freeze({ format: TOOL_CATALOG_FORMAT, revision: object.revision, entries });
 }
 export function assertToolCatalogCurrent(
   snapshot: ToolCatalogSnapshot,

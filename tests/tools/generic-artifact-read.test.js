@@ -38,6 +38,10 @@ test('artifact reads clamp ranges, preserve UTF-8 alignment and report original 
   const result = await read(repository, { artifactId: unicode.artifactId, offset: 2, byteCount: 1 });
   assert.equal(result.output.text, '🙂');
   assert.deepEqual(result.output.returnedRange, { start: 1, end: 5 });
+  assert.match(result.summary, /Read bytes 1-5/u);
+  assert.deepEqual(result.observedFacts.items[0].resources[0].range, { kind: 'byte', start: 1, end: 5 });
+  assert.equal(result.observedFacts.items[0].resources[0].fullSha256, unicode.sha256);
+  assert.match(result.observedFacts.items[0].summary, /4 bytes at 1-5/u);
   assert.equal(result.output.nextOffset, 5);
   assert.equal(result.output.coverage, 'partial');
   const eof = await read(repository, { artifactId: unicode.artifactId, offset: unicode.size });

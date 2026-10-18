@@ -1,3 +1,5 @@
+import { decodeSessionToolCatalogSelection, emptySessionToolCatalogSelection, toolCatalogSelectionOwner } from './tool-catalog.js';
+import { parseToolCatalogSelection, type ToolCatalogSelectionState } from '@agent-core/tools';
 import { createSessionRunFinalizationConfirmation } from './finalization-confirmation.js';
 import { recordedModelSelection } from '../orchestration/model-change.js';
 import { protectedInferenceInput } from '../inference/input.js';
@@ -123,7 +125,7 @@ export class InMemorySessionRepository implements SessionRepository {
       const header: SessionHeader = Object.freeze({
         type: 'session',
         version: 1,
-        format: 'agent-core.session/6',
+        format: 'agent-core.session/7',
         sessionStateStorage: 'session',
         id,
         timestamp: new Date().toISOString(),
@@ -132,7 +134,7 @@ export class InMemorySessionRepository implements SessionRepository {
         ...(options.provider ? { provider: options.provider } : {}),
         ...(options.model ? { model: options.model } : {})
       });
-      const state = { header, branchEntries: [], finalizations: [], confirmations: [], submissionRecords: [], acceptedInputRevision: 0, retainedStateBytes: 0, stateIndexes: new Map<string,MemoryStateIndex>() };
+      const state = { header, branchEntries: [], finalizations: [], confirmations: [], submissionRecords: [], acceptedInputRevision: 0, retainedStateBytes: 0, stateIndexes: new Map<string,MemoryStateIndex>(), catalogIndexes: new Map<string, MemoryCatalogIndex>() };
       this.states.set(id, state);
       return sessionFromState(state);
     });
@@ -277,6 +279,41 @@ export class InMemorySessionRepository implements SessionRepository {
     });
   }
 
+  currentToolCatalogSelection(session: SessionDescriptor): Promise<ToolCatalogSelectionState> {
+    return this.serial(() => {
+      const state = this.requireDescriptor(session);
+      return catalogState(state, branchLeaf(state.branchEntries)).state;
+    });
+  }
+  findToolCatalogSelection(session: SessionDescriptor, operationId: string): Promise<ToolCatalogSelectionState | undefined> {
+    return this.serial(() => {
+      const state = this.requireDescriptor(session);
+      const current = catalogState(state, branchLeaf(state.branchEntries));
+      const selection = current.operations.get(operationId);
+      return selection ? Object.freeze({ ownerId: current.state.ownerId, selection }) : undefined;
+    });
+  }
+  saveToolCatalogSelection(session: SessionDescriptor, input: Parameters<SessionRepository['saveToolCatalogSelection']>[1], options: Parameters<SessionRepository['saveToolCatalogSelection']>[2] = {}): Promise<ToolCatalogSelectionState> {
+    const selection = parseToolCatalogSelection(input.selection);
+    return this.serial(() => {
+      const state = this.requireDescriptor(session);
+      const current = catalogState(state, branchLeaf(state.branchEntries));
+      if (input.ownerId !== current.state.ownerId) throw new PersistenceConflictError('Tool catalog branch changed.');
+      const previous = current.operations.get(input.operationId);
+      if (previous) {
+        if (previous.revision !== selection.revision) throw new PersistenceConflictError('Tool catalog operation changed.');
+        return Object.freeze({ ownerId: current.state.ownerId, selection: previous });
+      }
+      if (input.expectedRevision !== current.state.selection.revision) throw new PersistenceConflictError('Tool catalog selection changed.');
+      const entry = decodeSessionToolCatalogSelection({ ...baseEntry(branchLeaf(state.branchEntries)), type: 'tool_catalog_selection',
+        branchId: current.branchId, operationId: input.operationId, selection });
+      const publish = () => {
+        appendBranchRecord(state, entry);
+        return Promise.resolve(catalogState(state, entry.id).state);
+      };
+      return options.withOwnership ? options.withOwnership(publish) : publish();
+    });
+  }
   sourceSnapshot(session: SessionDescriptor, leafId?: string | null) {
     return this.serial(() => {
       const state = this.requireDescriptor(session);
@@ -298,7 +335,8 @@ export class InMemorySessionRepository implements SessionRepository {
           entry.type !== 'branch' &&
           entry.type !== 'model_settings' &&
           entry.type !== 'context_transition' &&
-          entry.type !== 'session_state_batch'
+          entry.type !== 'session_state_batch' &&
+          entry.type !== 'tool_catalog_selection'
       )
     );
   }
@@ -829,6 +867,7 @@ interface SessionState {
   acceptedInputRevision: number;
   retainedStateBytes: number;
   readonly stateIndexes: Map<string,MemoryStateIndex>;
+  readonly catalogIndexes: Map<string, MemoryCatalogIndex>;
   readonly header: SessionHeader;
   readonly branchEntries: SessionBranchEntry[];
   readonly finalizations: SessionRunFinalization[];
@@ -841,7 +880,26 @@ function stateItems(state: SessionState, leafId: string | null): MemoryStateInde
   if (!items) throw new Error(`Unknown session-state boundary: ${leafId}`);
   return items;
 }
+interface MemoryCatalogIndex {
+  readonly branchId: string;
+  readonly state: ToolCatalogSelectionState;
+  readonly operations: ReadonlyMap<string, import('@agent-core/tools').ToolCatalogSelection>;
+}
+function catalogState(state: SessionState, leafId: string | null): MemoryCatalogIndex {
+  if (leafId === null) return { branchId: state.header.id, state: emptySessionToolCatalogSelection(state.header.id), operations: new Map() };
+  const current = state.catalogIndexes.get(leafId);
+  if (!current) throw new Error('Unknown tool catalog branch boundary.');
+  return current;
+}
 function appendBranchRecord(state: SessionState, entry: SessionBranchEntry): void {
+  const parent = catalogState(state, entry.parentId);
+  const branchId = entry.type === 'branch' ? entry.id : parent.branchId;
+  state.catalogIndexes.set(entry.id, {
+    branchId,
+    state: Object.freeze({ ownerId: toolCatalogSelectionOwner(state.header.id, branchId),
+      selection: entry.type === 'tool_catalog_selection' ? entry.selection : parent.state.selection }),
+    operations: entry.type === 'tool_catalog_selection' ? new Map([...parent.operations, [entry.operationId, entry.selection]]) : parent.operations
+  });
   state.stateIndexes.set(entry.id,advanceMemoryState(stateItems(state,entry.parentId),entry));
   const batch = stateBatch(entry);
   if (batch) state.retainedStateBytes += sessionStateBatchStorageBytes(batch);

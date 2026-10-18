@@ -63,6 +63,8 @@ export interface ToolRequirements {
   readonly hostCapabilities?: readonly string[];
 }
 
+export type ToolInvocationMode = 'direct' | 'programmatic';
+
 /** Executor-owned lifecycle facts. Active resources outlive the invocation. */
 export interface ToolExecutionObservation {
   readonly state: 'not_started' | 'settled' | 'active' | 'unknown';
@@ -208,6 +210,10 @@ export interface ToolDefinition<
   readonly promptGuide?: ToolPromptGuide;
   readonly jsonSchema: JsonObject;
   readonly outputSchema: z.ZodType<TOutput>;
+  /** Portable result contract derived from the same validator used at the observation boundary. */
+  readonly outputJsonSchema: JsonObject;
+  /** Explicit call surfaces. Programmatic execution is opt-in. */
+  readonly invocationModes: readonly ToolInvocationMode[];
   readonly textInput?: ToolTextInputDefinition<TDecodedInput>;
   readonly effectEnvelope: ToolEffectEnvelope;
   readonly requirements?: ToolRequirements;

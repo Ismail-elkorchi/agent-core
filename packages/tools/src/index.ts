@@ -5,7 +5,9 @@ export * from './core/command-output.js';
 export * from './core/command-resources.js';
 export type { CompiledToolDefinition } from './core/compiled.js';
 export * from './core/context.js';
+export { toolDefinitionHash, normalizeToolInvocationModes } from './core/contract.js';
 export * from './core/define.js';
+export { defineJsonSchema, embedJsonSchema, type JsonSchemaValidator, type JsonSchemaValidationIssue } from './core/json-schema.js';
 export * from './core/definition.js';
 export * from './core/execute.js';
 export { describeError } from './core/errors.js';
@@ -24,3 +26,4 @@ export * from './core/workspace-files.js';
 export * from './core/text-edits.js';
 
 export * from './artifact-read/index.js';
+export * from './catalog.js';

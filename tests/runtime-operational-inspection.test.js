@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
+import { conservativeProtocolCapabilities } from '@agent-core/model';
 import { AgentRuntime, ContextService, HistoryReader, InMemorySessionRepository, InferenceService, InMemoryInferenceRepository, agentEventCodec,
-  resolveEffectiveToolCatalog, inspectCapabilitySnapshot, inspectSessionOperational, generationAllowance } from '@agent-core/runtime';
+  resolveEffectiveToolCatalog, resolveToolHostEligibility, inspectCapabilitySnapshot, inspectSessionOperational, generationAllowance } from '@agent-core/runtime';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import { adoptToolDefinition, ResourceLeaseCoordinator, toolRequirementsSatisfied, isToolAvailable } from '@agent-core/tools';
 
@@ -31,10 +32,10 @@ test('source inspection pages do not hydrate or duplicate the operational domain
   await assert.rejects(context.inspect(), /separately requested/);
   assert.equal(inspections, 1);
 });
-function tool(name, requirements, mode = 'read') {
+function tool(name, requirements, mode = 'read', invocationModes = ['direct']) {
   const effects = { accesses: [{ mode, scope: 'memory' }], lockScopes: [], recovery: { kind: 'unknown' } };
   return adoptToolDefinition({ name, implementationId: `tests/${name}@1`, description: name,
-    jsonSchema: { type: 'object' }, outputSchema: z.strictObject({}), requirements,
+    jsonSchema: { type: 'object' }, outputSchema: z.strictObject({}), requirements, invocationModes,
     effectEnvelope: { accesses: effects.accesses, lockScopes: [] },
     decodeInput: () => ({ ok: true, input: {} }), canonicalizeInput: value => value,
     snapshotInput: value => value, deriveEffects: () => effects,
@@ -251,4 +252,69 @@ test('operational byte bound fits complete revision-bound pages without skipping
   } while (offset !== undefined);
   assert.deepEqual(seen, configured.tools.map(item => item.name));
   await assert.rejects(inspectSessionOperational({ ...input, page: { maxBytes: 1 } }), /minimum complete page/);
+});
+
+
+test('capability projection distinguishes effective invocation routes from top-level model exposure', () => {
+  const tools = [tool('direct'), tool('both', undefined, 'read', ['direct', 'programmatic']),
+    tool('program_only', undefined, 'read', ['programmatic'])];
+  const base = { bindingId: 'routes', tools, policy, host: {} };
+  const defaults = resolveEffectiveToolCatalog(base);
+  assert.deepEqual(resolveToolHostEligibility(base).map(value => value.name), ['direct', 'both', 'program_only']);
+  assert.deepEqual(defaults.tools.map(value => value.name), ['direct', 'both']);
+  assert.deepEqual(defaults.snapshot.nativeToolExposure, { discovery: false, programmatic: false });
+  assert.equal(defaults.snapshot.programmaticRoute, 'unavailable');
+  assert.deepEqual(defaults.snapshot.tools[1].invocationModes, ['direct']);
+  assert.deepEqual(defaults.snapshot.tools[2].invocationModes, []);
+  assert.deepEqual(defaults.snapshot.tools[2].reasons, [{ kind: 'invocation_mode' }]);
+  const portable = resolveEffectiveToolCatalog({ ...base, programmaticRunner: true });
+  assert.deepEqual(portable.tools.map(value => value.name), ['direct', 'both', 'program_only']);
+  assert.equal(portable.snapshot.tools[2].available, true);
+  assert.equal(portable.snapshot.tools[2].modelCallable, false);
+  assert.equal(portable.snapshot.tools[2].programmaticRoute, 'portable');
+  const supported = { ...profile, capabilities: { ...profile.capabilities,
+    protocol: conservativeProtocolCapabilities('routes', { deferredTools: true, programmaticTools: true }) } };
+  const native = resolveEffectiveToolCatalog({ ...base, modelProfile: supported,
+    nativeToolExposure: { discovery: true, programmatic: true } });
+  assert.equal(native.snapshot.tools[2].modelCallable, true);
+  assert.equal(native.snapshot.tools[2].deferred, true);
+  assert.equal(native.snapshot.tools[2].programmaticRoute, 'provider');
+  assert.deepEqual(inspectCapabilitySnapshot(native.snapshot).nativeToolExposure, { discovery: true, programmatic: true });
+  assert.notEqual(native.snapshot.revision, portable.snapshot.revision);
+  for (const modelProfile of [undefined, profile])
+    assert.throws(() => resolveEffectiveToolCatalog({ ...base, modelProfile, nativeToolExposure: { programmatic: true } }), /unsupported/u);
+  assert.throws(() => resolveEffectiveToolCatalog({ ...base, modelProfile: supported,
+    programmaticRunner: true, nativeToolExposure: { programmatic: true } }), /one portable or provider-native/u);
+});
+
+test('configured and admitted route inspection matches actual model schemas for direct, portable and native modes', async () => {
+  for (const route of ['unavailable', 'portable', 'provider']) {
+    const calls = [];
+    const provider = fixture(async request => { calls.push(request); return response(request); });
+    provider.describeModel = async () => ({ ...profile, capabilities: { ...profile.capabilities,
+      protocol: conservativeProtocolCapabilities('routes', { deferredTools: true, programmaticTools: true }) } });
+    const artifacts = new InMemoryArtifactRepository();
+    const runtime = new AgentRuntime({ provider, model: 'inspection', maxOutputTokens: 64,
+      tools: [tool('host_runner'), tool('program_only', undefined, 'read', ['programmatic'])],
+      toolPolicy: policy, toolBoundary: { authorizationPolicyId: 'routes', executionTargetId: 'routes' },
+      repositories: { events: new InMemoryEventRepository(agentEventCodec), artifacts },
+      ...(route === 'portable' ? { programRunner: { toolName: 'host_runner', configurationRevision: 'inspection.runner.v1', async run() { return { status: 'completed' }; } } } : {}),
+      ...(route === 'provider' ? { nativeToolExposure: { discovery: true, programmatic: true } } : {}) });
+    try {
+      const configured = await runtime.inspectOperational();
+      assert.equal(configured.capabilities.programmaticRoute, route);
+      const result = await runtime.run({ task: 'inspect modes' }).result;
+      assert.equal(result.terminal.executionStatus, 'completed', JSON.stringify(result));
+      const names = calls[0].tools.map(value => value.function.name);
+      const admitted = await runtime.inspectOperational({ target: 'last_admitted' });
+      assert.equal(admitted.capabilities.programmaticRoute, route);
+      for (const projection of [configured.capabilities, admitted.capabilities]) {
+        assert.deepEqual(projection.items.filter(value => value.modelCallable).map(value => value.name), names);
+        const program = projection.items.find(value => value.name === 'program_only');
+        if (program) assert.equal(program.available, route !== 'unavailable');
+      }
+      if (route === 'provider') assert(calls[0].tools.every(value => value.deferLoading));
+      if (route === 'portable') assert.equal(admitted.capabilities.items.find(value => value.name === 'program_only').modelCallable, false);
+    } finally { await runtime.close(); }
+  }
 });

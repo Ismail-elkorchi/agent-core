@@ -320,11 +320,12 @@ function normalizeToolCalls(provider: string, output: readonly OpenAICodexOutput
     .filter((toolCall): toolCall is ModelToolCall => toolCall !== undefined);
 }
 
-function parseToolArguments(provider: string, value: string | undefined): JsonObject {
-  if (value === undefined || value.length === 0) {
+function parseToolArguments(provider: string, value: unknown): JsonObject {
+  if (value === undefined || value === '') {
     return Object.freeze({});
   }
   try {
+    if (typeof value !== 'string') throw new TypeError('Function call arguments must be a JSON string.');
     return parseJsonObject(JSON.parse(value));
   } catch (error) {
     throw new ModelProviderError({

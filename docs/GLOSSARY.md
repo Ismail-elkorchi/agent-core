@@ -24,6 +24,10 @@ events, state fields, and documentation use them consistently.
 | **observed fact** | A bounded, normalized fact derived from an observation for persistence or later selection. |
 | **plan** | A fully specified proposed effect that has not crossed its authorization or start boundary. |
 | **authorization** | Host-owned authority to perform a bounded effect. |
+| **tool discovery** | Bounded metadata describing source-owned tool references. Discovery does not load an implementation or grant invocation authority. |
+| **tool reference** | Exact source identity, source-local tool identity, definition revision, and authority/connection binding revision. A changed reference requires fresh discovery and loading. |
+| **loaded tool selection** | Branch-owned exact tool references selected for host implementation loading. Saving selection is independent of model-request admission and may survive failed admission. |
+| **admitted tool catalog** | Exact tool definitions bound to an admitted model request. Later loading cannot add tools to that request or authorize calls from its response. |
 | **staged** | Durable local state awaiting a later commit, application, or publication boundary. |
 | **snapshot** | An immutable capture of state at a named boundary, such as a pre-change workspace snapshot. It is not a synonym for request, view, or summary. |
 | **receipt** | An immutable acknowledgement from a durability or authority boundary. Selection records, prompt bundles, and ordinary return values are not receipts. |

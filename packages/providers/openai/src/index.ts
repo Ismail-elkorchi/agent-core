@@ -55,6 +55,7 @@ import {
   responsesPayloadPaths,
   responsesOpaqueProtocolPayloads,
   responsesTool,
+  responsesCaller,
   waitForResponseOrStatus,
   type JsonSseEvent,
   type ResponsesOutputItem as OpenAIOutputItem,
@@ -334,6 +335,8 @@ export class OpenAIProvider implements ModelProvider {
       state: 'exact',
       counting: this.countTokens ? 'provider' : 'estimate',
       asyncTools: modern,
+      deferredTools: modern,
+      programmaticTools: modern,
       steering: modern && this.transport === 'websocket' ? 'native' : 'next_request',
       contextReset: 'fresh_request'
     });
@@ -669,7 +672,10 @@ export class OpenAIProvider implements ModelProvider {
         }
 
         const toolCall = toolCallFromOutputItem(this.id, part.item);
-        if (eventType === 'response.output_item.done' && toolCall) {
+        if (toolCall?.caller && !request.tools?.some(tool => tool.allowedCallers?.includes('programmatic')))
+          throw new ModelProviderError({ provider: this.id, code: 'malformed_response',
+            message: 'Unadvertised programmatic tool call.' });
+        if (eventType === 'response.output_item.done' && toolCall && !request.tools?.some(tool => tool.allowedCallers?.includes('programmatic') === true || tool.deferLoading === true)) {
           const deduped = addUniqueToolCall(toolCalls, toolCall);
           if (deduped) {
             yield { type: 'tool_call', toolCall, raw: parseJsonValue(part) };
@@ -677,17 +683,15 @@ export class OpenAIProvider implements ModelProvider {
           continue;
         }
 
-        for (const streamedToolCall of mergeStreamingFunctionCallParts(accumulators, part)) {
+        for (const streamedToolCall of (request.tools?.some(tool => tool.allowedCallers?.includes('programmatic') === true || tool.deferLoading === true) ? [] : mergeStreamingFunctionCallParts(accumulators, part))) {
           const deduped = addUniqueToolCall(toolCalls, streamedToolCall);
           if (deduped) {
             yield { type: 'tool_call', toolCall: streamedToolCall, raw: parseJsonValue(part) };
           }
         }
 
-        for (const streamedToolCall of mergeStreamingCustomToolCallParts(
-          customAccumulators,
-          part
-        )) {
+        for (const streamedToolCall of (request.tools?.some(tool => tool.allowedCallers?.includes('programmatic') === true || tool.deferLoading === true)
+          ? [] : mergeStreamingCustomToolCallParts(customAccumulators, part))) {
           const deduped = addUniqueToolCall(toolCalls, streamedToolCall);
           if (deduped) {
             yield { type: 'tool_call', toolCall: streamedToolCall, raw: parseJsonValue(part) };
@@ -1013,7 +1017,12 @@ function toOpenAIResponsesRequest(request: ModelRequest, stream: boolean): Recor
   if (request.maxOutputTokens !== undefined) body.max_output_tokens = request.maxOutputTokens;
   const text = toOpenAITextConfig(request.responseFormat);
   if (text) body.text = text;
-  if (request.tools && request.tools.length > 0) body.tools = request.tools.map(responsesTool);
+  if (request.tools && request.tools.length > 0) {
+    const tools: Record<string, unknown>[] = request.tools.map(responsesTool);
+    if (request.tools.some(tool => tool.deferLoading)) tools.push({ type: 'tool_search' });
+    if (request.tools.some(tool => tool.allowedCallers?.includes('programmatic'))) tools.push({ type: 'programmatic_tool_calling' });
+    body.tools = tools;
+  }
   const reasoning = toOpenAIReasoning(request.reasoning);
   if (reasoning) body.reasoning = reasoning;
   if (request.logprobs !== undefined || request.topLogprobs !== undefined) {
@@ -1279,6 +1288,7 @@ function normalizeOpenAITermination(
     return 'content_filter';
   }
   if (payload.status === 'completed') {
+    if (payload.output?.some(item => ['program', 'program_output', 'tool_search_call', 'tool_search_output'].includes(item.type ?? '')) && !payload.output.some(item => item.type === 'message')) return 'continuation';
     return 'stop';
   }
   return 'unknown';
@@ -1330,6 +1340,7 @@ function toolCallFromOutputItem(
   provider: string,
   item: OpenAIOutputItem | undefined
 ): ModelToolCall | undefined {
+  const caller = responsesCaller(item?.caller, provider);
   if (item?.type === 'custom_tool_call') {
     if (!item.name) {
       throw new ModelProviderError({
@@ -1341,6 +1352,7 @@ function toolCallFromOutputItem(
     return {
       ...(item.call_id ? { id: item.call_id } : item.id ? { id: item.id } : {}),
       type: 'custom',
+      ...(caller ? { caller } : {}),
       name: item.name,
       ...(typeof item.async === 'boolean' ? { async: item.async } : {}),
       input: { kind: 'text', value: stringValue(item.input) }
@@ -1359,17 +1371,19 @@ function toolCallFromOutputItem(
   return {
     ...(item.call_id ? { id: item.call_id } : item.id ? { id: item.id } : {}),
     type: 'function',
+    ...(caller ? { caller } : {}),
     name: item.name,
     ...(typeof item.async === 'boolean' ? { async: item.async } : {}),
     input: { kind: 'json', value: parseToolArguments(provider, item.arguments) }
   };
 }
 
-function parseToolArguments(provider: string, value: string | undefined): JsonObject {
-  if (value === undefined || value.length === 0) {
+function parseToolArguments(provider: string, value: unknown): JsonObject {
+  if (value === undefined || value === '') {
     return Object.freeze({});
   }
   try {
+    if (typeof value !== 'string') throw new TypeError('Function call arguments must be a JSON string.');
     return parseJsonObject(JSON.parse(value));
   } catch (error) {
     throw new ModelProviderError({

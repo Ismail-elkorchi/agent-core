@@ -1,3 +1,5 @@
+import { emptySessionToolCatalogSelection, toolCatalogSelectionOwner } from './tool-catalog.js';
+import type { ToolCatalogSelectionState } from '@agent-core/tools';
 import { createProjectionSnapshot, type SessionIndexState } from './projection-snapshot-node.js';
 import { promises as fs } from 'node:fs';
 import { parseModelSelection, type ModelSelection } from '@agent-core/model';
@@ -34,7 +36,7 @@ const locatorSchema = z.strictObject({offset: integer, bytes: z.number().int().p
 type Locator = z.infer<typeof locatorSchema>;
 const stampSchema = z.strictObject({size: integer, mtimeMs: z.number(), ctimeMs: z.number()});
 const rootSchema = z.strictObject({
-  format: z.literal('agent-core.session-projection/10'), generation: id, lineage: z.uuid(), header: z.unknown(),
+  format: z.literal('agent-core.session-projection/11'), generation: id, lineage: z.uuid(), header: z.unknown(),
   summary: z.strictObject({id, timestamp: id, updatedAt: id, preview: z.string().max(160).optional(), provider: id.optional(), model: id.optional(), bindingSchemaId: id, bindingSchemaVersion: z.number().int().positive(), bindingSha256: hash}),
   tree: hash.nullable(), confirmedRunsRoot: hash.nullable(), leafId: id.nullable(), sourceRevision: integer, acceptedInputRevision: integer, retainedStateBytes: integer, indexedRecords: integer,
   headerBytes: z.number().int().positive().max(16 * 1024 * 1024), completeBytes: integer, lineCount: integer, marker: z.string(), stamp: stampSchema,
@@ -45,12 +47,12 @@ const statePointerSchema = z.strictObject({entryId:id,itemId:id,revisionId:id,co
 const positionSchema = locatorSchema.extend({
   depth: integer, ancestors: z.array(id).max(53), branchId: id,
   lookupRoot: hash.nullable(), inheritedHeadsRoot: hash.nullable(), activeRunsRoot: hash.nullable(), finalizedRunsRoot: hash.nullable(), unconfirmedRunsRoot: hash.nullable(), confirmedRunsRoot: hash.nullable(),
-  parentId: id.nullable(), identity: id, type: z.enum(['input','steering','assistant','tool_call','observation','branch','model_settings','context_transition','session_state_batch']),
+  parentId: id.nullable(), identity: id, type: z.enum(['input','steering','assistant','tool_call','observation','branch','model_settings','context_transition','session_state_batch','tool_catalog_selection']),
   timestamp: id, runId: id.optional(), toolName: id.optional(), source: historyEventSourceSchema.optional(),
   fromEntryId: id.nullable().optional(), historyPosition: historyCutSchema.optional(),
   stateHeadsRoot: hash.nullable(), stateRevisionsRoot: hash.nullable(), latestInputDepth: z.number().int().min(-1), modelSourceId: id.nullable(), contextId: id.nullable(),
   context: z.strictObject({
-    type: z.enum(['input','steering','assistant','tool_call','observation','branch','model_settings','context_transition','session_state_batch']),
+    type: z.enum(['input','steering','assistant','tool_call','observation','branch','model_settings','context_transition','session_state_batch','tool_catalog_selection']),
     description: z.string().max(400), runId: id.optional(), exchangeId: id.optional(),
     callIndex: integer.optional(), toolBatchId: id.optional(), expectedCalls: integer.optional(),
     prefixBound: z.boolean().optional(), contextRecovery: z.literal(true).optional()
@@ -431,6 +433,18 @@ export class JsonlBranchIndex {
       return entry;
     });
   }
+  async toolCatalogSelection(session: SessionDescriptor, operationId?: string): Promise<ToolCatalogSelectionState | undefined> {
+    return this.query(session, async root => {
+      if (root.leafId === null) return operationId === undefined ? emptySessionToolCatalogSelection(this.sessionId) : undefined;
+      const leaf = this.positionValue(await this.main(root).get(root.tree, `entry:${root.leafId}`));
+      const value = await this.tree.get(leaf.lookupRoot, operationId === undefined ? 'tool-catalog:current' : `tool-catalog:operation:${operationId}`);
+      if (value === undefined) return operationId === undefined ? emptySessionToolCatalogSelection(this.sessionId, leaf.branchId) : undefined;
+      const pointer = z.strictObject({ entryId: id }).parse(value);
+      const entry = await this.branchRecord(await this.locate(root, `entry:${pointer.entryId}`), pointer.entryId, root);
+      if (entry.type !== 'tool_catalog_selection') throw new Error('Invalid tool catalog selection index.');
+      return Object.freeze({ ownerId: toolCatalogSelectionOwner(this.sessionId, leaf.branchId), selection: entry.selection });
+    });
+  }
   async initialModelSettings(session: SessionDescriptor): Promise<ModelSelection | undefined> {
     return this.query(session, async root => {
       const value = await this.main(root).get(root.tree, 'initial-model');
@@ -646,7 +660,7 @@ export class JsonlBranchIndex {
     await this.store.repairStorage();
     const stamp = await jsonlStorageStamp(this.filePath);
     const lineage = randomUUID();
-    const root: Root = {format: 'agent-core.session-projection/10', generation: randomUUID(), lineage, header, summary: {
+    const root: Root = {format: 'agent-core.session-projection/11', generation: randomUUID(), lineage, header, summary: {
       id: header.id, timestamp: header.timestamp, updatedAt: header.timestamp,
       ...(header.provider ? {provider: header.provider} : {}), ...(header.model ? {model: header.model} : {}),
       bindingSchemaId: header.binding.schemaId, bindingSchemaVersion: header.binding.schemaVersion, bindingSha256: header.binding.bindingSha256
@@ -836,6 +850,13 @@ export class JsonlBranchIndex {
     if ('runId' in record) lookupChanges.push([`run:${record.runId}`, {entryId: record.id}]);
     if (record.type === 'input') lookupChanges.push([`input:${record.runId}`, {entryId: record.id}]);
     const modelSourceId = record.type === 'model_settings' ? record.id : parent?.modelSourceId ?? null;
+    if (record.type === 'tool_catalog_selection') {
+      const branchId = parent?.branchId ?? this.sessionId;
+      if (record.branchId !== branchId) throw new Error('Tool catalog selection belongs to another branch.');
+      if (await this.tree.get(parent?.lookupRoot ?? null, `tool-catalog:operation:${record.operationId}`) !== undefined)
+        throw new Error('Duplicate tool catalog selection operation.');
+      lookupChanges.push(['tool-catalog:current', { entryId: record.id }], [`tool-catalog:operation:${record.operationId}`, { entryId: record.id }]);
+    }
     if (record.type === 'context_transition') {
       if (await this.tree.get(parent?.lookupRoot ?? null, `context:${record.transition.idempotencyKey}`) !== undefined) throw new Error('Duplicate context transition idempotency key.');
       lookupChanges.push([`context:${record.transition.idempotencyKey}`, {entryId: record.id}]);

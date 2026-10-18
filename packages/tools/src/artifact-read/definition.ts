@@ -21,6 +21,7 @@ export function createReadArtifactTool(options: ReadArtifactToolOptions) {
     description: 'Read a byte range from an artifact produced by this runtime.',
     schema: readArtifactInputSchema,
     outputSchema: readArtifactOutputSchema,
+    invocationModes: ['direct', 'programmatic'],
     buildModelContent: buildReadArtifactContent,
     requirements: { services: ['artifactRepository'] },
     effectEnvelope: { accesses: [{ mode: 'read', scope: 'artifacts' }], lockScopes: [] },
@@ -91,17 +92,22 @@ export function createReadArtifactTool(options: ReadArtifactToolOptions) {
       } as const;
       return {
         kind: 'result' as const,
-        summary: `Read bytes ${String(input.offset)}-${String(end)} of ${String(artifact.size)} from ${artifact.artifactId}.`,
+        summary: `Read bytes ${String(range.offset)}-${String(end)} of ${String(artifact.size)} from ${artifact.artifactId}.`,
         scope,
         observedFacts: { items: [{
           action: 'read',
-          resources: [{ uri: `artifact://${artifact.artifactId}` }],
+          resources: [{
+            uri: `artifact://${artifact.artifactId}`,
+            range: { kind: 'byte', start: range.offset, end },
+            fullSha256: artifact.sha256,
+            mediaType: artifact.mediaType.replace(/;.*$/u, '').trim()
+          }],
           scope: {
             coverage,
             ...(scope.coverage === 'partial' ? { limits: scope.limits } : {}),
             actuality: 'observed'
           },
-          summary: `Read ${String(selected.byteLength)} bytes from artifact ${artifact.artifactId}.`,
+          summary: `Read ${String(selected.byteLength)} bytes at ${String(range.offset)}-${String(end)} from artifact ${artifact.artifactId}.`,
           outcome: 'success'
         }] },
         content,

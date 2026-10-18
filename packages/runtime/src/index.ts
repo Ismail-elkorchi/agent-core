@@ -90,3 +90,12 @@ export { SessionReadLifetime } from './session/read-lifetime.js';
 export * from "./session/operational.js";
 
 export { createResourceReportTool, readPendingResourceReports, readResourceReleaseReports } from './orchestration/resource-reports.js';
+
+export type { ProgramToolDescription, ProgramRunnerInput, ProgramRunnerResult, RuntimeProgramRunner, ProgramExecutionHost } from './orchestration/program-contracts.js';
+
+export * from './run/tool-discovery.js';
+export { SessionToolCatalogSelectionStore } from './session/tool-catalog.js';
+
+export { programResultSchema } from './orchestration/program-result.js';
+
+export { parseNativeToolExposure, type NativeToolExposure } from './orchestration/native-tool-exposure.js';

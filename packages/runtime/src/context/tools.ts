@@ -21,6 +21,7 @@ import { hashJson, decodeOwnedArtifactRef, PersistenceConflictError, type Artifa
 import { SESSION_STATE_GUIDANCE, sessionStatePageSchema, sessionStateReadSchema, sessionStateSearchSchema, sessionStateOperationSchema, sessionStateItemRefSchema, plannedSessionStateRefs } from '../session/session-state.js';
 import type { HistorySourceExcerpt } from '../history/contracts.js';
 import type { ContextService } from './service.js';
+const jsonOutputSchema: z.ZodType<JsonValue> = z.json();
 /** Internal construction receives explicit owned storage, never a public staging capability. */
 export function contextToolDefinitions(options: {
   readonly context: ContextService;
@@ -101,7 +102,7 @@ export function contextToolDefinitions(options: {
       ? 'Atomically save conditional narrative item changes and activate the selected view, or publish neither if admission fails. activateSaved replaces selected references for touched items with their new revisions and removes deleted items from the view. Set activateSaved=false to use the explicitly supplied view unchanged.'
       : 'Activate exact existing item revisions and historical sources without saving state.'} retain replaces optional original sources; add/release edits complete exchanges. Active accepted inputs remain protected. renewal deliberately starts a new provider continuation. outputReservation proposes an ordinary output-token allowance for this window, only within explicit host policy; omission retains the current choice. It changes neither continuing-work budgets nor host ceilings. A scheduled result is pending until the exact next request is admitted.`,
     schema: atomic ? combined : transition,
-    outputSchema: z.json().transform(value => parseJsonValue(value)),
+    outputSchema: jsonOutputSchema,
     effectEnvelope: { accesses: [{ mode: 'read', scope: 'session_state' }, { mode: 'read', scope: 'artifacts' }, { mode: 'write', scope: 'context' }, ...(atomic ? [{ mode: 'write' as const, scope: 'session_state' }] : [])],
       lockScopes: atomic ? ['context', 'session_state'] : ['context'] },
     canonicalizeInput: canonicalize,
@@ -253,7 +254,7 @@ export function contextToolDefinitions(options: {
       name: `${prefix}_state_save`, implementationId: 'agent-core.session-state-save.v1',
       description: `${SESSION_STATE_GUIDANCE} Durably save a conditional atomic batch of create, replace, UTF-8 range edit, or remove operations. Does not compile or activate any model request. Runtime assigns item and revision identities and returns them in the durable receipt.`,
       schema: save,
-      outputSchema: z.json().transform(value => parseJsonValue(value)),
+      outputSchema: jsonOutputSchema,
       effectEnvelope: { accesses: [{ mode: 'write', scope: 'session_state' }, { mode: 'read', scope: 'session_state' }], lockScopes: ['session_state'] },
       async canonicalizeInput(value, planning) {
         if (!planning.invocation) throw new Error('State saving requires an originating inference.');

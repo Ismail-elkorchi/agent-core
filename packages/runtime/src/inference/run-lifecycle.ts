@@ -279,6 +279,7 @@ export function createRunInferenceLifecycle(
         effectId,
         responseId,
         response,
+        ...(requestFingerprint.programReceiptsThrough === undefined ? {} : { programReceiptsThrough: requestFingerprint.programReceiptsThrough }),
         ...(providerState ? { providerState } : {})
       };
       const settlementReceipt = await turnRequest.run.append(

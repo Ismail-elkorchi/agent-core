@@ -44,9 +44,14 @@ export class RequestAdmission {
     readonly original: CompiledModelRequest;
     readonly profile: ModelProfile;
     readonly control: import('./prompt-material.js').PromptRuntimeControl;
+    readonly tools?: readonly import('@agent-core/model').ModelTool[];
     readonly outputReservation: number;
     readonly signal?: AbortSignal | undefined;
   }) {
+    if (input.tools && hashJson(input.tools) !== hashJson(input.original.logicalRequest.tools ?? []) &&
+        input.original.logicalRequest.messages.some(message => message.role === 'protocol' && message.state.compatibility.requiresExactPrefix))
+      throw new NativeContextTransitionRequired(input.original.logicalRequest,
+        'Recovery tool schemas cannot replace an exact native prefix catalog.');
     const presentation = this.inference.presentationFor(input.original);
     if (!presentation) throw new Error('Runtime control requires the original compiled request presentation.');
     const roles = input.profile.capabilities.protocol?.roles ?? ['system', 'user', 'assistant'];
@@ -57,6 +62,7 @@ export class RequestAdmission {
     });
     const request: ModelRequest = {
       ...input.original.logicalRequest, messages: assembly.messages,
+      ...(input.tools ? { tools: input.tools } : {}),
       ...(input.profile.supportedParameters.includes('maxOutputTokens')
         ? { maxOutputTokens: input.outputReservation } : {}),
       ...(input.signal ? { signal: input.signal } : {})

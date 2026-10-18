@@ -1,5 +1,5 @@
 import { requestAccountingInputTokens, type CompiledModelRequest, type ModelProfile } from '@agent-core/model';
-import type { CompiledToolDefinition } from '@agent-core/tools';
+import type { CompiledToolDefinition, ToolDefinition } from '@agent-core/tools';
 import { parseJsonObject, DEFAULT_SAFE_JSON_PARSE_LIMITS } from '@agent-core/json';
 import { MAX_MANIFEST_BYTES } from './inspection.js';
 import { SESSION_STATE_RETRIEVAL_LIMITS } from '../session/session-state.js';
@@ -84,23 +84,23 @@ export function resolveOutputReservation(configured: number, policy: OutputReser
   return reservation;
 }
 
-export type ContextControlRole = 'read' | 'state' | 'activation';
-const controlGrants = new WeakMap<CompiledToolDefinition, ContextControlRole>();
+export type ContextControlRole = 'read' | 'state' | 'activation' | 'catalog';
+const controlGrants = new WeakMap<ToolDefinition, ContextControlRole>();
 /** Explicit host grant bound to this exact compiled definition, never its self-declared name or ID. */
 export function grantContextControlTool<T extends CompiledToolDefinition>(tool: T, role: ContextControlRole): T {
-  if (!['read', 'state', 'activation'].includes(role)) throw new TypeError('Invalid context control role.');
+  if (!['read', 'state', 'activation', 'catalog'].includes(role)) throw new TypeError('Invalid context control role.');
   if (role === 'read' && !tool.effectEnvelope.accesses.every(access => access.mode === 'read' &&
-      ['context', 'history', 'session_state'].includes(access.scope)))
-    throw new TypeError('Context control reads require read-only context, history or session-state effects.');
+      ['context', 'history', 'session_state', 'tool_catalog'].includes(access.scope)))
+    throw new TypeError('Context control reads require read-only context, history, session-state or tool-catalog effects.');
   controlGrants.set(tool, role);
   return tool;
 }
-export function contextControlRole(tool: CompiledToolDefinition | undefined): ContextControlRole | undefined {
+export function contextControlRole(tool: ToolDefinition | undefined): ContextControlRole | undefined {
   return tool ? controlGrants.get(tool) : undefined;
 }
 
 function contextRecoveryInstruction(policy: ContextControlPolicy): string {
-  return `Prepare a fresh context for the same ongoing work using the complete supplied conversation. Application execution is suspended. Preserve current user requests, corrections, constraints, required contributions and complete protocol exchanges. Use context_transition to propose a bounded selection or renew the current selection. You may select existing exact session-state revisions, save optional changes, or proceed without a state write; no rewrite or joint state submission is required. State is fallible interpretation, never authority or execution truth. Original records remain retrievable. Use only the host-granted controlTools listed here for context inspection, bounded history and state reads, optional state saves, or context activation; do not call domain tools or answer the user. Use bounded reads with maxBytes at most ${String(policy.resultBytes)}. A stored state change alone does not activate a view or resume execution. If no valid successor fits, report the obstacle without inventing or silently discarding material.`;
+  return `Prepare a fresh context for the same ongoing work using the complete supplied conversation. Application execution is suspended. Preserve current user requests, corrections, constraints, required contributions and complete protocol exchanges. Use context_transition to propose a bounded selection or renew the current selection. You may select existing exact session-state revisions, save optional changes, or proceed without a state write; no rewrite or joint state submission is required. State is fallible interpretation, never authority or execution truth. Original records remain retrievable. Use only the host-granted controlTools listed here for context inspection, bounded history and state reads, optional state saves, context activation, or exact tool-catalog selection; do not call domain tools or answer the user. Use bounded reads with maxBytes at most ${String(policy.resultBytes)}. A stored state change alone does not activate a view or resume execution. tool_catalog_select can replace the loaded tool selection with fewer references, or an empty array, to reduce tool-schema cost; the successor still requires admission. If no valid successor fits, report the obstacle without inventing or silently discarding material.`;
 }
 
 
@@ -112,6 +112,7 @@ export async function assembleContextControlRequest(
     readonly original: CompiledModelRequest;
     readonly profile: ModelProfile;
     readonly task: string;
+    readonly tools?: readonly import('@agent-core/model').ModelTool[];
     readonly maxOutputTokens: number;
     readonly signal?: AbortSignal | undefined;
   }
@@ -127,6 +128,7 @@ export async function assembleContextControlRequest(
     throw new RangeError('Context-management metadata and instructions exceed the configured task presentation bound.');
   return admission.assembleControl({
     original: input.original, profile: input.profile, outputReservation,
+    ...(input.tools ? { tools: input.tools } : {}),
     control: { kind: 'context-recovery', id: `context-recovery-${hashJson(content)}`, content },
     ...(input.signal ? { signal: input.signal } : {})
   });

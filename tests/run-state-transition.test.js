@@ -125,7 +125,7 @@ function readyBatch(index) {
     modelCalls: [{ id: call.id, name: call.name, type: 'function', input: call.input }],
     source: {
       responseId: `response-${String(index)}`,
-      catalog: { revision: hashJson(entries), entries }
+      catalog: { format: 'agent-core.tool-catalog/2', revision: hashJson({ format: 'agent-core.tool-catalog/2', entries }), entries }
     },
     callStates: [{ stage: 'ready' }],
     maxConcurrency: 1,

@@ -12,6 +12,7 @@ export const readFilesTool = defineTool({
     'Read line ranges from one or more rooted text files with complete-file integrity metadata.',
   schema: readFilesInputSchema,
   outputSchema: readFilesOutputSchema,
+  invocationModes: ['direct', 'programmatic'],
   buildModelContent: buildReadFilesContent,
   requirements: { services: ['localToolConfiguration'] },
   effectEnvelope: { accesses: [{ mode: 'read', scope: 'files' }], lockScopes: [] },

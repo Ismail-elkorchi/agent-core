@@ -1,8 +1,14 @@
+import { parseNativeToolExposure, type NativeToolExposure } from './orchestration/native-tool-exposure.js';
+import { toolInvocationCaller } from './run/control/tool-state.js';
+import { settledProgramReceiptsThrough, programCompletionContext } from './orchestration/program-observations.js';
+import { createToolCatalogTools, authorizeToolCatalogEffects, resolveRuntimeToolCatalog } from './run/tool-discovery.js';
+import { SessionToolCatalogSelectionStore } from './session/tool-catalog.js';
+import type { RuntimeProgramRunner } from './orchestration/program-contracts.js';
 import { captureRequestCapabilities } from './inference/capability-capture.js';
 import { captureContextCapabilities } from './context/service.js';
 import { inspectSessionOperational, type ContextOperationalInspectionPage } from './session/operational.js';
 import { commitResourceRelease } from './orchestration/resource-settlement.js';
-import { resolveEffectiveToolCatalog, type EffectiveCapabilitySnapshot } from './run/capabilities.js';
+import { resolveEffectiveToolCatalog, resolveToolHostEligibility, type EffectiveCapabilitySnapshot } from './run/capabilities.js';
 import { NativeContextIncompatibilityError } from './orchestration/model-change.js';
 import { parseContextControlPolicy, parseOutputReservationPolicy, resolveOutputReservation, contextControlRole, type ContextControlPolicy, type OutputReservationPolicy, assembleContextControlRequest, contextControlReserve, contextControlPreview, contextControlSteering } from './context/recovery.js';
 import { resolveToolModelContent } from './orchestration/observation-source.js';
@@ -25,6 +31,7 @@ import {
   modelResponseOutput,
   ModelContractError,
   parseModelProfile,
+  providerContextIncompatibility,
   type CompiledModelRequest,
   type ModelOutputItem,
   type ModelProfile,
@@ -40,9 +47,11 @@ import {
 import { hashJson, PersistenceDriverOwnershipLostError, type EventAppendReceipt } from '@agent-core/persistence';
 import {
   READ_ONLY_TOOL_POLICY,
+  POLICY_TOOL_AUTHORIZER,
   serializeToolModelContent,
   ResourceLeaseCoordinator,
   ToolRegistry,
+  ToolCatalog,
   parseToolPolicy,
   planToolCall,
   recoverToolCallPlan,
@@ -194,9 +203,9 @@ export interface AgentRuntimeOptions {
   readonly model: string;
   readonly repositories: AgentRuntimeRepositories;
   readonly tools?: readonly CompiledToolDefinition[];
-  readonly toolCatalogProvider?: () =>
-    | readonly CompiledToolDefinition[]
-    | Promise<readonly CompiledToolDefinition[]>;
+  readonly toolCatalog?: ToolCatalog;
+  readonly programRunner?: RuntimeProgramRunner;
+  readonly nativeToolExposure?: NativeToolExposure;
   readonly toolBoundary: ToolAuthorizationBoundary;
   readonly toolContext?: Omit<ToolExecutionContext, 'policy' | 'signal' | 'observationSignal'>;
   readonly toolResourceLeases?: ResourceLeaseCoordinator;
@@ -440,6 +449,7 @@ export class AgentRuntime {
   private readonly outputReservationPolicy: OutputReservationPolicy | undefined;
   private readonly toolPolicy: ToolPolicy;
   private tools: readonly CompiledToolDefinition[];
+  private readonly toolCatalog: ToolCatalog;
   private readonly resourceLeases: ResourceLeaseCoordinator;
   private readonly requestAssembler: ModelRequestAssembler;
   private readonly history: HistoryReader | undefined;
@@ -478,6 +488,21 @@ export class AgentRuntime {
   private static readonly MAX_STEERING_ITEMS = 1024;
 
   constructor(private readonly options: AgentRuntimeOptions) {
+    const runner = options.programRunner;
+    const runnerRevision = runner?.configurationRevision;
+    // Capture once before validation, then bind below without rereading a potentially mutable getter.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const runnerRun = runner?.run;
+    if (runner && (typeof runnerRevision !== 'string' || !runnerRevision.trim() || runnerRevision.length > 512))
+      throw new TypeError('Program runner requires an explicit bounded configurationRevision.');
+    if (runner && typeof runnerRun !== 'function')
+      throw new TypeError('Program runner requires a run function.');
+    this.options = options = { ...options,
+      ...(options.nativeToolExposure === undefined ? {} : { nativeToolExposure: parseNativeToolExposure(options.nativeToolExposure) }),
+      ...(runner && runnerRevision && runnerRun ? { programRunner: Object.freeze({ toolName: runner.toolName, configurationRevision: runnerRevision,
+        ...(runner.maxConcurrentPrograms === undefined ? {} : { maxConcurrentPrograms: runner.maxConcurrentPrograms }),
+        run: runnerRun.bind(runner) }) } : {}) };
+
     this.metadata =
       options.metadata === undefined ? undefined : Object.freeze({ ...options.metadata });
     this.estimator = options.estimator ?? new RequestTokenEstimator();
@@ -539,8 +564,17 @@ export class AgentRuntime {
       if (!Number.isSafeInteger(minimum) || minimum < 1 || !Number.isSafeInteger(maximum) || maximum < minimum || maximum > this.maxOutputTokens)
         throw new TypeError('Output reservation policy must be positive, ordered and within the configured output allowance.');
     }
+    if (options.programRunner?.maxConcurrentPrograms !== undefined && (!Number.isSafeInteger(options.programRunner.maxConcurrentPrograms) || options.programRunner.maxConcurrentPrograms < 1))
+      throw new TypeError('Program runner maxConcurrentPrograms must be a positive safe integer.');
     this.toolPolicy = parseToolPolicy(options.toolPolicy ?? READ_ONLY_TOOL_POLICY);
-    this.tools = Object.freeze(new ToolRegistry(options.tools ?? []).list());
+    if (options.tools !== undefined && options.toolCatalog !== undefined)
+      throw new TypeError('Supply tools or a toolCatalog, not two catalog owners.');
+    this.toolCatalog = options.toolCatalog ?? new ToolCatalog({ tools: options.tools ?? [] });
+    if (options.repositories.session) this.toolCatalog.bindSelectionStore(new SessionToolCatalogSelectionStore(
+      options.repositories.session.repository, options.repositories.session.descriptor,
+      operation => this.withStateOwnership(operation)));
+    this.tools = Object.freeze(new ToolRegistry([...this.toolCatalog.current(),
+      ...(this.toolCatalog.hasSelectionControls() ? createToolCatalogTools({ catalog: this.toolCatalog }) : [])]).list());
     this.resourceLeases =
       options.toolResourceLeases ??
       options.resources?.resourceLeases ??
@@ -588,6 +622,7 @@ export class AgentRuntime {
 
   /** These facts are observations; only the actual request/effect admission grants authority. */
   async inspectOperational(page: ContextOperationalInspectionPage = {}) {
+    await this.refreshTools();
     const profile = parseModelProfile(await this.options.provider.describeModel(this.options.model));
     const ownerId = this.options.inferenceOwnerId ?? this.activeRunId;
     return inspectSessionOperational({ configured: this.capabilityCatalog(profile).snapshot, profile,
@@ -617,9 +652,10 @@ export class AgentRuntime {
     const abortController = new AbortController();
     const runReady = runs
       .inspect(runId)
-      .then((inspection) =>
-        inspection.state.phase.kind === 'terminal' ? undefined : runs.attach(runId)
-      );
+      .then((inspection) => {
+        this.assertRunImplementation(inspection.state);
+        return inspection.state.phase.kind === 'terminal' ? undefined : runs.attach(runId);
+      });
     this.activeAbortController = abortController;
     this.activeRunId = runId;
     this.activeRunReady = runReady;
@@ -668,6 +704,11 @@ export class AgentRuntime {
     readonly decision: 'allow' | 'deny';
     readonly signal?: AbortSignal;
   }): Promise<AgentRunHandle> {
+    const runs = new AgentRunCoordinator(
+      this.options.repositories.events,
+      this.options.repositories.artifacts ?? this.inferenceService.options.artifacts
+    );
+    this.assertRunImplementation((await runs.inspect(input.runId)).state);
     const terminal = await this.options.repositories.events.latestOfType(input.runId, 'run.ended');
     if (terminal?.event.type === 'run.ended') {
       const confirmationDiagnostic = this.options.repositories.session
@@ -688,10 +729,7 @@ export class AgentRuntime {
         })
       );
     }
-    const run = await new AgentRunCoordinator(
-      this.options.repositories.events,
-      this.options.repositories.artifacts ?? this.inferenceService.options.artifacts
-    ).attach(input.runId);
+    const run = await runs.attach(input.runId);
     if (this.hasToolImplementationMismatch(run)) {
       await this.releaseResources();
       return completedRunControl(input.runId, missingImplementationSuspension(run.state()));
@@ -713,6 +751,7 @@ export class AgentRuntime {
     }
     const call = pendingApproval.batch.calls[pendingApproval.callIndex];
     if (!call) throw new Error(`Approval ${input.approvalId} has no durable tool call.`);
+    const caller = toolInvocationCaller(pendingApproval.batch, pendingApproval.callIndex);
     const authorizationContext = Object.freeze({
       ...this.toolContext(input.signal ?? new AbortController().signal),
       invocation: Object.freeze({
@@ -722,7 +761,8 @@ export class AgentRuntime {
         toolBatchId: approval.toolBatchId,
         callIndex: approval.callIndex,
         ...(approval.callId ? { callId: approval.callId } : {}),
-        toolAttempt: 1
+        toolAttempt: 1,
+        ...(caller ? { caller } : {})
       })
     });
     const current = await planToolCall(call, this.tools, authorizationContext);
@@ -1179,6 +1219,7 @@ export class AgentRuntime {
       }
       decision = cleanupFailureDecision(undefined, cleanupError);
     } else if (decision.executionStatus === 'waiting_for_recovery') {
+      await this.steeringWrites;
       const cleanupError = await this.releaseOwnedResources(runId, append);
       return Object.freeze({
         state: 'suspended',
@@ -1601,10 +1642,7 @@ export class AgentRuntime {
             await this.options.provider.describeModel(configuration.model)
           );
           const providerInfo = this.options.provider.describe();
-          if (this.options.toolCatalogProvider)
-            this.tools = Object.freeze(
-              new ToolRegistry(await this.options.toolCatalogProvider()).list()
-            );
+          await this.refreshTools(runtime.signal);
           const tools = Object.freeze(this.availableTools(profile));
           validateModelRun(
             providerInfo.id,
@@ -1823,6 +1861,19 @@ export class AgentRuntime {
               toolCalls: [],
               ...(response.output ? { output: response.output } : {})
             });
+          if (response.terminationReason === 'continuation') {
+            const providerSettlement = providerWork(runtime.run.state(), assistant.turn.snapshot.record);
+            if (providerSettlement.stage !== 'settled')
+              throw new Error('Program continuation requires a settled provider response.');
+            await runtime.run.transitionProvider('consume_provider_settlement', providerSettlement.identity,
+              () => ({ ...providerSettlement, stage: 'consumed' }), runtime.controller.snapshot());
+            await this.advanceRun(runtime.run, 'continue_provider_program', {
+              phase: { kind: 'initializing', step: 'assemble_turn', turnIndex: turnIndex + 1 },
+              budget: runtime.controller.snapshot()
+            });
+            turnIndex += 1;
+            continue;
+          }
           if (activeModelOutput.status === 'absent') {
             const emptyMessage = [
               `Model returned no native tool calls and no visible modelOutput at turnIndex ${String(turnIndex)}.`,
@@ -1844,12 +1895,13 @@ export class AgentRuntime {
           return completedDecision(activeModelOutput, turnIndex, response);
         }
 
+        this.assertProgrammaticCallsAdvertised(response, snapshot);
         runtime.controller.reserveToolCalls(toolCalls);
         if (!snapshot.record.contextRecovery) modelWindow.recordModelOutput({
           source: assistant.source,
           turnIndex,
           content: response.content,
-          toolCalls: toolCalls.map(modelToolCallFromToolCall),
+          toolCalls: response.toolCalls ?? toolCalls.map(modelToolCallFromToolCall),
           ...(response.output ? { output: response.output } : {})
         });
         await this.recordAcceptedToolCalls(runtime, activeTurnIdentity, toolBatchId, toolCalls, modelWindow);
@@ -1930,6 +1982,19 @@ export class AgentRuntime {
     }
   }
 
+  private programTool(): CompiledToolDefinition | undefined {
+    return this.options.programRunner ? this.tools.find(tool => tool.name === this.options.programRunner?.toolName) : undefined;
+  }
+
+  private assertProgrammaticCallsAdvertised(response: ModelResponse, snapshot: { readonly tools: readonly CompiledToolDefinition[]; readonly profile: ModelProfile }): void {
+    for (const call of response.toolCalls ?? []) {
+      if (!call.caller) continue;
+      if (!this.options.nativeToolExposure?.programmatic || !snapshot.profile.capabilities.protocol?.programmaticTools ||
+          !snapshot.tools.some(tool => tool.name === call.name && tool.invocationModes.includes('programmatic')))
+        throw new Error('Provider program call was not authorized by its admitted tool catalog.');
+    }
+  }
+
   private createToolExecutor(
     runtime: RunExecutionRuntime,
     modelWindow: ModelWindow,
@@ -1941,23 +2006,46 @@ export class AgentRuntime {
       runId: runtime.runId,
       driverGeneration: runtime.run.state().driverGeneration,
       resolveTools: (catalog) => this.catalogTools.get(catalog.revision) ?? this.tools,
-      currentTools: async () => {
-        if (this.options.toolCatalogProvider)
-          this.tools = Object.freeze(
-            new ToolRegistry(await this.options.toolCatalogProvider()).list()
-          );
-        return this.tools;
+      currentTools: async phase => {
+        await this.refreshTools(signal);
+        return resolveToolHostEligibility({ tools: this.tools, policy: this.toolPolicy, host: this.toolHostRequirements(phase.modelInputModalities) });
       },
       toolContext: this.toolContext(signal),
+      nativeProgrammaticTools: this.options.nativeToolExposure?.programmatic === true,
+      ...(this.options.programRunner ? { programRunner: this.options.programRunner } : {}),
+      ...(this.options.repositories.artifacts ? { artifactRepository: this.options.repositories.artifacts } : {}),
+      admitProgramCall: async (batch, tools) => {
+        this.catalogTools.set(batch.source.catalog.revision, tools);
+        await this.advanceRun(runtime.run, 'admit_program_call', state => {
+          signal.throwIfAborted();
+          this.observationController.signal.throwIfAborted();
+          if (state.phase.kind !== 'active' || state.control.status !== 'owned')
+            throw new Error('Program child admission is quiesced.');
+          return { phase: state.phase, toolBatches: [...state.toolBatches, batch],
+            budget: runtime.controller.reserveToolCalls(batch.calls) };
+        });
+      },
+      yieldProgramCall: async target => {
+        await runtime.run.transitionTool('reconcile_tool_call', target, call => call.stage === 'effect_pending'
+          ? { ...call, stage: 'outcome_unknown' } : call, runtime.controller.snapshot());
+      },
+      interruptProgramCall: async target => {
+        await runtime.run.transitionTool('interrupt_program_call', target, call => {
+          if (call.stage === 'ready') return { stage: 'cancelled', toolAttempt: 1 };
+          if (call.stage === 'effect_ready') return { stage: 'cancelled', toolAttempt: call.toolAttempt,
+            plan: call.plan, effect: closeExternalEffect(call.effect, 'cancelled_before_start') };
+          throw new Error('Only unstarted program children can be cancelled.');
+        }, runtime.controller.snapshot());
+      },
       resourceLeases: this.resourceLeases,
-      ...(this.options.toolAuthorizer ? { authorizer: this.options.toolAuthorizer } : {}),
+      authorizer: this.authorizeTool,
       ...(this.options.toolContextPrerequisite
         ? { contextPrerequisite: this.options.toolContextPrerequisite }
         : {}),
       modelWindow,
       observationStore,
       ...(this.options.context && this.options.contextRenewal?.automatic ? {
-        stagePresentations: (phase: AgentToolPhase) => !phase.source.nativeCatalogIdentity &&
+        stagePresentations: (phase: AgentToolPhase) => !phase.source.program && !phase.source.nativeCatalogIdentity &&
           (this.catalogTools.get(phase.source.catalog.revision) ?? this.tools).some(tool => isContextActivationTool(tool)) &&
           providerWork(runtime.run.state(), phase.identity).stage === 'consumed',
         selectPresentations: (phase: AgentToolPhase, observations: readonly {
@@ -2281,8 +2369,7 @@ export class AgentRuntime {
     const profile = parseModelProfile(await this.options.provider.describeModel(record.model));
     if (hashJson(profile) !== record.profileHash)
       throw new Error(`Provider model profile changed for persisted turn ${record.turnId}.`);
-    if (this.options.toolCatalogProvider)
-      this.tools = Object.freeze(new ToolRegistry(await this.options.toolCatalogProvider()).list());
+    await this.refreshTools();
     const available = new Map(this.availableTools(profile).map((tool) => [tool.name, tool]));
     const tools = record.toolNames.map((name) => {
       const tool = available.get(name);
@@ -2383,7 +2470,7 @@ export class AgentRuntime {
         context.dispatch?.kind === 'steering'
           ? (active?.request.snapshot.tools ?? nextTools)
           : nextTools;
-      if (hashJson(toolsForModel([...tools], context.profile)) !== hashJson(context.compiled.logicalRequest.tools ?? [])) {
+      if (hashJson(toolsForModel([...tools], context.profile, this.options.nativeToolExposure, this.programTool())) !== hashJson(context.compiled.logicalRequest.tools ?? [])) {
         throw new Error('Native dispatch changed the captured tool catalog.');
       }
       return tools;
@@ -2464,6 +2551,7 @@ export class AgentRuntime {
             configuredContextIds: [],
             providerContextIds: [],
             runContextIds: [],
+            ...await this.programReceiptCursor(runtime.runId),
             effectiveInstructionHash: hashJson(
               request.messages.filter((item) => item.role === 'system' || item.role === 'developer')
             ),
@@ -2658,6 +2746,7 @@ export class AgentRuntime {
             ...(response.output ? { output: response.output } : {})
           });
           if (calls.length) {
+            this.assertProgrammaticCallsAdvertised(response, item.request.snapshot);
             runtime.controller.reserveToolCalls(calls);
             const source = providerWork(runtime.run.state(), item.request.snapshot.record);
             if (source.stage !== 'settled')
@@ -2707,14 +2796,11 @@ export class AgentRuntime {
             pauseFor(await pump.waitUntil(() => deliveries.available().results.length > 0));
             ready = deliveries.available();
           }
-          if (!ready.results.length && !calls.length) return;
-          if (this.options.toolCatalogProvider) {
-            this.tools = Object.freeze(
-              new ToolRegistry(await this.options.toolCatalogProvider()).list()
-            );
-          }
+          if (!ready.results.length && !calls.length &&
+              (response.terminationReason !== 'continuation' || boundary.continuation !== 'client')) return;
+          await this.refreshTools(initial.signal);
           nextTools = Object.freeze(this.availableTools(context.profile));
-          const tools = toolsForModel([...nextTools], context.profile);
+          const tools = toolsForModel([...nextTools], context.profile, this.options.nativeToolExposure, this.programTool());
           // A text response that still waits for an async result is consumed before its successor.
           const source = providerWork(runtime.run.state(), item.request.snapshot.record);
           if (source.stage === 'settled') {
@@ -3002,11 +3088,17 @@ export class AgentRuntime {
       assistantEnded,
       assistantResponseKey(request.runId, responseIdentity)
     );
+    // Ordinary fallback text and direct calls already have canonical session
+    // records. Only synthesize ordered output when it carries additional
+    // provider protocol or caller identity that those records cannot express.
+    const sessionOutput = response.output?.length ? response.output :
+      response.providerState || response.toolCalls?.some(call => call.caller !== undefined)
+        ? modelResponseOutput(response) : undefined;
     await this.recordSessionAssistant(
       request.runId,
       assistantEnded,
       assistantReceipt,
-      response.output
+      sessionOutput
     );
     await emit(assistantEnded);
     return {
@@ -3151,8 +3243,7 @@ export class AgentRuntime {
     const profile = parseModelProfile(
       await this.options.provider.describeModel(configuration.model)
     );
-    if (this.options.toolCatalogProvider)
-      this.tools = Object.freeze(new ToolRegistry(await this.options.toolCatalogProvider()).list());
+    await this.refreshTools(signal);
     const tools = this.availableTools(profile);
     const snapshot = this.createTurnSnapshot({
       turnIndex: turnIndex,
@@ -3224,7 +3315,7 @@ export class AgentRuntime {
 
   /** Recovery retains the bound catalog and native prefix, with host-granted control execution only. */
   private async assembleContextRecovery<T extends Pick<AssistantTurnRequest, 'runId' | 'input' | 'snapshot' | 'signal' | 'run'>>(
-    ordinary: T,
+    ordinary: T & { readonly modelWindow?: ModelWindow },
     failure: ContextAdmissionError | ContextSourceCapacityError,
     append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>,
     probe = false,
@@ -3233,6 +3324,39 @@ export class AgentRuntime {
     const context = this.options.context;
     if (!context || !ordinary.snapshot.profile.capabilities.toolCalling || !(failure instanceof ContextAdmissionError)) throw failure;
     cut ??= await context.history.capture();
+    let recoveryOriginal = failure.compiled;
+    let recoveryTools = ordinary.snapshot.tools;
+    const continuation = ordinary.snapshot.tools.some(tool => contextControlRole(tool) === 'catalog')
+      ? ordinary.modelWindow?.continuation() : undefined;
+    if (continuation) {
+      const accepted = continuation.input;
+      const configuration = ordinary.snapshot.configuration;
+      const selectedSettings = { model: configuration.model, temperature: configuration.temperature ?? null,
+        reasoning: configuration.reasoning ?? null, responseFormat: configuration.responseFormat ?? null };
+      const acceptedSettings = { model: accepted.request.model, temperature: accepted.request.temperature ?? null,
+        reasoning: accepted.request.reasoning ?? null, responseFormat: accepted.request.responseFormat ?? null };
+      if (hashJson(selectedSettings) !== hashJson(acceptedSettings))
+        throw new ContextContinuityError('unsupported', 'Recovery cannot replace the configuration bound to an admitted native prefix.');
+      const candidatePresentation = this.inferenceService.presentationFor(failure.compiled);
+      if (candidatePresentation?.authority !== accepted.presentation.authority)
+        throw new ContextContinuityError('unsupported', 'Recovery cannot substitute changed authority into an admitted native prefix.');
+      const messages = [...accepted.request.messages, ...continuation.prior, ...continuation.current];
+      for (const message of messages) {
+        if (message.role !== 'protocol') continue;
+        const incompatibility = providerContextIncompatibility(message.state, { provider: this.options.provider.id,
+          model: configuration.model, ...(ordinary.snapshot.profile.capabilities.protocol ? { protocol: ordinary.snapshot.profile.capabilities.protocol } : {}) });
+        if (incompatibility) throw new ContextContinuityError('unsupported', `Admitted native recovery source is incompatible: ${incompatibility}.`);
+      }
+      const identity = hashJson(accepted.request.tools ?? []);
+      const matches = [...this.catalogTools.values()].filter(tools =>
+        hashJson(toolsForModel([...tools], ordinary.snapshot.profile, this.options.nativeToolExposure, this.programTool())) === identity);
+      const matched = matches[0];
+      if (!matched || matches.length !== 1)
+        throw new ContextContinuityError('unsupported', 'The exact admitted native tool definitions are unavailable or ambiguous for recovery.');
+      recoveryTools = matched;
+      recoveryOriginal = await this.requestAdmission.compile({ ...accepted.request, messages, signal: ordinary.signal },
+        ordinary.snapshot.profile, accepted.outputReservation, accepted.presentation);
+    }
     const originalConflict = requestCapacityConflict(failure, this.outputReservationPolicy);
     const inspection = await context.inspect(cut, { limit: this.contextControlPolicy.inventoryItems, maxBytes: this.contextControlPolicy.inventoryBytes });
     const conflict = {
@@ -3249,10 +3373,14 @@ export class AgentRuntime {
         outputReservation: failure.compiled.accounting.outputReservation
       })
     } satisfies ContextAdmissionConflict;
-    // Keep the original catalog/protocol binding. The execution gate permits
-    // only checkpoint capabilities; domain calls are rejected before execution.
-    const tools = ordinary.snapshot.tools;
-    if (!tools.some(tool => isContextActivationTool(tool))) throw failure;
+    // Exact native prefixes retain their bound schemas. Portable catalog recovery
+    // may admit only exact host-granted controls, so loaded schema growth cannot
+    // prevent selecting a smaller inventory. Original messages remain complete.
+    const exactPrefix = continuation !== undefined || recoveryOriginal.logicalRequest.messages.some(message =>
+      message.role === 'protocol' && message.state.compatibility.requiresExactPrefix);
+    const restrictCatalog = !exactPrefix && recoveryTools.some(tool => contextControlRole(tool) === 'catalog');
+    const tools = restrictCatalog ? Object.freeze(recoveryTools.filter(isContextCheckpointTool)) : recoveryTools;
+    if (!tools.some(tool => isContextActivationTool(tool) || contextControlRole(tool) === 'catalog')) throw failure;
     // Probes compile bounded material only. Durable no-progress accounting is
     // read exactly when entering recovery, indexed to this unchanged boundary.
     const events = this.options.repositories.events;
@@ -3350,9 +3478,10 @@ export class AgentRuntime {
     let assembled: Awaited<ReturnType<typeof assembleContextControlRequest>>;
     try {
       assembled = await assembleContextControlRequest(this.requestAdmission, {
-        policy: this.contextControlPolicy, original: failure.compiled,
+        policy: this.contextControlPolicy, original: recoveryOriginal,
         profile: snapshot.profile,
-        task: content, maxOutputTokens: outputReservation, signal: request.signal
+        task: content, maxOutputTokens: outputReservation, signal: request.signal,
+        ...(restrictCatalog ? { tools: toolsForModel([...tools], snapshot.profile, this.options.nativeToolExposure, this.programTool()) } : {})
       });
     } catch (error) {
       this.preserveRecoveryFailure(error, ordinary);
@@ -3380,7 +3509,8 @@ export class AgentRuntime {
       capabilityRevision: assembled.compiled.capabilityRevision,
       // No application/provider context is recollected: original compiled messages are preserved below.
       configuredContextIds: [], providerContextIds: [], runContextIds: [],
-      effectiveInstructionHash: hashJson(snapshot.instructions), modelWindowHistoryHash: hashJson(failure.compiled.logicalRequest.messages),
+      ...await this.programReceiptCursor(request.runId),
+      effectiveInstructionHash: hashJson(snapshot.instructions), modelWindowHistoryHash: hashJson(recoveryOriginal.logicalRequest.messages),
       modelToolSchemasHash: hashJson(assembled.request.tools ?? []),
       modelWindowHash: hashJson(assembled.assembly.messages)
     };
@@ -3422,11 +3552,13 @@ export class AgentRuntime {
       if (!(error instanceof ContextSourceCapacityError)) throw error;
       sourceConflict = error;
     }
-    const contextInputs = await this.collectContextItems(
+    const collectedContext = await this.collectContextItems(
       request.input,
       request.turnIndex,
       request.snapshot.instructions
     );
+    const programReceipts = await programCompletionContext(request.runId, this.options.repositories.events, this.options.repositories.artifacts);
+    const contextInputs = { ...collectedContext, run: [ ...collectedContext.run, ...programReceipts.items ] };
     const capturedContext = [
       ...contextInputs.configured,
       ...contextInputs.provider,
@@ -3472,7 +3604,7 @@ export class AgentRuntime {
         },
         {
           model: request.snapshot.configuration.model,
-          tools: toolsForModel([...request.snapshot.tools], request.snapshot.profile),
+          tools: toolsForModel([...request.snapshot.tools], request.snapshot.profile, this.options.nativeToolExposure, this.programTool()),
           ...(supportsParameter(request.snapshot.profile, 'maxOutputTokens')
             ? { maxOutputTokens: outputReservation }
             : {}),
@@ -3492,6 +3624,7 @@ export class AgentRuntime {
       return { ...result, stateSelectionId: sessionState.id };
     };
     const contextPublication = { committed: false, fresh: false, candidateAdmitted: false };
+    let rejectedCompatibilityAdmission: ContextAdmissionError | undefined;
     const controlReserves = new Map<string, number>();
     const admitOrdinary = async (compiled: CompiledModelRequest) => {
       const reserve = await this.admitContextRequest(compiled, request, append);
@@ -3545,7 +3678,10 @@ export class AgentRuntime {
       {
         await this.contextTransitions?.drain({
           context: this.options.context,
-          preserveFailure: (error) => { this.preserveRecoveryFailure(error, request); },
+          preserveFailure: (error) => {
+            if (error instanceof ContextAdmissionError) rejectedCompatibilityAdmission = error;
+            this.preserveRecoveryFailure(error, request);
+          },
           admit: (transition) => this.retainPendingSources(transition, request.runId),
           validate,
           ...(sourceConflict ? { renewalReason: 'capacity' as const } :
@@ -3583,8 +3719,21 @@ export class AgentRuntime {
         });
       }
     }
-    if (this.pendingCompatibilityTransition)
-      throw new ContextContinuityError('unsupported', 'Fresh successor context could not be admitted; the prior context remains committed.');
+    if (this.pendingCompatibilityTransition) {
+      const accepted = request.modelWindow.continuation();
+      const canSelectCatalog = request.snapshot.tools.some(tool => contextControlRole(tool) === 'catalog');
+      const restoredCatalog = accepted && hashJson(accepted.input.request.tools ?? []) ===
+        hashJson(toolsForModel([...request.snapshot.tools], request.snapshot.profile, this.options.nativeToolExposure, this.programTool()));
+      if (canSelectCatalog && restoredCatalog) {
+        // No reset was published. Resume ordinary validation of the restored native
+        // inventory; changed authority/configuration still requires its own transition.
+        this.pendingCompatibilityTransition = false;
+      } else if (canSelectCatalog && accepted && rejectedCompatibilityAdmission) {
+        throw rejectedCompatibilityAdmission;
+      } else {
+        throw new ContextContinuityError('unsupported', 'Fresh successor context could not be admitted; the prior context remains committed.');
+      }
+    }
     if (sourceConflict && !contextPublication.candidateAdmitted) {
       if (!contextPublication.committed) throw sourceConflict;
       // A later rejected proposal cannot invalidate the preceding committed repair.
@@ -3656,6 +3805,8 @@ export class AgentRuntime {
     }
 
     const { assembly, compiled } = result;
+    if (programReceipts.items.some(receipt => !assembly.context.items.some(item => item.id === receipt.id)))
+      throw new Error('Admitted request omitted a pending program receipt contribution.');
     const continuityHeadroomTokens = controlReserves.get(compiled.inputIdentity);
     const estimate = requestTokenEstimate({
       accounting: compiled.accounting,
@@ -3671,6 +3822,7 @@ export class AgentRuntime {
       configuredContextIds: contextSourceIds(contextInputs.configured, 'configured'),
       providerContextIds: contextSourceIds(contextInputs.provider, 'provider'),
       runContextIds: contextSourceIds(contextInputs.run, 'run'),
+      ...(programReceipts.through === undefined ? {} : { programReceiptsThrough: programReceipts.through }),
       effectiveInstructionHash: hashJson(request.snapshot.instructions),
       modelWindowHistoryHash: hashJson(assembly.historyMessages),
       modelToolSchemasHash: hashJson(result.request.tools ?? []),
@@ -3715,15 +3867,13 @@ export class AgentRuntime {
     return { request: result.request, compiled, estimate, fingerprint, freshContext: contextPublication.fresh, ...(cut ? { capturedHistoryCut: cut } : {}) };
   }
 
+  private async programReceiptCursor(runId: string): Promise<{ readonly programReceiptsThrough?: number }> {
+    const through = await settledProgramReceiptsThrough(runId, this.options.repositories.events);
+    return through === undefined ? {} : { programReceiptsThrough: through };
+  }
+
   private boundCapabilitySnapshot(snapshot: Pick<TurnSnapshot, 'profile' | 'tools'>): EffectiveCapabilitySnapshot {
-    const boundTools = Object.freeze(snapshot.tools.map(tool => {
-      const controlRole = contextControlRole(tool);
-      return Object.freeze({ name: tool.name, implementationId: tool.implementationId,
-        available: true, reasons: Object.freeze([]), ...(controlRole ? { controlRole } : {}) });
-    }));
-    const bound = { bindingId: this.options.modelBindingId ?? this.capabilityCatalog(snapshot.profile).snapshot.bindingId,
-      policyRevision: hashJson(this.toolPolicy), tools: boundTools };
-    return Object.freeze({ ...bound, revision: hashJson(bound) });
+    return this.capabilityCatalog(snapshot.profile, snapshot.profile.modalities.input, snapshot.tools).snapshot;
   }
 
   private stageAdmittedCapabilities(compiled: CompiledModelRequest, request: Pick<AssistantTurnRequest, 'snapshot'>) {
@@ -3747,7 +3897,7 @@ export class AgentRuntime {
     await this.requestAdmission.admit(compiled, request.snapshot.profile);
     const context = this.options.context;
     if (!this.options.contextRenewal?.automatic || !context ||
-        !request.snapshot.tools.some((tool) => isContextActivationTool(tool))) {
+        !request.snapshot.tools.some((tool) => isContextActivationTool(tool) || contextControlRole(tool) === 'catalog')) {
       this.stageAdmittedCapabilities(compiled, request);
       return;
     }
@@ -4262,12 +4412,14 @@ export class AgentRuntime {
     }>,
     signal: AbortSignal
   ): Promise<boolean> {
-    if (callState.effect.intent.recovery.kind === 'unknown') return false;
+    if (callState.effect.intent.recovery.kind === 'unknown' ||
+        (!phase.source.program && phase.calls[callIndex]?.name === this.options.programRunner?.toolName)) return false;
     const call = phase.calls[callIndex];
     if (!call)
       throw new Error(
         `Run ${run.state().runId} has no tool call for effect ${callState.effect.intent.effectId}.`
       );
+    const caller = toolInvocationCaller(phase, callIndex);
     const context = Object.freeze({
       ...this.toolContext(signal),
       invocation: Object.freeze({
@@ -4276,7 +4428,8 @@ export class AgentRuntime {
         toolBatchId: phase.toolBatchId,
         callIndex,
         ...(call.id ? { callId: call.id } : {}),
-        toolAttempt: callState.toolAttempt
+        toolAttempt: callState.toolAttempt,
+        ...(caller ? { caller } : {})
       })
     });
     const planningResult = await planToolCall(call, this.tools, context);
@@ -4559,6 +4712,16 @@ export class AgentRuntime {
       configuration: this.currentRunConfiguration()
     });
   }
+  private assertRunImplementation(state: AgentRunState): void {
+    const current = this.currentRunConfiguration();
+    if (state.configuration.runtimeImplementationId !== current.runtimeImplementationId)
+      throw new Error(`Run ${state.runId} uses an incompatible runtime implementation; its records were not changed.`);
+    if (state.phase.kind !== 'terminal' && !this.nonToolConfigurationMatches(state.configuration, current))
+      throw new Error(`Run ${state.runId} was captured for a different runtime configuration; its records were not changed.`);
+  }
+  private nonToolConfigurationMatches(captured: AgentRunState['configuration'], current: AgentRunState['configuration']): boolean {
+    return hashJson({ ...captured, toolImplementationIds: [] }) === hashJson({ ...current, toolImplementationIds: [] });
+  }
   private assertRuntimeMatchesRun(run: AgentRunDriver): void {
     const captured = run.state().configuration;
     const current = this.currentRunConfiguration();
@@ -4572,12 +4735,7 @@ export class AgentRuntime {
     if (!currentToolBatch(run.state())) return false;
     const captured = run.state().configuration;
     const current = this.currentRunConfiguration();
-    const nonToolConfigurationMatches =
-      captured.providerId === current.providerId &&
-      captured.providerImplementationId === current.providerImplementationId &&
-      captured.model === current.model &&
-      captured.runtimeImplementationId === current.runtimeImplementationId &&
-      captured.policyHash === current.policyHash;
+    const nonToolConfigurationMatches = this.nonToolConfigurationMatches(captured, current);
     return (
       nonToolConfigurationMatches &&
       !sameStrings(captured.toolImplementationIds, current.toolImplementationIds)
@@ -4588,12 +4746,14 @@ export class AgentRuntime {
       providerId: this.options.provider.id,
       providerImplementationId: this.options.provider.implementationId,
       model: this.options.model,
-      runtimeImplementationId: 'agent-core.runtime.run-v1',
+      runtimeImplementationId: 'agent-core.runtime.run-v2',
       toolImplementationIds: Object.freeze(this.tools.map((tool) => tool.implementationId)),
       policyHash: hashJson({
         policy: this.toolPolicy,
         resourceLifetime: this.options.resources?.lifetime ?? { kind: 'run' },
-        inferenceOwnerId: this.options.inferenceOwnerId ?? null
+        inferenceOwnerId: this.options.inferenceOwnerId ?? null,
+        nativeToolExposure: this.options.nativeToolExposure ?? null,
+        programRunner: this.options.programRunner ? { toolName: this.options.programRunner.toolName, configurationRevision: this.options.programRunner.configurationRevision, maxConcurrentPrograms: this.options.programRunner.maxConcurrentPrograms ?? 1 } : null
       })
     });
   }
@@ -4610,6 +4770,11 @@ export class AgentRuntime {
   private toolContext(signal: AbortSignal): ToolPlanningContext {
     const services = {
       ...(this.options.toolContext?.services ?? {}),
+      ...(this.options.programRunner && this.options.repositories.artifacts ? {
+        programExecution: Object.freeze({ execute() {
+          throw new Error('Program execution requires its bound tool invocation.');
+        } })
+      } : {}),
       ...(this.options.repositories.artifacts
         ? { artifactRepository: this.options.repositories.artifacts }
         : {})
@@ -4644,19 +4809,35 @@ export class AgentRuntime {
       run: Object.freeze([...(input.contextItems ?? [])])
     });
   }
-  private capabilityCatalog(profile?: ModelProfile) {
+  private readonly authorizeTool: ToolAuthorizer = request => {
+    const tool = this.tools.find(tool => tool.name === request.call.name && tool.implementationId === request.toolImplementationId);
+    return authorizeToolCatalogEffects(request, tool) ?? (this.options.toolAuthorizer ?? POLICY_TOOL_AUTHORIZER)(request);
+  };
+  private async refreshTools(signal?: AbortSignal): Promise<void> {
+    this.tools = await resolveRuntimeToolCatalog(this.toolCatalog, signal);
+  }
+  private toolHostRequirements(modelInputModalities?: ModelProfile['modalities']['input']) {
     const context = this.toolContext(new AbortController().signal);
+    return { ...(context.services ? { services: context.services } : {}),
+      ...(modelInputModalities ? { modelInputModalities } : {}),
+      hostCapabilities: this.options.resources?.capabilities ?? [] };
+  }
+  private capabilityCatalog(profile?: ModelProfile, modelInputModalities = profile?.modalities.input,
+    tools: readonly CompiledToolDefinition[] = this.tools) {
+    const host = this.toolHostRequirements(modelInputModalities);
+    const programTool = this.programTool();
     return resolveEffectiveToolCatalog({
       bindingId: this.options.modelBindingId ?? hashJson({ provider: this.options.provider.id, implementationId: this.options.provider.implementationId,
         model: this.options.model, profile: profile ?? null }),
-      tools: this.tools, policy: this.toolPolicy,
-      host: { ...(context.services ? { services: context.services } : {}),
-        ...(profile ? { modelInputModalities: profile.modalities.input } : {}),
-        hostCapabilities: this.options.resources?.capabilities ?? [] }
+      tools, policy: this.toolPolicy, host,
+      programmaticRunner: !!programTool && resolveToolHostEligibility({ tools: [programTool], policy: this.toolPolicy, host }).length === 1,
+      ...(this.options.nativeToolExposure ? { nativeToolExposure: this.options.nativeToolExposure } : {}),
+      ...(profile ? { modelProfile: profile } : {}),
+      ...(programTool ? { eagerTool: programTool } : {})
     });
   }
-  private availableTools(profile?: ModelProfile): CompiledToolDefinition[] {
-    return [...this.capabilityCatalog(profile).tools];
+  private availableTools(profile?: ModelProfile, modelInputModalities = profile?.modalities.input): CompiledToolDefinition[] {
+    return [...this.capabilityCatalog(profile, modelInputModalities).tools];
   }
   private async releaseOwnedResources(
     runId: string,
@@ -5286,7 +5467,7 @@ function isContextActivationTool(tool: CompiledToolDefinition | undefined): bool
   return contextControlRole(tool) === 'activation';
 }
 function isContextMutationTool(tool: CompiledToolDefinition | undefined): boolean {
-  return contextControlRole(tool) === 'activation' || contextControlRole(tool) === 'state';
+  return contextControlRole(tool) === 'activation' || contextControlRole(tool) === 'state' || contextControlRole(tool) === 'catalog';
 }
 function isContextCheckpointTool(tool: CompiledToolDefinition): boolean {
   return contextControlRole(tool) !== undefined;

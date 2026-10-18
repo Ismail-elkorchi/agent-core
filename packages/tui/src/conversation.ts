@@ -139,7 +139,9 @@ function sessionEntries(
       ];
     case 'session_state_batch':
       return [{ id, kind: 'notice', tone: 'info', text: 'Working material saved; the active context is unchanged.' }];
+    case 'tool_catalog_selection':
     case 'model_settings':
+      // Catalog persistence is bookkeeping; its governed tool observation is already shown.
       return [];
   }
 }
