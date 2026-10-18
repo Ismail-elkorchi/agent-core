@@ -1825,7 +1825,10 @@ test('released owners leave empty pending inventories and old cursors survive ow
   const root = await mkdtemp(path.join(tmpdir(), 'pending-report-owners-'));
   const files = testRootedFileAuthority(root);
   const manager = new LocalCommandExecution({ artifactRepository: new InMemoryArtifactRepository(), rootedFileAuthority: files,
-    ledgerDirectory: path.join(root, 'processes'), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+    ledgerDirectory: path.join(root, 'processes'), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process,
+    // These commands emit no output; retain tiny captures while exercising many owner indexes.
+    // The authority-wide capture ceiling stays at its configured default.
+    maxCapturedBytes: 256, tailBytes: 128 });
   t.after(async () => { await manager.close(); files.close(); await rm(root, { recursive: true, force: true }); });
   let firstOwnerCursor;
   for (let index = 0; index < 32; index++) {
