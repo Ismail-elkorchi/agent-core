@@ -84,3 +84,5 @@ export * from './orchestration/observation-source.js';
 export { commitResourceRelease } from './orchestration/resource-settlement.js';
 
 export * from './run/capabilities.js';
+
+export { SessionReadLifetime } from './session/read-lifetime.js';
