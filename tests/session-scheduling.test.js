@@ -3,12 +3,25 @@ import test from 'node:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { AgentSession, AgentRunCoordinator, agentEventCodec, InMemorySessionRepository, SessionSubmissionOwnershipError, SessionConfigurationChangedError } from '@agent-core/runtime';
+import { AgentSession, SessionProviderBinding, InMemoryInferenceRepository, AgentRunCoordinator, agentEventCodec, InMemorySessionRepository, SessionSubmissionOwnershipError, SessionConfigurationChangedError } from '@agent-core/runtime';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
 const binding = { schemaId: 'test.scheduling', schemaVersion: 1, subject: {} };
 const configuration = { provider: 'test', model: 'model' };
+function modelProvider(selection, describe = () => {}) {
+  return { id: selection.provider, async describeModel(model) {
+    await describe();
+    return { id: model, provider: selection.provider,
+      capabilities: { streaming: false, toolCalling: false, supportedToolInputs: [], jsonMode: false, jsonSchema: false, logprobs: false, topP: false, reasoning: { strategies: [], canDisable: true, separateOutput: false }, temperature: true },
+      modalities: { input: ['text'], output: ['text'] }, limits: {}, supportedParameters: ['temperature', 'reasoning'] };
+  } };
+}
+function providerBinding(selection, describe) {
+  return new SessionProviderBinding({ selection, provider: modelProvider(selection, describe),
+    resolveProvider: next => modelProvider(next, describe),
+    artifacts: new InMemoryArtifactRepository(), repository: new InMemoryInferenceRepository() });
+}
 for (const kind of ['memory', 'jsonl']) {
   async function fixture(t) {
     let repository, other;
@@ -181,7 +194,7 @@ for (const kind of ['memory', 'jsonl']) {
     const session = new AgentSession({ descriptor: f.session, repository: f.other, expectedBinding: binding,
       configuration: selected,
       runs: new AgentRunCoordinator(new InMemoryEventRepository(agentEventCodec), new InMemoryArtifactRepository()),
-      prepareConfiguration(binding, input) { assert.equal(input.task, 'Bind endpoint before accepting input'); seen.push(binding); },
+      providerBinding: providerBinding(selected, () => seen.push(selected)),
       createRuntime(binding) {
         assert.deepEqual(binding, selected);
         return { run(input) { return { runId: input.runId, result: Promise.resolve({ state: 'ended', terminal: { runId: input.runId }, deliveryDiagnostics: [] }), abort() {} }; } };
@@ -207,13 +220,12 @@ for (const kind of ['memory', 'jsonl']) {
     const session = new AgentSession({ descriptor: f.session, repository: f.other, expectedBinding: binding,
       configuration: selected, scheduling: 'manual',
       runs: new AgentRunCoordinator(new InMemoryEventRepository(agentEventCodec), new InMemoryArtifactRepository()),
-      async prepareConfiguration(binding) {
+      providerBinding: providerBinding(selected, async () => {
         if (race) {
-          assert.deepEqual(binding, selected);
           race = false;
           await f.repository.appendModelSettings(f.session, { ...selected, ...changed });
         }
-      },
+      }),
       createRuntime() { dispatches++; assert.fail('Manual admission must not dispatch'); }
     });
     await assert.rejects(session.submit({ task: 'Configuration changes during preparation' }), SessionConfigurationChangedError);

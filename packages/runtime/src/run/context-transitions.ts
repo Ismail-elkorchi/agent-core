@@ -1,3 +1,4 @@
+import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import { hashJson, type EventRepository } from '@agent-core/persistence';
 import type { AgentAuditEvent, AgentEvent } from '../events.js';
 import { contextTransitionRequestSchema } from '../context/schema.js';
@@ -149,7 +150,7 @@ export class RunContextTransitions {
     readonly renewalReason?: 'capacity' | 'prefix_incompatibility';
     readonly committed: (entry: SessionContextTransitionEntry) => Promise<void>;
     readonly unchanged?: (result: ContextTransitionUnchanged, idempotencyKey: string) => Promise<void>;
-    readonly rejected?: (requestId: string, message: string, idempotencyKey: string) => void | Promise<void>;
+    readonly rejected?: (requestId: string, message: string, idempotencyKey: string, details?: JsonObject) => void | Promise<void>;
     readonly signal: AbortSignal;
     readonly preserveFailure?: (error: unknown) => void;
   }): Promise<void> {
@@ -185,11 +186,16 @@ export class RunContextTransitions {
         else {
           input.signal.throwIfAborted();
           input.preserveFailure?.(cause);
+          let details: JsonObject | undefined;
+          if (cause instanceof Error && 'details' in cause) {
+            try { details = parseJsonObject(cause.details, { maxTotalBytes: 8192 }); } catch { /* Keep the original failure when optional diagnostic detail is not serializable. */ }
+          }
           await this.options.append(
             {
               type: 'context.transition.rejected',
               requestId: pending.requestId,
-              message: cause instanceof Error ? cause.message : String(cause)
+              message: cause instanceof Error ? cause.message : String(cause),
+              ...(details ? { details } : {})
             },
             `${this.options.runId}:${pending.requestId}:rejected`
           );
@@ -197,7 +203,7 @@ export class RunContextTransitions {
           await input.rejected?.(
             pending.requestId,
             cause instanceof Error ? cause.message : String(cause),
-            pending.requested.idempotencyKey
+            pending.requested.idempotencyKey, details
           );
           continue;
         }

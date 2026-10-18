@@ -6,7 +6,6 @@ import {
 } from '@agent-core/tools';
 import type { ReadFilesOutput } from '../tools/read-files/schema.js';
 import { processOutputSchema, type ProcessOutput } from '../tools/process-output.js';
-import type { ReadArtifactOutput } from '../tools/read-artifact/schema.js';
 import type { SearchTextOutput } from '../tools/search-text/schema.js';
 import type * as z from 'zod';
 import type { ApplyPatchOutput } from '../tools/apply-patch/schema.js';
@@ -88,18 +87,6 @@ function processResultContent(output: ProcessOutput): readonly ToolContent[] {
     ...(output.status === 'running' && output.cursorStart === output.cursorEnd
       ? [text('No fresh output; still running. Await progress with write_stdin, afterCursor=cursorEnd, and a longer yieldMs. Waiting ends on output, termination, or the wait limit.')]
       : [])
-  ];
-}
-
-export function buildReadArtifactContent({
-  observation
-}: ToolModelContentRequest<unknown, ReadArtifactOutput>): readonly ToolContent[] {
-  if (observation.kind === 'failure') return defaultToolModelContent(observation);
-  const output: ReadArtifactOutput = observation.output;
-  const { text: source, ...facts } = output;
-  return [
-    text(json(facts)),
-    ...(source === undefined ? (observation.content ?? []) : [text(source)])
   ];
 }
 

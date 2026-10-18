@@ -188,6 +188,7 @@ export type AgentEvent =
     }
   | {
       readonly type: 'context.transition.rejected';
+      readonly details?: import('@agent-core/json').JsonObject;
       readonly requestId: string;
       readonly message: string;
     }
@@ -432,6 +433,7 @@ export type AgentProgressEvent =
   | { readonly type: 'context.transition.unchanged'; readonly idempotencyKey: string; readonly windowId: string | null }
   | {
       readonly type: 'context.transition.rejected';
+      readonly details?: import('@agent-core/json').JsonObject;
       readonly requestId: string;
       readonly idempotencyKey: string;
       readonly message: string;
@@ -699,9 +701,10 @@ const AGENT_EVENT_DECODERS = {
     });
   },
   'context.transition.rejected': (value) => {
-    exact(value, ['type', 'requestId', 'message']);
+    exact(value, ['type', 'requestId', 'message', 'details']);
     return Object.freeze({
       type: 'context.transition.rejected',
+      ...(value.details === undefined ? {} : { details: parseJsonObject(value.details) }),
       requestId: requiredString(value.requestId, 'requestId'),
       message: requiredString(value.message, 'message')
     });
@@ -1477,7 +1480,7 @@ function decodeInferenceRequestFingerprint(
   exact(object, [
     ...TURN_KEYS,
     'compiledInputIdentity',
-    'sessionStateRevisionId',
+    'stateSelectionId',
     'capabilityRevision',
     'requestId',
     'parentRequestId',
@@ -1490,10 +1493,10 @@ function decodeInferenceRequestFingerprint(
     'modelWindowHash'
   ]);
   return Object.freeze({
-    sessionStateRevisionId:
-      object.sessionStateRevisionId === null
+    stateSelectionId:
+      object.stateSelectionId === null
         ? null
-        : requiredString(object.sessionStateRevisionId, 'sessionStateRevisionId'),
+        : requiredString(object.stateSelectionId, 'stateSelectionId'),
     ...decodeTurnIdentity(object),
     compiledInputIdentity: requiredString(
       object.compiledInputIdentity,
@@ -1749,7 +1752,7 @@ function decodePromptMaterial(value: JsonValue | undefined): PromptMaterial {
     'images',
     'instructions',
     'context',
-    'sessionState',
+    'runtimeControl',
     'capacityNotice',
     'tools',
     'outputContract',
@@ -1771,9 +1774,9 @@ function decodePromptMaterial(value: JsonValue | undefined): PromptMaterial {
     ...(object.capacityNotice === undefined
       ? {}
       : { capacityNotice: decodePromptContextItem(object.capacityNotice, 'material.capacityNotice') }),
-    ...(object.sessionState === undefined
+    ...(object.runtimeControl === undefined
       ? {}
-      : { sessionState: decodePromptContextItem(object.sessionState, 'material.sessionState') }),
+      : { runtimeControl: decodePromptRuntimeControl(object.runtimeControl) }),
     tools: requiredArray(object.tools, 'material.tools').map((item, index) =>
       decodePromptTool(item, `material.tools[${String(index)}]`)
     ),
@@ -1781,6 +1784,13 @@ function decodePromptMaterial(value: JsonValue | undefined): PromptMaterial {
     ...(metadata ? { metadata: { ...metadata } } : {})
   });
 }
+function decodePromptRuntimeControl(value: JsonValue): NonNullable<PromptMaterial['runtimeControl']> {
+  const object = requiredObject(value, 'material.runtimeControl');
+  exact(object, ['kind', 'id']);
+  if (object.kind !== 'context-recovery') throw malformed('Invalid runtime control kind');
+  return Object.freeze({ kind: object.kind, id: requiredString(object.id, 'material.runtimeControl.id') });
+}
+
 function decodePromptInstruction(
   value: JsonValue,
   path: string

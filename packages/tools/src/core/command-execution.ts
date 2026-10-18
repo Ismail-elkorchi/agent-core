@@ -149,6 +149,13 @@ export interface CommandExecutionResult {
 export interface CommandExecutionReport {
   readonly result: CommandExecutionResult;
   readonly protectedArtifact?: ProtectedArtifactRef;
+  /** Immutable original terminal facts, independent of recovery/query presentation. */
+  readonly terminalOutput?: Readonly<{
+    stdout: Readonly<{ observedBytes: number; capturedBytes: number }>;
+    stderr: Readonly<{ observedBytes: number; capturedBytes: number }>;
+    combined: Readonly<{ observedBytes: number; capturedBytes: number }>;
+  }>;
+  readonly terminalDiagnostic?: string;
   /** Existing durable settlement; consumers acknowledge it without recording it again. */
   readonly settlementReference?: EventReference;
 }

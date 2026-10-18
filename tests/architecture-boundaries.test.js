@@ -30,7 +30,7 @@ test('production boundaries do not rebuild established ownership proofs', () => 
   assert.deepEqual(violations, []);
 });
 
-test('repositories encode on append and decode once on read', async () => {
+test('repositories capture and validate once before publication', async () => {
   let encodes = 0;
   let decodes = 0;
   const codec = {
@@ -57,7 +57,7 @@ test('repositories encode on append and decode once on read', async () => {
   const original = { type: 'measured', payload: { count: 1 } };
   const appended = await repository.append('run', original);
   original.payload.count = 2;
-  assert.deepEqual({ encodes, decodes }, { encodes: 1, decodes: 0 });
+  assert.deepEqual({ encodes, decodes }, { encodes: 1, decodes: 1 });
   assert.equal('event' in appended, false);
   const { hash, ...receipt } = appended;
   assert.equal(hash, hashJson({ ...receipt, event: { type: 'measured', payload: { count: 1 } } }));
@@ -74,8 +74,8 @@ test('repositories encode on append and decode once on read', async () => {
     },
     decode: codec.decode
   });
-  await malformed.append('run', { type: 'measured', payload: { count: 1 } });
-  await assert.rejects(Array.fromAsync(malformed.read('run')), /malformed measured event/u);
+  await assert.rejects(malformed.append('run', { type: 'measured', payload: { count: 1 } }), /malformed measured event/u);
+  assert.deepEqual(await Array.fromAsync(malformed.read('run')), []);
 
   const events = readFileSync(path.join(root, 'packages/runtime/src/events.ts'), 'utf8');
   assert.doesNotMatch(

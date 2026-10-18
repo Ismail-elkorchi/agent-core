@@ -216,7 +216,7 @@ test('context inspection explains adjusted capacity and does not expose the acco
   const result = await invokeToolCall(jsonToolCall('context_inspect'), tools, {
     policy: { allowedRisks: ['read'] }
   });
-  const presented = JSON.parse(tools[0].buildModelContent({ observation: result })[0].text);
+  const presented = JSON.parse(tools.find(tool => tool.name === 'context_inspect').buildModelContent({ observation: result })[0].text);
   assert.equal(presented.admission.status, 'admitted');
   assert.equal(
     presented.capacity.inputTokens,
@@ -228,7 +228,9 @@ test('context inspection explains adjusted capacity and does not expose the acco
   assert.match(presented.accounting.inputTokensMeaning, /uncertainty.headroomRatio/);
   assert.equal(presented.accounting.components, undefined);
   assert.equal(presented.admission.inputIdentity, compiled.inputIdentity);
-  assert.match(tools[1].description, /empty array releases it all/);
+  const activation = tools.find(tool => tool.name === 'context_transition');
+  assert.match(activation.description, /retain replaces optional original sources/);
+  assert.match(activation.description, /Active accepted inputs remain protected/);
 });
 
 test('all provider adapters continue with original reasoning using observed request-level usage', async () => {

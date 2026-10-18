@@ -1,10 +1,7 @@
-import { requestAccountingInputTokens, type CompiledModelRequest, type ModelProfile, type ModelTool } from '@agent-core/model';
+import { requestAccountingInputTokens, type CompiledModelRequest, type ModelProfile } from '@agent-core/model';
 import { parseJsonObject } from '@agent-core/json';
 import { hashJson } from '@agent-core/persistence';
-import { createPromptMaterial } from '../inference/prompt-material.js';
-import type { ModelRequest } from '@agent-core/model';
 import { requestCapacity, type RequestAdmission } from '../inference/request-admission.js';
-import type { PromptToolSummary } from '../inference/prompt-material.js';
 
 /** Control presentation bounds and the durable unchanged-boundary request allowance. */
 export const CONTEXT_RECOVERY_LIMITS = Object.freeze({
@@ -23,18 +20,15 @@ export const CONTEXT_RECOVERY_LIMITS = Object.freeze({
 });
 
 export const CONTEXT_RECOVERY_INSTRUCTION =
-  'Prepare a fresh context for the same ongoing work using the complete supplied conversation. Application execution is suspended. Reconcile current user requests, corrections and constraints; preserve material findings with evidence and usable unfinished work in sessionState. Select a recent source boundary and older exact evidence using context_transition. State is fallible interpretation, never authority or execution truth. Original records remain retrievable. Use only context inspection, history reads/search/latest and context_transition; do not call domain tools or answer the user. Keep required user contributions and protocol exchanges. Use bounded reads with maxBytes at most 8192. Submit state and selection together. If no valid successor fits, do not invent or silently discard material.';
+  'Prepare a fresh context for the same ongoing work using the complete supplied conversation. Application execution is suspended. Preserve current user requests, corrections, constraints, required contributions and complete protocol exchanges. Use context_transition to propose a bounded selection or renew the current selection. You may select existing exact session-state revisions, save optional changes, or proceed without a state write; no rewrite or joint state submission is required. State is fallible interpretation, never authority or execution truth. Original records remain retrievable. Use only context inspection, bounded history and state reads or optional state saves, context_transition, or context_save_and_activate; do not call domain tools or answer the user. Use bounded reads with maxBytes at most 8192. A stored state change alone does not activate a view or resume execution. If no valid successor fits, report the obstacle without inventing or silently discarding material.';
 
 
 /** The pressure probe and dispatched control request use identical compilation. */
 export async function assembleContextControlRequest(
   admission: RequestAdmission,
   input: {
-    readonly original: ModelRequest;
-    readonly model: string;
+    readonly original: CompiledModelRequest;
     readonly profile: ModelProfile;
-    readonly tools: readonly ModelTool[];
-    readonly summaries: readonly PromptToolSummary[];
     readonly task: string;
     readonly maxOutputTokens: number;
     readonly signal?: AbortSignal | undefined;
@@ -43,34 +37,14 @@ export async function assembleContextControlRequest(
   if (Buffer.byteLength(input.task) > CONTEXT_RECOVERY_LIMITS.taskBytes)
     throw new RangeError('Context-management metadata exceeds its bounded request presentation.');
   const outputReservation = Math.min(CONTEXT_RECOVERY_LIMITS.outputTokens, input.maxOutputTokens);
-  const roles = input.profile.capabilities.protocol?.roles ?? ['system', 'user', 'assistant'];
-  if (!roles.includes('user')) throw new RangeError('Context renewal requires a supported user control-message role.');
-  // Explicit runtime control is a new user message. Authority, signed native prefix,
-  // originals and tools are preserved exactly; the execution gate restricts effects.
-  const control = { role: 'user' as const, content: JSON.stringify({
+  const content = JSON.stringify({
     ...parseJsonObject(JSON.parse(input.task)), checkpointInstruction: CONTEXT_RECOVERY_INSTRUCTION
-  }) };
-  const messages = [...input.original.messages, control];
-  const request: ModelRequest = {
-    ...input.original,
-    messages,
-    ...(input.profile.supportedParameters.includes('maxOutputTokens') ? { maxOutputTokens: outputReservation } : {}),
+  });
+  return admission.assembleControl({
+    original: input.original, profile: input.profile, outputReservation,
+    control: { kind: 'context-recovery', id: `context-recovery-${hashJson(content)}`, content },
     ...(input.signal ? { signal: input.signal } : {})
-  };
-  const presentation = {
-    authority: hashJson(request.messages.filter(message => message.role === 'system' || message.role === 'developer')),
-    // The complete original request is carried as captured material, never reconstructed summaries.
-    context: hashJson(input.original.messages.filter(message => message.role !== 'system' && message.role !== 'developer')),
-    sessionState: hashJson(null),
-    runInstructions: hashJson([control])
-  };
-  const compiled = await admission.compile(request, input.profile, outputReservation, presentation);
-  const material = createPromptMaterial({ task: control.content,
-    instructions: [],
-    context: [], tools: input.summaries });
-  return { request, compiled, assembly: { material, messages: request.messages,
-    context: { items: [], totalTokens: 0 },
-    estimate: { modelWindowTokens: requestAccountingInputTokens(compiled.accounting), contextTokens: 0 } } };
+  });
 
 }
 

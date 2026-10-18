@@ -32,7 +32,6 @@ export * from './tools/edit-text/index.js';
 export * from './tools/exec-command/index.js';
 export * from './tools/find-files/index.js';
 export * from './tools/list-directory/index.js';
-export * from './tools/read-artifact/index.js';
 export * from './tools/read-files/index.js';
 export * from './tools/search-text/index.js';
 export * from './tools/stop-process/index.js';

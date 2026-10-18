@@ -218,6 +218,7 @@ export async function evaluateContextPolicies(input = {}, env = process.env) {
     defaultRecommendation: null,
     limitations: [
       'These authored text-memory tasks do not establish general agent quality or model rankings.',
+      'Context capabilities are scoped to history inspection and selection; these trials do not evaluate narrative state mutation or the full context-tool catalog.',
       'Simulation measures plumbing only; its parser intentionally trusts user records and scoped history rather than injected tool text. Repeated deterministic trials do not measure model quality or injection resistance.',
       'Model-authored context inspection and selection are measured through runtime tools. The host never schedules periodic transitions. Runtime automatic recovery remains separately identified.',
       'Report contains metrics and identities, not credentials, transcripts, working state, or provider payloads. Runtime storage is ephemeral in-memory.',
@@ -671,7 +672,11 @@ async function runTrial({
         }
       });
       const context = contextFor();
-      const tools = [backgroundLookup, ...historyTools, ...(policy === 'retained-history' ? [] : context.toolDefinitions())];
+      // These trials compare retained-history selection and retrieval, not narrative
+      // state mutation. Expose only the context capabilities exercised by that policy.
+      const selectionTools = context.toolDefinitions().filter(tool =>
+        ['context_inspect', 'context_transition'].includes(tool.name));
+      const tools = [backgroundLookup, ...historyTools, ...(policy === 'retained-history' ? [] : selectionTools)];
       const runtime = new core.AgentRuntime({
         provider,
         inferenceService: inference,

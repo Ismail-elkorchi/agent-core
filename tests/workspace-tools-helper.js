@@ -77,6 +77,7 @@ export function workspaceTools(
     close() {}
   });
   const host = createWorkspaceToolHost({
+    artifactReadMaxBytes: 2_000_000,
     files,
     artifacts: new InMemoryArtifactRepository(),
     enabledTools,

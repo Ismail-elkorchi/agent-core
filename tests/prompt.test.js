@@ -68,29 +68,23 @@ test('plain conversational material adds no persona, output contract, duplicated
   assert.deepEqual(configured[0], { role: 'developer', content: 'Return one category identifier.' });
 });
 
-test('session state appears once before ordinary history and is replaced on a fresh request', async () => {
+test('selected state is shared reference material and fresh requests contain only exact selected revisions', async () => {
   const item = (id, sourceKind, content) => ({ id, sourceUri: `history://${id}`, sourceKind,
     representation: 'full', mediaType: 'text/plain', title: id,
     content, tokenEstimate: 8, purpose: 'context' });
+  const repository = item('repository', 'external', 'Stable repository guidance');
   const material = { id: 'state-placement', task: 'Complete the repair', tools: [],
     instructions: [{ id: 'system', role: 'system', content: 'Current authority', priority: 1 }],
-    context: [item('repository', 'external', 'Stable repository guidance')],
-    sessionState: item('state-1', 'generated', 'Superseded understanding') };
+    context: [repository, item('state-1', 'generated', 'Superseded understanding')] };
   const prior = [{ role: 'user', content: 'Original requirement' }, { role: 'assistant', content: 'Earlier answer' }];
   const current = [{ role: 'assistant', content: 'Current answer' }];
   const first = await compilePromptMaterial(material, { prior, current });
   const second = await compilePromptMaterial({ ...material,
-    sessionState: item('state-2', 'generated', 'Corrected understanding') }, { prior, current });
-  assert.deepEqual(first.slice(0, 2), second.slice(0, 2));
-  assert.deepEqual(first.slice(3), second.slice(3));
-  assert.match(second[2].content, /Corrected understanding/);
-  assert.match(second[2].content, /sourceKind="generated"/);
+    context: [repository, item('state-2', 'generated', 'Corrected understanding')] }, { prior, current });
+  assert.deepEqual(first[0], second[0]);
+  assert.deepEqual(first.slice(2), second.slice(2));
+  assert.match(second[1].content, /Corrected understanding/);
+  assert.match(second[1].content, /sourceKind="generated"/);
   assert.doesNotMatch(JSON.stringify(second), /Superseded understanding/);
   assert.equal(second.filter(m => m.content.includes('Corrected understanding')).length, 1);
-  const next = await compilePromptMaterial({ ...material, task: 'New question' },
-    { prior: [...prior, { role: 'user', content: material.task }, ...current], current: [] });
-  assert.deepEqual(first.slice(0, 2), next.slice(0, 2));
-  const changedAuthority = await compilePromptMaterial({ ...material,
-    instructions: [{ ...material.instructions[0], content: 'Updated authority' }] });
-  assert.equal(changedAuthority[0].content, 'Updated authority');
 });

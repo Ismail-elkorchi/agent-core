@@ -1,11 +1,13 @@
+import { createReadArtifactTool } from '@agent-core/tools';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
 import { InMemoryArtifactRepository } from '@agent-core/persistence';
 import { filterToolResultContentForModel } from '@agent-core/runtime';
 import { defineTool, parseToolObservation } from '@agent-core/tools';
-import { DEFAULT_LOCAL_TOOL_CONFIGURATION, readArtifactTool } from '@agent-core/tools-local';
 import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
+
+const readArtifactTool = createReadArtifactTool({ maxReadBytes: 2_000_000 });
 
 const mixedContentTool = defineTool({
   name: 'mixed_content',
@@ -37,8 +39,7 @@ test('read_artifact image content is retained for multimodal models and represen
     {
       policy: { allowedRisks: ['read'] },
       services: {
-        artifactRepository: artifacts,
-        localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION
+        artifactRepository: artifacts
       }
     }
   );

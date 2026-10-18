@@ -39,6 +39,32 @@ export class RequestAdmission {
     return Object.freeze({ assembly, request, compiled });
   }
 
+  /** Use the ordinary assembler/compiler and the exact presentation captured with the original input. */
+  async assembleControl(input: {
+    readonly original: CompiledModelRequest;
+    readonly profile: ModelProfile;
+    readonly control: import('./prompt-material.js').PromptRuntimeControl;
+    readonly outputReservation: number;
+    readonly signal?: AbortSignal | undefined;
+  }) {
+    const presentation = this.inference.presentationFor(input.original);
+    if (!presentation) throw new Error('Runtime control requires the original compiled request presentation.');
+    const roles = input.profile.capabilities.protocol?.roles ?? ['system', 'user', 'assistant'];
+    if (!roles.includes('user')) throw new RangeError('Runtime control requires a supported user message role.');
+    const assembly = await this.assembler.assembleControl({
+      original: input.original.logicalRequest, presentation,
+      control: input.control, modelProfile: input.profile
+    });
+    const request: ModelRequest = {
+      ...input.original.logicalRequest, messages: assembly.messages,
+      ...(input.profile.supportedParameters.includes('maxOutputTokens')
+        ? { maxOutputTokens: input.outputReservation } : {}),
+      ...(input.signal ? { signal: input.signal } : {})
+    };
+    const compiled = await this.compile(request, input.profile, input.outputReservation, assembly.presentation);
+    return Object.freeze({ request, compiled, assembly });
+  }
+
   compile(
     request: ModelRequest,
     profile: ModelProfile,

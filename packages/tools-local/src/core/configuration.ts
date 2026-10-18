@@ -48,7 +48,6 @@ export interface LocalToolConfiguration {
     readonly maxPendingOutputBytes: number;
   };
   readonly artifact: {
-    readonly maxReadBytes: number;
     readonly maxImageEncodedBytes: number;
     readonly maxImageWidth: number;
     readonly maxImageHeight: number;
@@ -94,7 +93,6 @@ const DEFAULTS: LocalToolConfiguration = {
     maxPendingOutputBytes: 2_000_000
   },
   artifact: {
-    maxReadBytes: 2_000_000,
     maxImageEncodedBytes: 20_000_000,
     maxImageWidth: 16_384,
     maxImageHeight: 16_384,
@@ -164,7 +162,7 @@ export function parseLocalToolConfiguration(value: unknown): LocalToolConfigurat
     ),
     artifact: group(
       owned.artifact,
-      ['maxReadBytes', 'maxImageEncodedBytes', 'maxImageWidth', 'maxImageHeight', 'maxImagePixels'],
+      ['maxImageEncodedBytes', 'maxImageWidth', 'maxImageHeight', 'maxImagePixels'],
       'artifact'
     )
   }) as LocalToolConfiguration;

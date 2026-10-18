@@ -1,3 +1,4 @@
+import { createReadArtifactTool } from '@agent-core/tools';
 import { createObservationAccess } from '@agent-core/runtime';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -11,13 +12,14 @@ import {
   RootedFileSelector,
   findFilesTool,
   listDirectoryTool,
-  readArtifactTool,
   readFilesTool,
   searchTextTool,
   viewImageTool
 } from '@agent-core/tools-local';
 import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
 import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
+
+const readArtifactTool = createReadArtifactTool({ maxReadBytes: 2_000_000 });
 
 const onePixelPng = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',

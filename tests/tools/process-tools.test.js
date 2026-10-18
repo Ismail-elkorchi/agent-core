@@ -970,10 +970,15 @@ for (const recordKind of ['current', 'incompatible']) {
       }) + '\n'
     );
 
+    const files = RootedFileAuthority.adopt(root);
+    const artifacts = new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') });
+    const commands = new LocalCommandExecution({ rootedFileAuthority: files,
+      artifactRepository: artifacts, ledgerDirectory });
     const host = createLocalToolHost({
-      rootedFileAuthority: RootedFileAuthority.adopt(root),
-      artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') }),
-      processLedgerDirectory: ledgerDirectory,
+      artifactReadMaxBytes: 2_000_000,
+      rootedFileAuthority: files,
+      artifactRepository: artifacts,
+      commandExecution: commands,
       enabledTools: ['exec_command', 'write_stdin', 'stop_process']
     });
     await host.ready();
@@ -1024,6 +1029,7 @@ for (const recordKind of ['current', 'incompatible']) {
     });
     assert.equal(next.status, 'exited');
     await host.commandExecution.acknowledgeTerminalReport(next.processId);
+    await commands.close();
     await host.close();
   });
 }
@@ -1092,20 +1098,26 @@ test('local host durably hands recovered terminal reports to old runs during sta
   assert.equal(crashed.status, 44, crashed.stderr);
   const { processId } = JSON.parse(crashed.stdout);
   const delivered = [];
+  const files = RootedFileAuthority.adopt(root);
+  const artifacts = new LocalArtifactRepository({ rootDir: path.join(root, 'host-artifacts') });
+  const commands = new LocalCommandExecution({
+    rootedFileAuthority: files, artifactRepository: artifacts,
+    ledgerDirectory: path.join(root, 'processes'),
+    async commitTerminalReport(report) { delivered.push(report); }
+  });
   const host = createLocalToolHost({
-    rootedFileAuthority: RootedFileAuthority.adopt(root),
-    artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'host-artifacts') }),
-    processLedgerDirectory: path.join(root, 'processes'),
-    enabledTools: ['exec_command', 'write_stdin', 'stop_process'],
-    async commitTerminalReport(report) {
-      delivered.push(report);
-    }
+      artifactReadMaxBytes: 2_000_000,
+    rootedFileAuthority: files,
+    artifactRepository: artifacts,
+    commandExecution: commands,
+    enabledTools: ['exec_command', 'write_stdin', 'stop_process']
   });
   await host.ready();
   assert.equal(delivered.length, 1, JSON.stringify(await host.reconciliation()));
   assert.equal(delivered[0].result.processId, processId);
   assert.equal(delivered[0].result.owner.runId, 'orphan-run');
   assert((await readdir(path.join(root, 'processes'))).every(name => name.endsWith('.terminal.json')));
+  await commands.close();
   await host.close();
 });
 
@@ -1726,4 +1738,13 @@ test('pending process finalization remains an active observation with truthful t
     assert.equal(metadata.finalizationPending, true);
     assert.equal(metadata.processId, output.processId);
   }
+});
+
+test('a process ledger location cannot implicitly grant local command authority', () => {
+  assert.throws(() => createLocalToolHost({
+    rootedFileAuthority: {}, artifactRepository: new InMemoryArtifactRepository(),
+    artifactReadMaxBytes: 2_000_000,
+    processLedgerDirectory: '/tmp/does-not-grant-command-authority',
+    enabledTools: ['exec_command']
+  }), /explicitly supplied command authority/);
 });

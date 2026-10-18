@@ -2,6 +2,7 @@ export type * from './contracts.js';
 export { ContextService } from './service.js';
 export type {
   ContextServiceOptions,
+  ContextOperationalInspectionPage,
   ContextPolicy,
   ContextAdmission,
   ContextAdmissionInput

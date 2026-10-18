@@ -5,7 +5,7 @@ import { readFilesOutputSchema } from '../tools/read-files/schema.js';
 import { searchTextOutputSchema } from '../tools/search-text/schema.js';
 import { applyPatchOutputSchema } from '../tools/apply-patch/schema.js';
 import { editTextOutputSchema } from '../tools/edit-text/schema.js';
-import { readArtifactOutputSchema } from '../tools/read-artifact/schema.js';
+import { readArtifactOutputSchema } from '@agent-core/tools';
 import { listDirectoryOutputSchema } from '../tools/list-directory/schema.js';
 import { findFilesOutputSchema } from '../tools/find-files/schema.js';
 

@@ -1,4 +1,4 @@
-import type { SessionStateRevision, SessionStateChange } from './session-state.js';
+import type { SessionStateBatchCommit, SessionStateBatchReceipt, SessionStateItemRef, SessionStateItemRevision, SessionStatePageRequest, SessionStatePage } from './session-state.js';
 import type { JsonObject, JsonValue } from '@agent-core/json';
 import type {
   ModelOutputItem,
@@ -25,7 +25,7 @@ import type { SessionBinding, SessionBindingInput } from './binding.js';
 export type SessionHeader = Readonly<{
   readonly type: 'session';
   readonly version: 1;
-  readonly format: 'agent-core.session/4';
+  readonly format: 'agent-core.session/5';
   readonly sessionStateStorage: 'session';
   readonly id: string;
   readonly timestamp: string;
@@ -200,10 +200,15 @@ export type SessionModelSettingsEntry = BaseSessionEntry &
 export type SessionContextTransitionEntry = BaseSessionEntry &
   Readonly<{
     readonly type: 'context_transition';
-    readonly sessionState?: Omit<SessionStateChange, 'id'> | undefined;
+    readonly sessionState?: SessionStateBatchCommit | undefined;
     readonly window: ContextWindowRecord;
     readonly transition: ContextTransitionRecord;
   }>;
+
+export type SessionStateBatchEntry = BaseSessionEntry & Readonly<{
+  readonly type: 'session_state_batch';
+  readonly batch: SessionStateBatchCommit;
+}>;
 
 export type SessionRunFinalization = Readonly<{
   readonly type: 'run_finalization';
@@ -236,7 +241,8 @@ export type SessionBranchEntry =
   | SessionObservationEntry
   | SessionBranchMarkerEntry
   | SessionModelSettingsEntry
-  | SessionContextTransitionEntry;
+  | SessionContextTransitionEntry
+  | SessionStateBatchEntry;
 
 export type SessionConversationItem =
   | SessionInputEntry
@@ -248,7 +254,7 @@ export type SessionConversationItem =
 export interface SessionBranchPoint {
   readonly entryId: string;
   readonly timestamp: string;
-  readonly kind: 'run_finalization' | 'context_transition';
+  readonly kind: 'run_finalization' | 'context_transition' | 'session_state_batch';
   readonly runId?: string;
   readonly finalizationId?: string;
 }
@@ -421,7 +427,6 @@ export interface SessionReplayState {
   readonly branch: readonly SessionBranchEntry[];
   readonly runFinalizations: readonly SessionRunFinalization[];
   readonly contextWindow?: ContextWindowRecord;
-  readonly sessionState: SessionStateRevision | null;
   readonly sourceRevision: number;
   readonly ledgerRunIds: readonly string[];
 }
@@ -482,10 +487,13 @@ export interface SessionRepository {
   loadReplayState(session: SessionDescriptor, leafId?: string | null): Promise<SessionReplayState>;
   revision(session: SessionDescriptor): Promise<number>;
   currentModelSettings(session: SessionDescriptor): Promise<ModelSelection | undefined>;
-  currentSessionState(
-    session: SessionDescriptor,
-    leafId?: string | null
-  ): Promise<SessionStateRevision | null>;
+  /** Committed journal metadata and retained item content across every branch; excludes unreferenced staged artifacts. */
+  committedRetainedStateBytes(session: SessionDescriptor): Promise<number>;
+  findSessionStateBatch(session: SessionDescriptor, idempotencyKey: string): Promise<SessionStateBatchReceipt | undefined>;
+  saveSessionState(session: SessionDescriptor, batch: SessionStateBatchCommit, options?: {readonly withOwnership?: (<T>(operation: () => Promise<T>) => Promise<T>) | undefined}): Promise<SessionStateBatchReceipt>;
+  readSessionStateItem(session: SessionDescriptor, ref: SessionStateItemRef, leafId?: string | null): Promise<SessionStateItemRevision>;
+  currentSessionStateItem(session: SessionDescriptor, itemId: string, leafId?: string | null): Promise<SessionStateItemRevision | undefined>;
+  listSessionState(session: SessionDescriptor, request?: SessionStatePageRequest): Promise<SessionStatePage>;
   sourceSnapshot(
     session: SessionDescriptor,
     leafId?: string | null
@@ -548,7 +556,8 @@ export interface SessionRepository {
   ): Promise<SessionModelSettingsEntry>;
   commitContextTransition(
     session: SessionDescriptor,
-    input: ContextTransitionCommit
+    input: ContextTransitionCommit,
+    options?: {readonly withOwnership?: (<T>(operation: () => Promise<T>) => Promise<T>) | undefined}
   ): Promise<SessionContextTransitionEntry>;
   branchFrom(
     session: SessionDescriptor,

@@ -68,7 +68,7 @@ export interface InferenceServiceOptions {
   readonly admitRequest?: (request: CompiledModelRequest) => void | Promise<void>;
 }
 export interface GovernedInferenceInput extends InferenceIdentity, ModelCompilationOptions {
-  readonly sessionStateRevisionId?: string | null;
+  readonly stateSelectionId?: string | null;
   readonly capturedHistoryCut?: HistorySourceCut | undefined;
   readonly request: ModelRequest;
   readonly compiled?: CompiledModelRequest;
@@ -181,7 +181,7 @@ export class InferenceBudgetExceededError extends Error {
 interface DurableOperation<T extends { readonly usage?: ModelUsage }> {
   readonly nativeDispatch?: ModelNativeDispatch | undefined;
   readonly identity: InferenceIdentity;
-  readonly sessionStateRevisionId?: string | null;
+  readonly stateSelectionId?: string | null;
   readonly capturedHistoryCut?: HistorySourceCut | undefined;
   readonly operation: 'generation' | 'native_generation';
   readonly profile: ModelProfile;
@@ -228,8 +228,39 @@ export class InferenceService {
     });
   }
   /** Settled invocation identities are counted once, including native generations. */
+  presentationFor(compiled: CompiledModelRequest): RequestPresentation | undefined {
+    return this.presentations.get(compiled);
+  }
+
   async settledRunUsage(ownerId: string, runId: string) {
     return (await this.options.repository.load(ownerId, { runId })).settledUsage;
+  }
+
+  /** Read the existing owner ledger; this snapshot neither reserves nor authorizes work. */
+  async inspectOwnerAllowance(ownerId: string) {
+    const state = await this.options.repository.load(ownerId);
+    const limits = this.options.budget ?? {};
+    const outstanding = {
+      invocations: state.committed.invocations - state.settledUsage.invocations,
+      promptTokens: state.committed.usage.promptTokens - state.settledUsage.usage.promptTokens,
+      completionTokens: state.committed.usage.completionTokens - state.settledUsage.usage.completionTokens,
+      unknownPricedTokens: state.committed.unknownPricedTokens - state.settledUsage.unknownPricedTokens,
+      knownCosts: Object.fromEntries(Object.entries(state.committed.knownCosts)
+        .map(([currency, amount]) => [currency, amount - (state.settledUsage.knownCosts[currency] ?? 0)]))
+    };
+    return Object.freeze({ ownerId, ledgerTail: state.tail, limits,
+      settled: state.settledUsage, outstanding: Object.freeze(outstanding),
+      remaining: Object.freeze({
+        ...(limits.maxInvocations === undefined ? {} : { invocations: Math.max(0, limits.maxInvocations - state.committed.invocations) }),
+        ...(limits.maxPromptTokens === undefined ? {} : { promptTokens: Math.max(0, limits.maxPromptTokens - state.committed.usage.promptTokens) }),
+        ...(limits.maxCompletionTokens === undefined ? {} : { completionTokens: Math.max(0, limits.maxCompletionTokens - state.committed.usage.completionTokens) }),
+        ...(limits.maxKnownCost === undefined ? {} : { knownCost: {
+          currency: limits.maxKnownCost.currency,
+          amount: Math.max(0, limits.maxKnownCost.amount - (state.committed.knownCosts[limits.maxKnownCost.currency] ?? 0))
+        } })
+      }),
+      meaning: 'Remaining allowance subtracts settled usage and outstanding exposure. Missing limits are unbounded by this owner policy. Known cost excludes unpriced usage; it is not a hard monetary ceiling. Actual admission is transactional and may differ after this ledger cut.'
+    });
   }
 
   /** The caller must durably fence dispatch and prove this invocation has never started. */
@@ -355,7 +386,7 @@ export class InferenceService {
     ownerId: string,
     invocationId: string
   ): Promise<{
-    readonly revisionId: string | null;
+    readonly stateSelectionId: string | null;
     readonly capturedHistoryCut: HistorySourceCut;
     readonly inference: SessionStateInference;
   }> {
@@ -363,7 +394,7 @@ export class InferenceService {
     // Only the captured binding is needed here. The protected, already-accounted
     // request body is not a model-tool JSON payload with collection quotas.
     const record = z
-      .object({ sessionStateRevisionId: z.string().min(1).nullable(), capturedHistoryCut: historyCutSchema })
+      .object({ stateSelectionId: z.string().min(1).nullable(), capturedHistoryCut: historyCutSchema })
       .parse(
         JSON.parse(
           new TextDecoder('utf-8', { fatal: true }).decode(
@@ -372,7 +403,7 @@ export class InferenceService {
         ) as unknown
       );
     return {
-      revisionId: record.sessionStateRevisionId,
+      stateSelectionId: record.stateSelectionId,
       capturedHistoryCut: record.capturedHistoryCut,
       inference: { ownerId, invocationId, requestRef: ref }
     };
@@ -389,7 +420,7 @@ export class InferenceService {
       result = await this.invokeDurably(
         {
           ...identity,
-          sessionStateRevisionId: input.sessionStateRevisionId ?? null,
+          stateSelectionId: input.stateSelectionId ?? null,
           capturedHistoryCut: input.capturedHistoryCut,
           request: input.request,
           profile: input.profile,
@@ -425,7 +456,7 @@ export class InferenceService {
         start: async ({ context, signal, authorize, dispatch }) => {
           const result = await this.executeDurably({
             identity: ownIdentity(context),
-            sessionStateRevisionId: input.sessionStateRevisionId?.() ?? null,
+            stateSelectionId: input.stateSelectionId?.() ?? null,
             capturedHistoryCut: await input.capturedHistoryCut?.(),
             operation: 'native_generation',
             nativeDispatch: context.dispatch,
@@ -449,7 +480,7 @@ export class InferenceService {
           });
         },
         extend: async (context, compiled, dispatch) =>
-          this.extendNativeInvocation(context, compiled, input.sessionStateRevisionId?.() ?? null, await input.capturedHistoryCut?.(), dispatch)
+          this.extendNativeInvocation(context, compiled, input.stateSelectionId?.() ?? null, await input.capturedHistoryCut?.(), dispatch)
       },
       {
         ...input,
@@ -467,7 +498,7 @@ export class InferenceService {
   private async extendNativeInvocation(
     context: NativeGenerationContext,
     compiled: CompiledModelRequest,
-    sessionStateRevisionId: string | null,
+    stateSelectionId: string | null,
     capturedHistoryCut: HistorySourceCut | undefined,
     dispatch: ModelNativeDispatch
   ): Promise<void> {
@@ -478,7 +509,7 @@ export class InferenceService {
     const fingerprint = (
       await modelInputIdentity({
         identity: ownIdentity(context),
-        sessionStateRevisionId,
+        stateSelectionId,
         capturedHistoryCut: capturedHistoryCut ?? null,
         nativeDispatch: nativeDispatchProvenance(dispatch),
         inputIdentity: compiled.inputIdentity,
@@ -513,7 +544,7 @@ export class InferenceService {
         content: new TextEncoder().encode(
           JSON.stringify({
             invocationId: context.invocationId,
-            sessionStateRevisionId,
+            stateSelectionId,
             capturedHistoryCut,
             nativeDispatch: nativeDispatchProvenance(dispatch),
             logical: recordableSourceRequest(compiled.logicalRequest),
@@ -577,7 +608,7 @@ export class InferenceService {
     try {
       const result = await this.executeDurably({
         identity: ownIdentity(input),
-        sessionStateRevisionId: input.sessionStateRevisionId ?? null,
+        stateSelectionId: input.stateSelectionId ?? null,
         capturedHistoryCut: input.capturedHistoryCut,
         operation: 'generation',
         sourceRequest: request,
@@ -627,7 +658,7 @@ export class InferenceService {
     identity: InferenceIdentity,
     operation: 'generation' | 'native_generation',
     request: ModelRequest,
-    sessionStateRevisionId: string | null,
+    stateSelectionId: string | null,
     capturedHistoryCut: HistorySourceCut | undefined,
     outputReservation?: number
   ): Promise<string> {
@@ -635,7 +666,7 @@ export class InferenceService {
       await modelInputIdentity({
         identity,
         operation,
-        sessionStateRevisionId,
+        stateSelectionId,
         capturedHistoryCut: capturedHistoryCut === undefined ? null : historyCutSchema.parse(capturedHistoryCut),
         provider: this.options.provider.id,
         implementation: this.options.provider.implementationId,
@@ -664,7 +695,7 @@ export class InferenceService {
         identity,
         operation,
         input.request,
-        input.sessionStateRevisionId ?? null,
+        input.stateSelectionId ?? null,
         input.capturedHistoryCut,
         input.outputReservation
       ))
@@ -747,7 +778,7 @@ export class InferenceService {
       identity,
       input.operation,
       input.sourceRequest,
-      input.sessionStateRevisionId ?? null,
+      input.stateSelectionId ?? null,
       capturedHistoryCut,
       input.outputReservation
     );
@@ -755,7 +786,7 @@ export class InferenceService {
       await modelInputIdentity({
         identity,
         operation: input.operation,
-        sessionStateRevisionId: input.sessionStateRevisionId ?? null,
+        stateSelectionId: input.stateSelectionId ?? null,
         provider: this.options.provider.id,
         implementation: this.options.provider.implementationId,
         profile,
@@ -821,7 +852,7 @@ export class InferenceService {
             ...(this.presentations.has(compiled)
               ? { presentation: this.presentations.get(compiled) }
               : {}),
-            sessionStateRevisionId: input.sessionStateRevisionId ?? null,
+            stateSelectionId: input.stateSelectionId ?? null,
             capturedHistoryCut,
             ...(input.nativeDispatch ? { nativeDispatch: nativeDispatchProvenance(input.nativeDispatch) } : {}),
             logical,

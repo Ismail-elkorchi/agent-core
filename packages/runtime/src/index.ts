@@ -15,6 +15,8 @@ export * from './run/control/driver.js';
 export * from './run/control/state-transition.js';
 export * from './session/agent-session.js';
 export * from './session/binding.js';
+export * from './session/provider-binding.js';
+export * from './session/tool-authorization.js';
 export * from './session/contracts.js';
 export * from './session/repository.js';
 
@@ -25,14 +27,16 @@ export * from './inference/native-steering.js';
 export * from './inference/repository.js';
 export * from './inference/service.js';
 export * from './inference/usage-cost.js';
-export { decodeSessionStateContent, sessionStateContentSchema } from './session/session-state.js';
 export type {
-  SessionStateContent,
-  SessionStateBlock,
-  SessionStateChange,
-  SessionStateInference,
-  SessionStateSnapshot,
-  SessionStateRevision
+  SessionStateInference, SessionStateItemRef, SessionStateItemContent, SessionStateItemRevision,
+  SessionStateSelectedItem, SessionStateSnapshot, SessionStateOperation, SessionStateBatch,
+  SessionStateBatchCommit, SessionStateBatchReceipt, SessionStatePageRequest, SessionStateItemMetadata,
+  SessionStatePage
+} from './session/session-state.js';
+export {
+  sessionStateItemRefSchema, sessionStateItemContentSchema, sessionStateOperationSchema,
+  sessionStateInferenceSchema, sessionStateBatchSchema, sessionStateItemRevisionSchema,
+  sessionStateBatchCommitSchema
 } from './session/session-state.js';
 export {
   ToolCallExecutor,
@@ -76,3 +80,7 @@ export type { ContextAdmissionConflict, ContextAdmissionAction } from './run/con
 export * from './run/control/records.js';
 
 export * from './orchestration/observation-source.js';
+
+export { commitResourceRelease } from './orchestration/resource-settlement.js';
+
+export * from './run/capabilities.js';

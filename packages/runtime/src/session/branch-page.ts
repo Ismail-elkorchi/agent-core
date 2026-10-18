@@ -1,6 +1,5 @@
 import { HistorySearchIndex } from '../history/search-index.js';
 import type { HistorySearchPosition } from '../history/contracts.js';
-import { sessionStateAtEntry, type SessionStateRevision } from './session-state.js';
 import { hashJson } from '@agent-core/persistence';
 import { historySourceFacts } from '../history/source-metadata.js';
 import { historyToolName } from '../history/metadata.js';
@@ -24,7 +23,6 @@ export interface BranchEntryPosition {
   readonly context: SessionSourceMetadata['context'];
   readonly timestamp: string;
   readonly toolName?: string;
-  readonly sessionState?: SessionStateRevision | null;
   readonly identity: string;
   readonly type: SessionBranchEntry['type'];
   readonly runId?: string;
@@ -351,10 +349,6 @@ export function memoryBranchSource(
     }
     index.positions.set(entry.id, {
       depth: (parent?.depth ?? -1) + 1, ancestors: Object.freeze(ancestors),
-      sessionState: sessionStateAtEntry(
-        entry,
-        entry.parentId === null ? null : (index.positions.get(entry.parentId)?.sessionState ?? null)
-      ),
       ...branchEntryMetadata(entry),
       parentId: entry.parentId,
       hash: hashJson(entry),
@@ -545,6 +539,8 @@ function branchEntryText(entry: SessionBranchEntry): string {
       return `${entry.provider}/${entry.model}`;
     case 'context_transition':
       return entry.window.reason;
+    case 'session_state_batch':
+      return entry.batch.idempotencyKey;
   }
 }
 
@@ -561,7 +557,7 @@ export function branchEntryMetadata(entry: SessionBranchEntry) {
     ...(entry.type === 'branch' ? { fromEntryId: entry.fromEntryId } : {}),
     ...(entry.type === 'context_transition'
       ? { historyPosition: entry.window.historyPosition }
-      : {})
+      : entry.type === 'session_state_batch' ? {historyPosition:entry.batch.capturedHistoryCut} : {})
   };
 }
 /** Advance the in-memory repository's derived lifecycle facts at admission, not first search. */
@@ -659,11 +655,4 @@ export async function sourceSnapshot(
       }
     }
   });
-}
-
-export function currentSessionState(
-  source: BranchPageSource,
-  leafId = source.leafId
-): SessionStateRevision | null {
-  return leafId === null ? null : (position(source, leafId).sessionState ?? null);
 }

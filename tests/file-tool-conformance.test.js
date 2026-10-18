@@ -26,6 +26,7 @@ async function fixture(t, backend, initial, configuration = DEFAULT_LOCAL_TOOL_C
   for (const [name, content] of Object.entries(initial))
     await writeFile(path.join(root, name), content, { mode: 0o755 });
   const host = createLocalToolHost({
+    artifactReadMaxBytes: 2_000_000,
     rootedFileAuthority: RootedFileAuthority.adopt(root),
     patchJournal: TextPatchJournal.adopt(journal),
     artifactRepository: new InMemoryArtifactRepository(),

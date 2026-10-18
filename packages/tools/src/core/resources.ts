@@ -27,15 +27,29 @@ export function validateToolRequirements(value: unknown): ToolRequirements | und
   })();
   return Object.freeze({ ...(services ? { services } : {}), ...(modelInputModalities ? { modelInputModalities } : {}), ...(hostCapabilities ? { hostCapabilities } : {}) });
 }
-export function toolRequirementsSatisfied(tool: ToolDefinition, host: {
+export interface ToolHostRequirements {
   readonly services?: Readonly<Record<string, unknown>>;
   readonly modelInputModalities?: readonly string[];
   readonly hostCapabilities?: readonly string[];
-}): boolean {
+}
+export interface MissingToolRequirement {
+  readonly kind: 'service' | 'model_input_modality' | 'host_capability';
+  readonly name: string;
+}
+/** The same requirement decision supplies both execution eligibility and inspection. */
+export function missingToolRequirements(tool: ToolDefinition, host: ToolHostRequirements): readonly MissingToolRequirement[] {
   const requirements = tool.requirements;
-  return (requirements?.services ?? []).every((service) => host.services?.[service] !== undefined)
-    && (requirements?.modelInputModalities ?? []).every((modality) => host.modelInputModalities?.includes(modality) === true)
-    && (requirements?.hostCapabilities ?? []).every((capability) => host.hostCapabilities?.includes(capability) === true);
+  return Object.freeze([
+    ...(requirements?.services ?? []).filter(name => host.services?.[name] === undefined)
+      .map(name => Object.freeze({ kind: 'service' as const, name })),
+    ...(requirements?.modelInputModalities ?? []).filter(name => host.modelInputModalities?.includes(name) !== true)
+      .map(name => Object.freeze({ kind: 'model_input_modality' as const, name })),
+    ...(requirements?.hostCapabilities ?? []).filter(name => host.hostCapabilities?.includes(name) !== true)
+      .map(name => Object.freeze({ kind: 'host_capability' as const, name }))
+  ]);
+}
+export function toolRequirementsSatisfied(tool: ToolDefinition, host: ToolHostRequirements): boolean {
+  return missingToolRequirements(tool, host).length === 0;
 }
 function scoped(parent: string, child: string): string {
   const clean = child.replaceAll('\\', '/').replace(/^\.?\/+/u, '').replace(/\/+$/u, '');

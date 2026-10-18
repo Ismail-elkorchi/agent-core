@@ -1,7 +1,14 @@
 import type { HistorySourceCut, HistorySourceRef, HistorySourceExcerpt, HistorySourceMetadata } from '../history/contracts.js';
-import type { SessionStateChange } from '../session/session-state.js';
+import type { SessionStateBatchCommit, SessionStateItemRef } from '../session/session-state.js';
+
+export type ContextArtifactSelection =
+  | { readonly artifact: import('@agent-core/persistence').PublicArtifactRef; readonly representation: 'reference' }
+  | { readonly artifact: import('@agent-core/persistence').PublicArtifactRef; readonly representation: 'text';
+      readonly range?: { readonly offset: number; readonly bytes: number } | undefined };
 
 export interface ContextSourceSelection {
+  readonly sessionState?: readonly SessionStateItemRef[] | undefined;
+  readonly artifacts?: readonly ContextArtifactSelection[] | undefined;
   /** Exact historical text evidence, not conversational or native protocol replay. */
   readonly excerpts?: readonly HistorySourceExcerpt[] | undefined;
   /** Explicit host/user retention across subsequent renewals. */
@@ -13,29 +20,14 @@ export interface ContextSelection extends ContextSourceSelection {
   readonly continuity?:
     | {
         readonly kind: 'fresh';
+        readonly historyPosition: HistorySourceCut;
         readonly resetId: string;
         readonly model: import('@agent-core/model').ModelSelection;
         readonly sources: readonly HistorySourceRef[];
       }
     | undefined;
 }
-/** Immutable low-authority replacement, delivered only by an admitted provider request. */
-export interface ContextStateNotice {
-  readonly id: string;
-  readonly previousRevisionId: string | null;
-  readonly revisionId: string;
-  readonly after: HistorySourceCut;
-  readonly message: { readonly role: 'user'; readonly content: string };
-}
-/** A linked state-sequence journal references the one authoritative state revision. */
-export interface ContextStateSequence {
-  readonly checkpointRevisionId: string | null;
-  readonly lineage: HistorySourceCut | null;
-  readonly parent: HistorySourceRef | null;
-  readonly notice?: ContextStateNotice | undefined;
-}
 export interface ContextWindowRecord {
-  readonly stateSequence: ContextStateSequence;
   readonly windowId: string;
   readonly parentWindowId: string | null;
   readonly historyPosition: HistorySourceCut;
@@ -55,14 +47,12 @@ export interface ContextTransitionRecord {
   readonly windowId: string;
   readonly requestFingerprint: string;
   readonly selectionFingerprint: string;
-  readonly stateSequenceFingerprint: string;
   readonly requestedSourceRevision?: number | undefined;
-  readonly requestedSessionStateRevisionId?: string | null | undefined;
   readonly committedAt: string;
 }
+/** Activation owns the exact admitted view read set. Unlike independent item saves, it never rebases across a changed source/window boundary. */
 export interface ContextTransitionCommit {
-  readonly expectedSessionStateRevisionId: string | null;
-  readonly sessionState?: SessionStateChange | undefined;
+  readonly sessionState?: SessionStateBatchCommit | undefined;
   readonly expectedLeafId: string | null;
   readonly expectedSourceRevision: number;
   readonly expectedWindowId: string | null;
@@ -73,8 +63,7 @@ export interface ContextTransitionRequest {
   /** Deliberately replace the provider continuation even when content is unchanged. */
   readonly renewal?: boolean | undefined;
   readonly expectedCut?: HistorySourceCut | undefined;
-  readonly sessionState?: SessionStateChange | undefined;
-  readonly expectedSessionStateRevisionId?: string | null | undefined;
+  readonly sessionState?: SessionStateBatchCommit | undefined;
   readonly toolInvocation?:
     | Pick<
         import('@agent-core/tools').ToolInvocationContext,

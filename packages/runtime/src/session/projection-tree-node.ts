@@ -124,6 +124,24 @@ export class SessionIndexTree {
     for (const hash of Object.values(node.children)) yield* this.entries(hash);
   }
 
+  /** Seek a stable hash-order cursor without visiting preceding subtrees. */
+  async *entriesAfter(root: string | null, after?: string, prefix = ''): AsyncGenerator<readonly [string, unknown]> {
+    if (root === null) return;
+    const route = after === undefined ? undefined : hashJson(after);
+    if (route !== undefined && prefix < route.slice(0, prefix.length)) return;
+    const node = await this.read(root);
+    if (node.kind === 'bucket') {
+      const entries = [...node.entries].sort((a,b) => hashJson(a.key).localeCompare(hashJson(b.key)) || a.key.localeCompare(b.key));
+      for (const entry of entries) {
+        const hash = hashJson(entry.key);
+        if (route !== undefined && (hash < route || (hash === route && entry.key <= (after ?? '')))) continue;
+        yield [entry.key,entry.value];
+      }
+      return;
+    }
+    for (const part of Object.keys(node.children).sort()) yield* this.entriesAfter(node.children[part] ?? null, after, prefix + part);
+  }
+
   /** Retire changed main-tree paths only, including buckets split into smaller descendants. */
   async retired(previous: string | null, next: string | null): Promise<readonly string[]> {
     const retired: string[] = [];

@@ -2,9 +2,8 @@ import { createSessionRunFinalizationConfirmation } from './finalization-confirm
 import { recordedModelSelection } from '../orchestration/model-change.js';
 import { protectedInferenceInput } from '../inference/input.js';
 import type { ProtectedArtifactRef } from '@agent-core/persistence';
-import {
-  type SessionStateRevision
-} from './session-state.js';
+import { sessionStateBatchCommitSchema, sessionStateBatchStorageBytes, sessionStateItemRefSchema, validateSessionStateCommit } from './session-state.js';
+import { assertStateSelection, decodeSessionStateBatchEntry, stateReceipt, stateBatch, assertStateRetry, advanceMemoryState, emptyMemoryStateIndex, type MemoryStateIndex, assertStateSourceCut, stateItemMetadata, statePageLimits, statePageResult, decodeStatePageCursor } from './state-records.js';
 import { parseJsonValue } from '@agent-core/json';
 import { parseModelSelection, type ModelOutputItem, type ModelSelection } from '@agent-core/model';
 import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
@@ -31,7 +30,6 @@ import {
   settleMemorySource,
   assertBranchEntry,
   memoryBranchSource,
-  currentSessionState,
   readBranchPage,
   searchBranch
 } from './branch-page.js';
@@ -101,14 +99,14 @@ export class InMemorySessionRepository implements SessionRepository {
         released || this.executionOwners.get(session.id) !== token
           ? Promise.reject(new PersistenceConflictError('Session execution ownership was lost.'))
           : Promise.resolve();
-      return Object.freeze({ assertOwned, release: () => {
+      return Object.freeze({ assertOwned, release: () => this.serial(() => {
         if (released) return Promise.resolve();
         if (this.executionOwners.get(session.id) !== token)
           return Promise.reject(new PersistenceConflictError('Session execution ownership was lost.'));
         this.executionOwners.delete(session.id);
         released = true;
         return Promise.resolve();
-      } });
+      }) });
     });
   }
 
@@ -125,7 +123,7 @@ export class InMemorySessionRepository implements SessionRepository {
       const header: SessionHeader = Object.freeze({
         type: 'session',
         version: 1,
-        format: 'agent-core.session/4',
+        format: 'agent-core.session/5',
         sessionStateStorage: 'session',
         id,
         timestamp: new Date().toISOString(),
@@ -134,7 +132,7 @@ export class InMemorySessionRepository implements SessionRepository {
         ...(options.provider ? { provider: options.provider } : {}),
         ...(options.model ? { model: options.model } : {})
       });
-      const state = { header, branchEntries: [], finalizations: [], confirmations: [], submissionRecords: [] };
+      const state = { header, branchEntries: [], finalizations: [], confirmations: [], submissionRecords: [], acceptedInputRevision: 0, retainedStateBytes: 0, stateIndexes: new Map<string,MemoryStateIndex>() };
       this.states.set(id, state);
       return sessionFromState(state);
     });
@@ -202,16 +200,81 @@ export class InMemorySessionRepository implements SessionRepository {
         ?? initialSessionModelSelection(state.submissionRecords);
     });
   }
-  currentSessionState(
-    session: SessionDescriptor,
-    leafId?: string | null
-  ): Promise<SessionStateRevision | null> {
-    return this.serial(() =>
-      currentSessionState(
-        memoryBranchSource(session.id, this.requireDescriptor(session).branchEntries),
-        leafId
-      )
-    );
+  committedRetainedStateBytes(session: SessionDescriptor): Promise<number> {
+    return this.serial(() => this.requireDescriptor(session).retainedStateBytes);
+  }
+  findSessionStateBatch(session: SessionDescriptor, idempotencyKey: string) {
+    return this.serial(() => {
+      const state = this.requireDescriptor(session);
+      const entry = stateItems(state,branchLeaf(state.branchEntries)).batches.get(idempotencyKey);
+      return entry ? stateReceipt(entry) : undefined;
+    });
+  }
+  saveSessionState(session: SessionDescriptor, input: Parameters<SessionRepository['saveSessionState']>[1], options: Parameters<SessionRepository['saveSessionState']>[2] = {}) {
+    const batch = sessionStateBatchCommitSchema.parse(input);
+    return this.serial(async () => {
+      const state = this.requireDescriptor(session);
+      const branch = activeBranch(state.branchEntries, branchLeaf(state.branchEntries));
+      const items = stateItems(state,branchLeaf(state.branchEntries));
+      const previous = items.batches.get(batch.idempotencyKey);
+      if (previous) return assertStateRetry(previous, batch);
+      const publish = async () => {
+        if (batch.capturedHistoryCut.sourceRevision < state.acceptedInputRevision) throw new PersistenceConflictError('Accepted input changed after the state inference.');
+        assertStateSourceCut(session.id, branch, batch, state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length);
+        await validateSessionStateCommit(batch, itemId => Promise.resolve(items.heads.get(itemId)), state.retainedStateBytes);
+        const entry = decodeSessionStateBatchEntry({...baseEntry(branchLeaf(state.branchEntries)), type: 'session_state_batch', batch});
+        appendBranchRecord(state, entry);
+        return stateReceipt(entry);
+      };
+      return options.withOwnership ? options.withOwnership(publish) : publish();
+    });
+  }
+  currentSessionStateItem(session: SessionDescriptor, itemId: string, leafId?: string | null) {
+    return this.serial(() => {
+      const state = this.requireDescriptor(session);
+      return stateItems(state,leafId === undefined ? branchLeaf(state.branchEntries) : leafId).heads.get(itemId);
+    });
+  }
+  readSessionStateItem(session: SessionDescriptor, input: Parameters<SessionRepository['readSessionStateItem']>[1], leafId?: string | null) {
+    const ref = sessionStateItemRefSchema.parse(input);
+    return this.serial(() => {
+      const state = this.requireDescriptor(session);
+      const item = stateItems(state,leafId === undefined ? branchLeaf(state.branchEntries) : leafId).revisions.get(ref.revisionId);
+      if (item?.itemId !== ref.itemId) throw new Error('Session-state revision is unavailable on this branch.');
+      if (ref.range && ref.range.offset + ref.range.bytes > item.contentBytes) throw new Error('Session-state range exceeds the immutable revision.');
+      return item;
+    });
+  }
+  listSessionState(session: SessionDescriptor, request: Parameters<SessionRepository['listSessionState']>[1] = {}) {
+    return this.serial(() => {
+      const state = this.requireDescriptor(session);
+      const {limit,maxBytes} = statePageLimits(request);
+      const cursor = decodeStatePageCursor(session.id,request);
+      const leaf = cursor?.leafId ?? (request.leafId === undefined ? branchLeaf(state.branchEntries) : request.leafId);
+      const values = stateItems(state,leaf).orderedItems;
+      const items: import('./session-state.js').SessionStateItemMetadata[] = [];
+      let after = cursor?.after, partial = false;
+      let start = 0;
+      if (cursor) {
+        const hash = hashJson(cursor.after);
+        let end = values.length;
+        while (start < end) {
+          const middle = Math.floor((start + end) / 2), value = values[middle];
+          if (value && (hashJson(value.itemId) < hash || (hashJson(value.itemId) === hash && value.itemId <= cursor.after))) start = middle + 1;
+          else end = middle;
+        }
+      }
+      for (let index = start; index < values.length; index++) {
+        const value = values[index];
+        if (!value) break;
+        const metadata = stateItemMetadata(value);
+        if (items.length >= limit) {partial = true; break;}
+        try {statePageResult(session.id,leaf,[...items,metadata],index + 1 < values.length,value.itemId,maxBytes);}
+        catch (error) {if (items.length === 0) throw error;partial = true;break;}
+        items.push(metadata); after = value.itemId;
+      }
+      return statePageResult(session.id,leaf,items,partial,after,maxBytes);
+    });
   }
 
   sourceSnapshot(session: SessionDescriptor, leafId?: string | null) {
@@ -234,7 +297,8 @@ export class InMemorySessionRepository implements SessionRepository {
         (entry): entry is SessionConversationItem =>
           entry.type !== 'branch' &&
           entry.type !== 'model_settings' &&
-          entry.type !== 'context_transition'
+          entry.type !== 'context_transition' &&
+          entry.type !== 'session_state_batch'
       )
     );
   }
@@ -288,12 +352,12 @@ export class InMemorySessionRepository implements SessionRepository {
         })
       );
       for (const entry of state.branchEntries) {
-        if (entry.type === 'context_transition')
+        if (entry.type === 'context_transition' || entry.type === 'session_state_batch')
           points.push(
             Object.freeze({
               entryId: entry.id,
               timestamp: entry.timestamp,
-              kind: 'context_transition'
+              kind: entry.type
             })
           );
       }
@@ -529,30 +593,43 @@ export class InMemorySessionRepository implements SessionRepository {
   }
   commitContextTransition(
     session: SessionDescriptor,
-    input: ContextTransitionCommit
+    input: ContextTransitionCommit,
+    options: Parameters<SessionRepository['commitContextTransition']>[2] = {}
   ): Promise<SessionContextTransitionEntry> {
-    return this.serial(() => {
+    return this.serial(async () => {
       const state = this.requireDescriptor(session);
       const branch = activeBranch(state.branchEntries, branchLeaf(state.branchEntries));
       const existing = contextCommitRetry(branch, input);
       if (existing) return existing;
-      validateContextCommit(
-        session.id,
-        branch,
-        state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length,
-        input,
-        state.finalizations
-      );
-      const { id: revisionId, ...sessionState } = input.sessionState ?? {};
-      const entry = decodeContextTransitionEntry({
-        ...baseEntry(branchLeaf(state.branchEntries)),
-        type: 'context_transition',
-        ...(revisionId ? { id: revisionId, sessionState } : {}),
-        window: input.window,
-        transition: input.transition
-      });
-      appendBranchRecord(state, entry);
-      return entry;
+      const publish = async () => {
+        validateContextCommit(
+          session.id,
+          branch,
+          state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length,
+          input,
+          state.finalizations
+        );
+        if (input.sessionState) {
+          const items = stateItems(state,branchLeaf(state.branchEntries));
+          if (items.batches.has(input.sessionState.idempotencyKey)) throw new PersistenceConflictError('State batch was already committed.');
+          if (input.sessionState.capturedHistoryCut.sourceRevision < state.acceptedInputRevision) throw new PersistenceConflictError('Accepted input changed after the state inference.');
+          assertStateSourceCut(session.id, branch, input.sessionState, state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length);
+          await validateSessionStateCommit(input.sessionState, itemId => Promise.resolve(items.heads.get(itemId)), state.retainedStateBytes);
+        }
+        const selectedItems = new Map(stateItems(state,branchLeaf(state.branchEntries)).revisions);
+        for (const revision of input.sessionState?.revisions ?? []) selectedItems.set(revision.revisionId,revision);
+        for (const ref of input.window.selection.sessionState ?? []) assertStateSelection(ref,selectedItems.get(ref.revisionId));
+        const entry = decodeContextTransitionEntry({
+          ...baseEntry(branchLeaf(state.branchEntries)),
+          type: 'context_transition',
+          ...(input.sessionState ? { sessionState: input.sessionState } : {}),
+          window: input.window,
+          transition: input.transition
+        });
+        appendBranchRecord(state, entry);
+        return entry;
+      };
+      return options.withOwnership ? options.withOwnership(publish) : publish();
     });
   }
   branchFrom(
@@ -566,11 +643,11 @@ export class InMemorySessionRepository implements SessionRepository {
       const source = state.branchEntries.find((entry) => entry.id === entryId);
       if (!source) throw new Error(`Unknown entry: ${entryId}`);
       if (
-        source.type !== 'context_transition' &&
+        source.type !== 'context_transition' && source.type !== 'session_state_batch' &&
         !state.finalizations.some((finalization) => finalization.throughEntryId === entryId)
       ) {
         throw new Error(
-          `Session branches require a completed final or context transition entry: ${entryId}`
+          `Session branches require a completed final, state batch, or context transition entry: ${entryId}`
         );
       }
       const entry: SessionBranchMarkerEntry = Object.freeze({
@@ -656,6 +733,7 @@ export class InMemorySessionRepository implements SessionRepository {
       assertSessionAdmissionConfiguration(input.configuration, selection);
       const record = createSessionAdmission(state.submissionRecords, input);
       state.submissionRecords.push(record);
+      state.acceptedInputRevision = state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length;
       const admitted = sessionSubmission(state.submissionRecords, record.submissionId);
       if (!admitted || (admitted.state !== 'claimed' && admitted.state !== 'queued'))
         throw new Error('Committed admission has no pending submission.');
@@ -716,6 +794,7 @@ export class InMemorySessionRepository implements SessionRepository {
       state.submissionRecords.push(
         createQueuedSubmissionUpdate(state.submissionRecords, submissionId, change)
       );
+      if (change.kind === 'replace') state.acceptedInputRevision = state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length;
     });
   }
 
@@ -747,14 +826,27 @@ function sessionUpdatedAt(state: SessionState): string {
 }
 
 interface SessionState {
+  acceptedInputRevision: number;
+  retainedStateBytes: number;
+  readonly stateIndexes: Map<string,MemoryStateIndex>;
   readonly header: SessionHeader;
   readonly branchEntries: SessionBranchEntry[];
   readonly finalizations: SessionRunFinalization[];
   readonly confirmations: SessionRunFinalizationConfirmation[];
   readonly submissionRecords: SessionSubmissionRecord[];
 }
+function stateItems(state: SessionState, leafId: string | null): MemoryStateIndex {
+  if (leafId === null) return emptyMemoryStateIndex;
+  const items = state.stateIndexes.get(leafId);
+  if (!items) throw new Error(`Unknown session-state boundary: ${leafId}`);
+  return items;
+}
 function appendBranchRecord(state: SessionState, entry: SessionBranchEntry): void {
+  state.stateIndexes.set(entry.id,advanceMemoryState(stateItems(state,entry.parentId),entry));
+  const batch = stateBatch(entry);
+  if (batch) state.retainedStateBytes += sessionStateBatchStorageBytes(batch);
   state.branchEntries.push(entry);
+  if (entry.type === 'input' || entry.type === 'steering') state.acceptedInputRevision = state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length;
   memoryBranchSource(state.header.id, state.branchEntries);
 }
 

@@ -925,10 +925,10 @@ test('durable replay binds the exact session state revision', async () => {
     calls++;
     return response(request);
   }) });
-  const request = { ...input('state-revision'), sessionStateRevisionId: 'state-1' };
+  const request = { ...input('state-revision'), stateSelectionId: 'state-1' };
   await service.invoke(request);
   assert.equal((await service.invoke(request)).replayed, true);
-  await assert.rejects(service.invoke({ ...request, sessionStateRevisionId: 'state-2' }),
+  await assert.rejects(service.invoke({ ...request, stateSelectionId: 'state-2' }),
     /different input or configuration/);
   assert.equal(calls, 1);
 });
@@ -937,7 +937,7 @@ test('session-state origin retains the inference history boundary despite later 
   const service = InferenceService.inMemory({ provider: fixture(async request => response(request)) });
   const cut = { format: 'agent-core.history/1', sessionId: 'session', branchId: 'main',
     throughEntryId: 'before-correction', sourceRevision: 1, ledgerCoverage: 'session' };
-  const request = { ...input('history-origin'), capturedHistoryCut: cut, sessionStateRevisionId: null };
+  const request = { ...input('history-origin'), capturedHistoryCut: cut, stateSelectionId: null };
   await service.invoke(request);
   const original = { ...cut };
   cut.throughEntryId = 'later-correction';

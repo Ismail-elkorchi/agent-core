@@ -1,8 +1,7 @@
 import { parseJsonObject } from '@agent-core/json';
 import type {
   CommandExecution,
-  CommandExecutionReport,
-  CommandOutputView
+  CommandExecutionReport
 } from './command-execution.js';
 import type {
   ExecutionResources,
@@ -37,26 +36,17 @@ export function commandReleaseReport(report: CommandExecutionReport): ResourceRe
       ...(result.finalizationPending ? { finalizationPending: true } : {}),
       owner: result.owner,
       cursorEnd: result.cursorEnd,
-      stdout: outputCounts(result.stdout),
-      stderr: outputCounts(result.stderr),
-      ...(result.terminal === undefined ? {} : { terminal: outputCounts(result.terminal) }),
-      combined: outputCounts(result.combined),
+      // Receipt facts are independent of a query's output window and recovery diagnostics.
+      stdout: report.terminalOutput?.stdout ?? { observedBytes: result.stdout.observedBytes },
+      stderr: report.terminalOutput?.stderr ?? { observedBytes: result.stderr.observedBytes },
+      combined: report.terminalOutput?.combined ?? { observedBytes: result.combined.observedBytes },
+      ...(report.terminalDiagnostic === undefined ? {} : { diagnostic: report.terminalDiagnostic }),
       ...(result.artifact === undefined ? {} : { artifact: result.artifact }),
-      ...(result.originalOutput === undefined ? {} : { originalOutput: result.originalOutput }),
-      ...(result.diagnostic === undefined ? {} : { diagnostic: result.diagnostic }),
       ...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
       ...(result.signal === undefined ? {} : { signal: result.signal }),
       ...(report.protectedArtifact === undefined
         ? {}
         : { protectedArtifact: report.protectedArtifact })
     })
-  });
-}
-
-function outputCounts(output: CommandOutputView) {
-  return Object.freeze({
-    observedBytes: output.observedBytes,
-    capturedBytes: output.capturedBytes,
-    omittedBytes: output.omittedBytes
   });
 }

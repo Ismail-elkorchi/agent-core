@@ -82,6 +82,21 @@ export class ResourceLeaseCoordinator {
     return this.active.size;
   }
 
+  /** Bounded observation of existing leases, never an execution permission. */
+  inspect(limit = 32) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 128)
+      throw new RangeError('Resource inspection limit must be between 1 and 128.');
+    const items = [];
+    for (const lease of this.active.values()) {
+      if (items.length === limit) break;
+      items.push(Object.freeze({ ...(new TextEncoder().encode(lease.owner).byteLength <= 256 ? { owner: lease.owner } : { ownerOmitted: 'identifier_byte_limit' as const }),
+        ...(lease.resourceId ? new TextEncoder().encode(lease.resourceId).byteLength <= 256 ? { resourceId: lease.resourceId } : { resourceIdOmitted: 'identifier_byte_limit' as const } : {}),
+        status: lease.failure ? 'unresolved' as const : 'active' as const }));
+    }
+    return Object.freeze({ activeCount: this.active.size, waitingCount: this.waiters.length,
+      items: Object.freeze(items), coverage: items.length === this.active.size ? 'complete' as const : 'partial' as const });
+  }
+
   /** Reattach an already admitted external effect; this does not authorize a new effect. */
   restoreResource(resourceId: string, effects: ToolEffects, controlScope: string): void {
     if ([...this.active.values()].some((lease) => lease.resourceId === resourceId)) return;

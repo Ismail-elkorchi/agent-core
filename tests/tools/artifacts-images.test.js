@@ -1,3 +1,4 @@
+import { createReadArtifactTool } from '@agent-core/tools';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFile, mkdtemp, readFile, rename, stat, truncate, writeFile } from 'node:fs/promises';
@@ -7,11 +8,12 @@ import { InMemoryArtifactRepository } from '@agent-core/persistence';
 import { LocalArtifactRepository } from '@agent-core/persistence/node';
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
-  readArtifactTool,
   viewImageTool
 } from '@agent-core/tools-local';
 import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
 import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
+
+const readArtifactTool = createReadArtifactTool({ maxReadBytes: 2_000_000 });
 
 const tools = [readArtifactTool, viewImageTool];
 

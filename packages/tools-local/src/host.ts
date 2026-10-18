@@ -1,4 +1,3 @@
-import path from 'node:path';
 import type { ArtifactRepository } from '@agent-core/persistence';
 import type {
   CommandExecution,
@@ -11,7 +10,6 @@ import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
   type LocalToolConfiguration
 } from './core/configuration.js';
-import { LocalCommandExecution, type LocalCommandExecutionOptions } from './core/command-execution.js';
 import { RootedFileSelector } from './core/rooted-file-selection.js';
 import { isRootedFileAuthority, type RootedFileAuthority } from './core/rooted-file-authority.js';
 import { TextPatchJournal } from './core/text-write.js';
@@ -20,7 +18,7 @@ import { editTextTool } from './tools/edit-text/index.js';
 import { createExecCommandTool } from './tools/exec-command/index.js';
 import { findFilesTool } from './tools/find-files/index.js';
 import { listDirectoryTool } from './tools/list-directory/index.js';
-import { readArtifactTool } from './tools/read-artifact/index.js';
+import { createReadArtifactTool } from '@agent-core/tools';
 import { readFilesTool } from './tools/read-files/index.js';
 import { searchTextTool } from './tools/search-text/index.js';
 import { stopProcessTool } from './tools/stop-process/index.js';
@@ -30,13 +28,12 @@ import { writeStdinTool } from './tools/write-stdin/index.js';
 export interface LocalToolHostOptions {
   readonly rootedFileAuthority: RootedFileAuthority;
   readonly artifactRepository: ArtifactRepository;
-  readonly processLedgerDirectory?: string;
   /** Borrowed authority. Its owner manages reconciliation and lifetime. */
   readonly commandExecution?: CommandExecution;
   readonly patchJournal?: TextPatchJournal;
   readonly configuration?: LocalToolConfiguration;
   readonly enabledTools: readonly string[];
-  readonly commitTerminalReport?: LocalCommandExecutionOptions['commitTerminalReport'];
+  readonly artifactReadMaxBytes: number;
 }
 
 export interface LocalToolHost {
@@ -67,26 +64,13 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
   const processToolsEnabled = enabledTools.some(
     (name) => name === 'exec_command' || name === 'write_stdin' || name === 'stop_process'
   );
-  if (options.processLedgerDirectory !== undefined && options.commandExecution !== undefined) {
-    throw new Error(
-      'Local tool host accepts either a process ledger or an application command authority, not both.'
-    );
-  }
-  if (options.commandExecution && options.commitTerminalReport)
-    throw new Error('A borrowed command authority owns its terminal handoff.');
-  if (
-    processToolsEnabled &&
-    options.processLedgerDirectory === undefined &&
-    options.commandExecution === undefined
-  ) {
-    throw new Error(
-      'Local process tools require an application command authority or a local process ledger.'
-    );
-  }
+  if (processToolsEnabled && options.commandExecution === undefined)
+    throw new Error('Local process tools require an explicitly supplied command authority.');
   const configuration =
     options.configuration === undefined
       ? DEFAULT_LOCAL_TOOL_CONFIGURATION
       : parseLocalToolConfiguration(options.configuration);
+  const readArtifact = createReadArtifactTool({ maxReadBytes: options.artifactReadMaxBytes });
   const artifactRepository = options.artifactRepository;
   let rootedFileAuthority: RootedFileAuthority | undefined;
   let patchJournal: TextPatchJournal | undefined;
@@ -104,18 +88,9 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
   const rootedFileSelector = new RootedFileSelector(adoptedRoot, configuration.fileSelection);
   let commandExecution: CommandExecution | undefined;
   try {
-    commandExecution =
-      options.commandExecution === undefined
-        ? options.processLedgerDirectory === undefined
-          ? undefined
-          : new LocalCommandExecution({
-              artifactRepository,
-              rootedFileAuthority: adoptedRoot,
-              ledgerDirectory: path.resolve(options.processLedgerDirectory),
-              ...configuration.process,
-              ...(options.commitTerminalReport ? { commitTerminalReport: options.commitTerminalReport } : {})
-            })
-        : adoptCommandExecution(options.commandExecution);
+    commandExecution = options.commandExecution === undefined
+      ? undefined
+      : adoptCommandExecution(options.commandExecution);
   } catch (error) {
     patchJournal?.close();
     adoptedRoot.close();
@@ -142,14 +117,13 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     writeStdinTool,
     stopProcessTool,
     viewImageTool,
-    readArtifactTool
+    readArtifact
   ]);
   const tools = selectTools(allTools, enabledTools);
   const noProcesses: CommandReconciliationResult = Object.freeze({
     resolved: Object.freeze([]),
     unresolved: Object.freeze([])
   });
-  const ownsCommands = options.commandExecution === undefined;
   return Object.freeze({
     tools,
     services,
@@ -170,16 +144,14 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
         await commandExecution.acknowledgeUnresolved(input.acknowledge);
       return commandExecution.retryReconciliation();
     },
-    async close() {
+    close() {
+      // Command authority is borrowed; its application owner closes it.
       try {
-        if (ownsCommands) await commandExecution?.close();
+        patchJournal?.close();
       } finally {
-        try {
-          patchJournal?.close();
-        } finally {
-          adoptedRoot.close();
-        }
+        adoptedRoot.close();
       }
+      return Promise.resolve();
     }
   });
 }

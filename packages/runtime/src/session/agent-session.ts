@@ -3,6 +3,7 @@ import {
   assertModelRequestSupported,
   parseModelSelection,
   type ModelProfile,
+  type ModelProvider,
   type ModelSelection
 } from '@agent-core/model';
 import { assertHistoryModelCompatibility } from '../orchestration/session-replay.js';
@@ -28,6 +29,7 @@ import type {
   SessionSuspensionCategory,
   SessionSuspensionDescriptor
 } from './contracts.js';
+import type { SessionProviderBinding } from './provider-binding.js';
 import { parseSessionImages } from './images.js';
 import { ApplicationEvents, type ApplicationDeliveryEvent } from './event-delivery.js';
 import {
@@ -109,8 +111,7 @@ export interface AgentSessionOptions {
   readonly repository: SessionRepository;
   readonly runs: AgentRunCoordinator;
   readonly configuration: AgentSessionConfiguration;
-  /** Prepare this client to execute the complete binding before durable admission. */
-  readonly prepareConfiguration?: (configuration: AgentSessionConfiguration, input: SessionSubmissionInput) => void | Promise<void>;
+  readonly providerBinding?: SessionProviderBinding;
   readonly createRuntime: (
     configuration: AgentSessionConfiguration,
     onProgress: (event: AgentProgressEvent) => void | Promise<void>,
@@ -193,6 +194,15 @@ export class AgentSession {
     });
   }
 
+  /** Inspect the current durable selection without replacing an executing binding. */
+  inspectProviderBinding() {
+    return this.serial(async () => {
+      await this.restorePending();
+      if (!this.options.providerBinding) throw new Error('Session provider binding is not configured.');
+      return this.options.providerBinding.resolve(this.configuration);
+    });
+  }
+
   startNextSubmission(): Promise<AgentSessionSubmissionResult | undefined> {
     return this.serial(async () => {
       await this.restorePending();
@@ -210,11 +220,14 @@ export class AgentSession {
 
   /** Per-client defaults for future response formatting; model changes use changeModel(). */
   configure(settings: Partial<Pick<AgentSessionConfiguration, 'responseFormat'>>): Promise<AgentSessionState> {
-    return this.serial(() => {
+    return this.serial(async () => {
       this.assertOpen();
       if (Object.keys(settings).some((key) => key !== 'responseFormat'))
         throw new Error('Model settings must be changed through changeModel().');
-      this.configuration = ownConfiguration({ ...this.configuration, ...settings });
+      await this.restorePending();
+      const configuration = ownConfiguration({ ...this.configuration, ...settings });
+      await this.options.providerBinding?.resolve(configuration);
+      this.configuration = configuration;
       this.emit({ type: 'configuration.changed', configuration: this.configuration });
       return this.state();
     });
@@ -270,7 +283,7 @@ export class AgentSession {
           reason: 'session_suspended',
           suspension: this.suspended.descriptor
         };
-      await this.options.prepareConfiguration?.(this.configuration, submissionInput(input));
+      const binding = await this.options.providerBinding?.resolve(this.configuration, submissionInput(input));
       const immediate = this.options.scheduling !== 'manual' && !this.active
         ? await this.acquireExecution() : false;
       const claimId = randomUUID();
@@ -289,6 +302,7 @@ export class AgentSession {
         throw error;
       }
       if (immediate && admitted.state !== 'claimed') await this.releaseExecution();
+      if (binding && this.options.providerBinding) this.options.providerBinding.commit(binding);
       this.configuration = ownConfiguration(admitted.configuration);
       const pending = pendingFromRecord(admitted, false, admitted.claimId);
       this.handles.set(submissionId, pending);
@@ -306,10 +320,11 @@ export class AgentSession {
     input: {
       readonly selection: ModelSelection;
       readonly profile: ModelProfile;
+      readonly provider?: ModelProvider;
       readonly artifacts: ArtifactRepository;
     }
   ): Promise<AgentSessionState> {
-    if (Object.keys(input).some(key => !['selection', 'profile', 'artifacts'].includes(key)))
+    if (Object.keys(input).some(key => !['selection', 'profile', 'provider', 'artifacts'].includes(key)))
       throw new TypeError('Unknown model change option.');
     const selection = parseModelSelection(input.selection);
     return this.serial(async () => {
@@ -319,9 +334,16 @@ export class AgentSession {
         throw new Error(
           'Settle or reconcile pending work and native result deliveries before changing models. Unknown effects remain unresolved.'
         );
-      if (input.profile.provider !== selection.provider || input.profile.id !== selection.model)
+      if (input.provider && !this.options.providerBinding)
+        throw new Error('Explicit provider replacement requires a session provider binding.');
+      const binding = await this.options.providerBinding?.resolve({
+        ...selection,
+        ...(this.configuration.responseFormat === undefined ? {} : { responseFormat: this.configuration.responseFormat })
+      }, undefined, input.provider);
+      const profile = binding?.profile ?? input.profile;
+      if (profile.provider !== selection.provider || profile.id !== selection.model)
         throw new Error('The target model profile does not match the selected configuration.');
-      assertModelRequestSupported(input.profile, {
+      assertModelRequestSupported(profile, {
         model: selection.model,
         messages: [],
         ...(selection.reasoning === undefined ? {} : { reasoning: selection.reasoning }),
@@ -334,10 +356,11 @@ export class AgentSession {
       await assertHistoryModelCompatibility({
         history: context.history,
         artifacts: input.artifacts,
-        profile: input.profile,
+        profile,
         representation: 'portable'
       });
       await this.options.repository.appendModelSettings(this.options.descriptor, selection);
+      if (binding && this.options.providerBinding) this.options.providerBinding.commit(binding);
       this.configuration = ownConfiguration({
         provider: selection.provider,
         model: selection.model,
@@ -807,8 +830,9 @@ export class AgentSession {
     configuration: AgentSessionConfiguration,
     resuming: boolean
   ): Promise<AgentRuntime> {
-    return Promise.resolve(this.options.prepareConfiguration?.(configuration, submissionInput(input))).then(() =>
-      this.options.createRuntime(
+    return Promise.resolve(this.options.providerBinding?.resolve(configuration, submissionInput(input))).then((binding) => {
+      if (binding && this.options.providerBinding) this.options.providerBinding.commit(binding);
+      return this.options.createRuntime(
         configuration,
         (event) => {
           this.emit({ type: 'run.progress', runId, event });
@@ -821,8 +845,8 @@ export class AgentSession {
             });
         },
         Object.freeze({ submissionId, runId, input, resuming })
-      )
-    );
+      );
+    });
   }
 
   private async settle(active: ActiveSubmission, result: AgentRunResult): Promise<void> {

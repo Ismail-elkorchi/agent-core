@@ -7,14 +7,22 @@ import {
 import { parseJsonObject } from '@agent-core/json';
 import * as z from 'zod';
 
-/** Fingerprints of host material whose placement is fixed by an admitted native prefix. */
-export const requestPresentationSchema = z.strictObject({
-  authority: z.string(),
-  context: z.string(),
-  sessionState: z.string(),
-  capacityNotice: z.string().optional(),
-  runInstructions: z.string()
+const contextPresentationSchema = z.strictObject({
+  kind: z.enum(['host-context', 'runtime-notice']),
+  applicability: z.literal('current-request'),
+  update: z.literal('replace'),
+  items: z.array(z.strictObject({ id: z.string().min(1), revision: z.string().min(1) }).readonly()).readonly(),
+  fingerprint: z.string().min(1)
 });
+
+/** Exact current material selection whose placement is fixed by an admitted native prefix. */
+export const requestPresentationSchema = z.strictObject({
+  runtimeControl: z.strictObject({ kind: z.literal('context-recovery'), id: z.string().min(1), revision: z.string().min(1) }).readonly().optional(),
+  authority: z.string(),
+  context: contextPresentationSchema.extend({ kind: z.literal('host-context') }).readonly(),
+  capacityNotice: contextPresentationSchema.extend({ kind: z.literal('runtime-notice') }).readonly(),
+  runInstructions: z.string()
+}).readonly();
 export type RequestPresentation = z.infer<typeof requestPresentationSchema>;
 export interface AdmittedModelInput {
   readonly runId: string;

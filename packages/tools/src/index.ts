@@ -22,3 +22,5 @@ export * from './core/text.js';
 export * from './core/workspace-files.js';
 
 export * from './core/text-edits.js';
+
+export * from './artifact-read/index.js';

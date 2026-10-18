@@ -137,6 +137,8 @@ function sessionEntries(
           text: `Session branched${entry.label === undefined ? '' : ` · ${entry.label}`}`
         }
       ];
+    case 'session_state_batch':
+      return [{ id, kind: 'notice', tone: 'info', text: 'Working material saved; the active context is unchanged.' }];
     case 'model_settings':
       return [];
   }

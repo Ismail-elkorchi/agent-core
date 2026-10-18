@@ -27,7 +27,7 @@ export interface NativeGenerationSettlement {
   readonly result: InferenceResult;
 }
 export interface NativeInferenceInput extends InferenceIdentity {
-  readonly sessionStateRevisionId?: () => string | null;
+  readonly stateSelectionId?: () => string | null;
   readonly capturedHistoryCut?: () => HistorySourceCut | undefined | Promise<HistorySourceCut | undefined>;
   readonly request: ModelRequest;
   readonly compiled: CompiledModelRequest;

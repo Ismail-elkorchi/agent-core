@@ -1,3 +1,4 @@
+import { createReadArtifactTool } from '@agent-core/tools';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
@@ -24,7 +25,6 @@ import {
   execCommandTool,
   findFilesTool,
   listDirectoryTool,
-  readArtifactTool,
   readFilesTool,
   searchTextTool,
   stopProcessTool,
@@ -32,6 +32,8 @@ import {
   writeStdinTool
 } from '@agent-core/tools-local';
 import { invokePlannedForTest } from '../tool-call-helpers.js';
+
+const readArtifactTool = createReadArtifactTool({ maxReadBytes: 2_000_000 });
 
 const builtins = [
   listDirectoryTool,

@@ -41,7 +41,8 @@ export function createHistoryTools(options: {
             'observation',
             'branch',
             'model_settings',
-            'context_transition'
+            'context_transition',
+            'session_state_batch'
           ])
           .optional(),
         role: z.enum(['user', 'assistant', 'tool', 'control']).optional(),

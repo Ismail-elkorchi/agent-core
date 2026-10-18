@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { canonicalJsonString } from '@agent-core/json';
 import { randomUUID } from 'node:crypto';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
@@ -26,6 +27,17 @@ export interface EventCodec<T extends TypedEvent> extends RuntimeCodec<T> {
   /** Small, declared equality indexes over routing facts, never event bodies. */
   readonly metadataIndexes?: readonly EventMetadataIndex[];
   metadata?(value: T): Readonly<Record<string, string>>;
+}
+
+/** Capture the codec boundary once, before any source or index publication. */
+export function captureEventForAppend<TEvent extends TypedEvent>(codec: EventCodec<TEvent>, value: TEvent, indexes: readonly EventMetadataIndex[]) {
+  const encoded = parseJsonObject(codec.encode(value), EVENT_LIMITS);
+  const event = codec.decode(encoded);
+  if (typeof encoded.type !== 'string' || encoded.type.length === 0 || event.type !== encoded.type)
+    throw new TypeError('Event codec returned an invalid or inconsistent event type.');
+  const metadata = parseEventMetadata(codec.metadata?.(event) ?? {});
+  const routeKeys = eventMetadataRouteKeys(indexes,encoded.type,metadata);
+  return Object.freeze({encoded,event,metadata,routeKeys,type:encoded.type});
 }
 
 export function parseEventMetadata(value: unknown): Readonly<Record<string, string>> {
@@ -224,6 +236,8 @@ export interface EventRepository<TEvent extends TypedEvent> {
     event: TEvent,
     options: ConditionalEventAppendOptions
   ): Promise<ConditionalEventAppendResult>;
+  /** Holds stream append ownership through publication. The callback must not call this event repository. */
+  withDriverGeneration<T>(runId: string, generation: number, operation: () => Promise<T>): Promise<T>;
   tail(runId: string, options?: EventIndexReadOptions): Promise<EventLedgerTail>;
   latest(runId: string): Promise<EventEnvelope<TEvent> | undefined>;
   latestOfType(runId: string, type: TEvent['type']): Promise<EventEnvelope<TEvent> | undefined>;
@@ -267,6 +281,15 @@ export class PersistenceConflictError extends Error {
   }
 }
 
+/** Publication was fenced by a newer durable run driver. */
+export class PersistenceDriverOwnershipLostError extends PersistenceConflictError {
+  readonly code = 'driver_ownership_lost';
+  constructor(readonly runId: string, readonly expectedGeneration: number, readonly actualGeneration: number) {
+    super('Run driver ownership was lost.');
+    this.name = 'PersistenceDriverOwnershipLostError';
+  }
+}
+
 /** Metadata-only reads cannot repair derived indexes by hydrating event bodies. */
 export class PersistenceIndexRecoveryRequiredError extends PersistenceConflictError {
   readonly code = 'index_recovery_required';
@@ -284,6 +307,7 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
   private readonly metadataRoutes = new Map<string, Map<string, number[]>>();
   private readonly decoded = new WeakMap<EncodedEnvelope, TEvent>();
   private queue: Promise<void> = Promise.resolve();
+  private readonly ownershipScope = new AsyncLocalStorage<boolean>();
   private readonly metadataIndexes: readonly EventMetadataIndex[];
   constructor(private readonly codec: EventCodec<TEvent>) {
     this.metadataIndexes = ownEventMetadataIndexes(codec.metadataIndexes);
@@ -294,9 +318,11 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
     event: TEvent,
     options: EventAppendOptions = {}
   ): Promise<EventAppendReceipt> {
+    if (this.ownershipScope.getStore()) return Promise.reject(new Error('Event repository access inside ownership publication is not allowed.'));
     const operation = this.queue.then(() => {
       assertIdentifier(runId, 'runId');
-      const encodedEvent = this.codec.encode(event);
+      const captured = captureEventForAppend(this.codec,event,this.metadataIndexes);
+      const encodedEvent = captured.encoded;
       const records = this.records.get(runId) ?? [];
       const idempotencyKey = options.idempotencyKey;
       const existing = idempotencyKey
@@ -314,7 +340,7 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
         sequence: records.length,
         timestamp: options.timestamp ?? new Date().toISOString(),
         schemaVersion: '1',
-        actor: options.actor ?? inferActor(event.type),
+        actor: options.actor ?? inferActor(captured.type),
         event: encodedEvent,
         ...(options.causationId ? { causationId: options.causationId } : {}),
         ...(options.correlationId ? { correlationId: options.correlationId } : {}),
@@ -323,9 +349,15 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
         driverGeneration: previous?.driverGeneration ?? 0
       });
       const encodedEnvelope: EncodedEnvelope = Object.freeze({ ...base, hash: hashJson(base) });
+      const routing = Object.freeze({
+        reference:Object.freeze({runId,eventId:encodedEnvelope.eventId,sequence:encodedEnvelope.sequence,hash:encodedEnvelope.hash}),
+        type:captured.type,timestamp:encodedEnvelope.timestamp,bytes:Buffer.byteLength(canonicalJsonString(encodedEnvelope)) + 1,metadata:captured.metadata
+      });
+      // Everything capable of rejecting caller/codec data has completed before publication.
       records.push(encodedEnvelope);
       this.records.set(runId, records);
-      this.rememberType(runId, encodedEnvelope);
+      this.decoded.set(encodedEnvelope,captured.event);
+      this.rememberType(runId, encodedEnvelope,routing,captured.routeKeys);
       return receiptFromEncoded(encodedEnvelope);
     });
     this.queue = operation.then(
@@ -340,11 +372,13 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
     event: TEvent,
     options: ConditionalEventAppendOptions
   ): Promise<ConditionalEventAppendResult> {
+    if (this.ownershipScope.getStore()) return Promise.reject(new Error('Event repository access inside ownership publication is not allowed.'));
     const operation = this.queue.then(() => {
       assertIdentifier(runId, 'runId');
       assertConditionalOptions(options);
       assertIdentifier(options.idempotencyKey, 'idempotencyKey');
-      const encodedEvent = this.codec.encode(event);
+      const captured = captureEventForAppend(this.codec,event,this.metadataIndexes);
+      const encodedEvent = captured.encoded;
       const records = this.records.get(runId) ?? [];
       const currentTail = tailFromEncoded(records.at(-1));
       const existing = records.find((record) => record.idempotencyKey === options.idempotencyKey);
@@ -386,7 +420,7 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
         sequence: records.length,
         timestamp: options.timestamp ?? new Date().toISOString(),
         schemaVersion: '1',
-        actor: options.actor ?? inferActor(event.type),
+        actor: options.actor ?? inferActor(captured.type),
         event: encodedEvent,
         ...(options.causationId ? { causationId: options.causationId } : {}),
         ...(options.correlationId ? { correlationId: options.correlationId } : {}),
@@ -395,9 +429,15 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
         driverGeneration: options.driverGeneration
       });
       const encodedEnvelope: EncodedEnvelope = Object.freeze({ ...base, hash: hashJson(base) });
+      const routing = Object.freeze({
+        reference:Object.freeze({runId,eventId:encodedEnvelope.eventId,sequence:encodedEnvelope.sequence,hash:encodedEnvelope.hash}),
+        type:captured.type,timestamp:encodedEnvelope.timestamp,bytes:Buffer.byteLength(canonicalJsonString(encodedEnvelope)) + 1,metadata:captured.metadata
+      });
+      // Everything capable of rejecting caller/codec data has completed before publication.
       records.push(encodedEnvelope);
       this.records.set(runId, records);
-      this.rememberType(runId, encodedEnvelope);
+      this.decoded.set(encodedEnvelope,captured.event);
+      this.rememberType(runId, encodedEnvelope,routing,captured.routeKeys);
       const tail = tailFromEncoded(encodedEnvelope);
       return Object.freeze({
         kind: 'committed' as const,
@@ -412,8 +452,22 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
     return operation;
   }
 
+  withDriverGeneration<T>(runId: string, generation: number, publish: () => Promise<T>): Promise<T> {
+    if (this.ownershipScope.getStore()) return Promise.reject(new Error('Event repository access inside ownership publication is not allowed.'));
+    const operation = this.queue.then(async () => {
+      assertIdentifier(runId, 'runId');
+      if (!Number.isSafeInteger(generation) || generation < 0) throw new TypeError('Invalid driver generation.');
+      const actual = tailFromEncoded(this.records.get(runId)?.at(-1)).driverGeneration;
+      if (actual !== generation) throw new PersistenceDriverOwnershipLostError(runId,generation,actual);
+      return this.ownershipScope.run(true, publish);
+    });
+    this.queue = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
   tail(runId: string, _options?: EventIndexReadOptions): Promise<EventLedgerTail> {
     void _options;
+    if (this.ownershipScope.getStore()) return Promise.reject(new Error('Event repository access inside ownership publication is not allowed.'));
     const operation = this.queue.then(() => {
       assertIdentifier(runId, 'runId');
       return tailFromEncoded(this.records.get(runId)?.at(-1));
@@ -426,6 +480,7 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
   }
 
   latest(runId: string): Promise<EventEnvelope<TEvent> | undefined> {
+    if (this.ownershipScope.getStore()) return Promise.reject(new Error('Event repository access inside ownership publication is not allowed.'));
     const operation = this.queue.then(() => {
       assertIdentifier(runId, 'runId');
       const encoded = this.records.get(runId)?.at(-1);
@@ -441,6 +496,7 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
   }
 
   latestOfType(runId: string, type: TEvent['type']): Promise<EventEnvelope<TEvent> | undefined> {
+    if (this.ownershipScope.getStore()) return Promise.reject(new Error('Event repository access inside ownership publication is not allowed.'));
     const operation = this.queue.then(() => {
       assertIdentifier(runId, 'runId');
       assertIdentifier(type, 'type');
@@ -626,17 +682,9 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
     return event;
   }
 
-  private rememberType(runId: string, encoded: EncodedEnvelope): void {
-    const type = encoded.event.type;
-    if (typeof type !== 'string') throw new TypeError('Encoded event type is invalid.');
-    this.routing.set(encoded, Object.freeze({
-      reference: Object.freeze({ runId, eventId: encoded.eventId, sequence: encoded.sequence, hash: encoded.hash }),
-      type,
-      timestamp: encoded.timestamp,
-      bytes: Buffer.byteLength(canonicalJsonString(encoded)) + 1,
-      metadata: parseEventMetadata(this.codec.metadata?.(this.domainEvent(encoded)) ?? {})
-    }));
-    for (const routeKey of eventMetadataRouteKeys(this.metadataIndexes, type, this.routing.get(encoded)?.metadata ?? {})) {
+  private rememberType(runId: string, encoded: EncodedEnvelope, routing: EventSourceMetadata, routeKeys: readonly string[]): void {
+    this.routing.set(encoded,routing);
+    for (const routeKey of routeKeys) {
       const routes = this.metadataRoutes.get(runId) ?? new Map<string, number[]>();
       const sequences = routes.get(routeKey) ?? [];
       sequences.push(encoded.sequence);
@@ -649,7 +697,7 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
       this.byKey.set(runId, keys);
     }
     const index = this.latestByType.get(runId) ?? new Map<string, EncodedEnvelope>();
-    index.set(type, encoded);
+    index.set(routing.type, encoded);
     this.latestByType.set(runId, index);
   }
 }

@@ -32,6 +32,18 @@ export type PromptContextItemInput = Omit<PromptContextItem, 'id' | 'tokenEstima
   readonly tokenEstimate?: number;
 };
 
+/** Exact current applicability of replaceable material in one admitted request.
+ * Absence is an empty item list, not an instruction to retain the prior selection.
+ * Original source/history records remain evidence independently of this selection.
+ */
+export interface PromptContextPresentation {
+  readonly kind: 'host-context' | 'runtime-notice';
+  readonly applicability: 'current-request';
+  readonly update: 'replace';
+  readonly items: readonly { readonly id: string; readonly revision: string }[];
+  readonly fingerprint: string;
+}
+
 export interface PromptContextDelivery {
   readonly items: readonly PromptContextItem[];
   readonly totalTokens: number;
@@ -58,14 +70,21 @@ export interface PromptOutputContract {
   readonly description: string;
 }
 
+/** Bounded runtime-owned request control; it never replaces application authority. */
+export interface PromptRuntimeControl {
+  readonly kind: 'context-recovery';
+  readonly id: string;
+  readonly content: string;
+}
+
 /** Typed material selected by the application and runtime before message framing. */
 export interface PromptMaterial {
   readonly id: string;
   readonly task: string;
+  readonly runtimeControl?: Pick<PromptRuntimeControl, 'kind' | 'id'>;
   readonly images?: readonly import('../session/images.js').SessionImageInput[];
   readonly instructions: readonly PromptInstructionBlock[];
   readonly context: readonly PromptContextItem[];
-  readonly sessionState?: PromptContextItem;
   readonly capacityNotice?: PromptContextItem;
   readonly tools: readonly PromptToolSummary[];
   readonly outputContract?: PromptOutputContract;
@@ -160,6 +179,7 @@ export function createPromptMaterial(
   return Object.freeze({
     ...input,
     id: input.id ?? `material_${randomUUID()}`,
+    ...(input.runtimeControl ? { runtimeControl: Object.freeze({ ...input.runtimeControl }) } : {}),
     ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
     instructions: Object.freeze(input.instructions.map((item) => Object.freeze({ ...item }))),
     context: Object.freeze([...input.context]),

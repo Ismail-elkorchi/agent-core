@@ -76,7 +76,10 @@ async function fixture({ budget, sourceBound = 100000, targetCapacity = 25000,
       contextProvider: request => { contextCollections.push(request); return []; },
       recordLogicalRequest: request => { logicalRequests.push(request); },
       repositories: { events, artifacts, session: { repository: sessions, descriptor } },
-      tools: [domain, ...context.toolDefinitions(), ...createHistoryTools({ history })],
+      // These scenarios activate history selections without narrative mutations. Keep
+      // their fixed-capacity catalog scoped to the exercised context operations.
+      tools: [domain, ...context.toolDefinitions().filter(tool => ['context_inspect', 'context_transition'].includes(tool.name)),
+        ...createHistoryTools({ history })],
       toolPolicy: { allowedRisks: ['read', 'write'] },
       toolBoundary: { authorizationPolicyId: 'recovery-accounting-test', executionTargetId: 'recovery-accounting-test' },
       maxOutputTokens: 4096,
@@ -234,7 +237,8 @@ test('successful distinct recovery boundaries exceed four requests while retaini
     const readMetadata = f.events.readMetadataRange.bind(f.events);
     f.events.readMetadataRange = async (runId, query) => {
       const page = await readMetadata(runId, query);
-      if (query?.types?.includes('turn.snapshot.created')) boundaryReads.push({ query, scanned: page.scanned });
+      if (query?.types?.includes('turn.snapshot.created') && query.metadata?.recoveryBoundary)
+        boundaryReads.push({ query, scanned: page.scanned });
       return page;
     };
     // Derive the allowance from the same completed work, rather than assuming a

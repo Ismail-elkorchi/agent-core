@@ -140,7 +140,7 @@ for (const id of providerIds) {
     assert.deepEqual(resumed.reasoning, firstRequest.logicalRequest.reasoning);
     assert.equal(resumed.temperature, firstRequest.logicalRequest.temperature);
     assert.equal(resumed.responseFormat, options.responseFormat);
-    assert.equal((await context.sessionState()).revision, null);
+    assert.equal((await context.sessionState()).id, null);
     const usage = await service.settledRunUsage('continue', 'continue');
     assert.equal(usage.invocations, 1);
     assert.equal(usage.usage.promptTokens, 20);
@@ -218,7 +218,7 @@ for (const id of ['openai', 'openai-codex', 'openrouter', 'claude']) {
         inspected.admission.accounting.unknownComponents.length > 0,
         'uncertainty remains explicit'
       );
-    assert.equal(inspected.sessionState.revisionId, null);
+    assert.equal(inspected.sessionState.selectionId, null);
   });
 }
 
@@ -319,7 +319,7 @@ for (const id of providerIds) {
         window,
         task,
         instructions: [{ id: 'authority', role: 'system', content: guidance }],
-        sessionState: state(text),
+        contextItems: [state(text)],
         tools: [],
         modelProfile: profile
       });

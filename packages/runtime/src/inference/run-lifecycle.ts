@@ -455,7 +455,7 @@ export async function invokeRunInference(input: RunInferenceInput): Promise<RunI
   const governed = createRunInferenceLifecycle({ ...input, operation: 'generation' });
   return input.service.invokeWithLifecycle(
     {
-      sessionStateRevisionId: input.requestFingerprint.sessionStateRevisionId,
+      stateSelectionId: input.requestFingerprint.stateSelectionId,
       capturedHistoryCut: input.capturedHistoryCut,
       request: input.request,
       compiled: input.compiled,

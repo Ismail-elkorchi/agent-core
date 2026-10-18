@@ -934,7 +934,7 @@ test('session branches require stable boundaries and record assistant turns once
   const input = await repository.appendInput(session, { runId: 'run', task: 'work' });
   await assert.rejects(
     repository.branchFrom(session, input.id),
-    /completed final or context transition/u
+    /completed final, state batch, or context transition/u
   );
   await repository.appendAssistant(session, {
     runId: 'run',

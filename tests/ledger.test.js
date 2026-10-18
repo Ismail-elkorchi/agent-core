@@ -496,7 +496,7 @@ for (const kind of ['memory', 'jsonl']) {
       filtered.records.map((record) => record.sequence),
       [24]
     );
-    assert.equal(decoded - before, 1, 'unrelated indexed event types are not decoded');
+    assert.equal(decoded - before, kind === 'memory' ? 0 : 1, 'memory reuses append-validated events; unrelated indexed event types are not decoded');
     assert.ok(filtered.bytes <= 4096);
     const reference = await events.referenceByKey('range', 'item:24');
     assert.equal((await events.readReference(reference)).event.text.length, 2000);

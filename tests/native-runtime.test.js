@@ -514,6 +514,10 @@ for (const publication of ['normal', 'lost_receipt', 'rejected', 'append_noop_fr
     let freshRequests = 0;
     const body1 = 'Retain the rationale.';
     const body2 = 'Retain the corrected rationale.';
+    let currentStateRef;
+    const stateOperations = text => [currentStateRef
+      ? { kind: 'replace', itemId: currentStateRef.itemId, expectedRevisionId: currentStateRef.revisionId, text }
+      : { kind: 'create', text }];
     const provider = new OpenAIProvider({
       apiKey: 'fixture', transport: 'websocket',
       webSocketFactory: () => {
@@ -525,16 +529,16 @@ for (const publication of ['normal', 'lost_receipt', 'rejected', 'append_noop_fr
           const id = publication === 'append_noop_fresh' ? `continuation-${frames.length}` : fresh ? `r${freshRequests}` : `ack${freshRequests}`;
           const ordinaryOutput = !fresh || freshRequests === 3 || (publication === 'rejected' && freshRequests > 1)
             ? message(fresh ? 'Finished.' : 'Selection requested.')
-            : [{ ...call(id + '-state', 'context_transition'), arguments: JSON.stringify({
+            : [{ ...call(id + '-state', 'context_save_and_activate'), arguments: JSON.stringify({
               reason: 'Revise useful understanding.', renewal: true,
-              sessionState: { blocks: [{ text: freshRequests === 1 ? body1 : body2 }] }
+              operations: stateOperations(freshRequests === 1 ? body1 : body2)
             }) }];
           const turn = frames.length;
           const output = publication !== 'append_noop_fresh' ? ordinaryOutput
             : [1, 3, 5, 7].includes(turn)
-              ? [{ ...call(id + '-state', 'context_transition'), arguments: JSON.stringify({
+              ? [{ ...call(id + '-state', [3, 7].includes(turn) ? 'context_transition' : 'context_save_and_activate'), arguments: JSON.stringify({
                   reason: 'Preserve transport until deliberate renewal.',
-                  sessionState: { blocks: [{ text: turn <= 3 ? body1 : body2 }] },
+                  ...([3, 7].includes(turn) ? {} : { operations: stateOperations(turn === 1 ? body1 : body2) }),
                   ...(turn === 7 ? { renewal: true } : {})
                 }) }]
               : message(turn === 9 ? 'Finished.' : 'Selection requested.');
@@ -553,6 +557,7 @@ for (const publication of ['normal', 'lost_receipt', 'rejected', 'append_noop_fr
       await new Promise(resolve => setImmediate(resolve));
       assert.equal(frames.length, before, 'A native successor cannot be sent while state publication is pending');
       const entry = await commit(...args);
+      if (entry.sessionState) currentStateRef = entry.sessionState.revisions[0];
       if (publication === 'lost_receipt' && !receiptLost) {
         receiptLost = true;
         throw new Error('Lost admitted state receipt');
@@ -575,7 +580,7 @@ for (const publication of ['normal', 'lost_receipt', 'rejected', 'append_noop_fr
       context,
       inferenceService: inference,
       tools: context.toolDefinitions(),
-      toolPolicy: { allowedRisks: ['write'] },
+      toolPolicy: { allowedRisks: ['read', 'write'] },
       toolBoundary: { authorizationPolicyId: 'native-state', executionTargetId: 'native-state' },
       repositories: { events, artifacts, session: { repository: sessions, descriptor } }
     }).run({ task: 'Correct the understanding and finish.' }).result;
@@ -588,7 +593,8 @@ for (const publication of ['normal', 'lost_receipt', 'rejected', 'append_noop_fr
     assert.deepEqual(sources.map(entry => entry.source.eventId), receipts.map(record => record.eventId));
     if (publication === 'rejected') {
       assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-      assert.equal((await context.sessionState()).revision, null);
+      assert.equal((await context.sessionState()).id, null);
+      assert.deepEqual((await context.listSessionState()).items, [], 'Rejected atomic activation publishes no saved revisions');
       assert.equal(frames.length, 3);
       assert.ok(!frames[2].input.some(item => item.role === 'user' && JSON.stringify(item).includes(body1)),
         'Rejected state is never dispatched; unchanged original context may continue');
@@ -600,7 +606,15 @@ for (const publication of ['normal', 'lost_receipt', 'rejected', 'append_noop_fr
     const { branch } = await sessions.loadReplayState(descriptor);
     const revisions = branch.filter((entry) => entry.type === 'context_transition' && entry.sessionState);
     assert.equal(revisions.length, 2, JSON.stringify((await Array.fromAsync(events.read(result.terminal.runId))).filter(({event}) => event.type === 'context.transition.rejected')));
-    assert.equal((await context.sessionState()).content.blocks[0].text, body2);
+    const selectedState = await context.sessionState();
+    assert.equal(selectedState.items.length, 1, 'Replacement selects one current item revision');
+    assert.equal(selectedState.items[0].text, body2);
+    const originalRef = revisions[0].window.selection.sessionState[0];
+    const correctedRef = revisions[1].window.selection.sessionState[0];
+    assert.equal(originalRef.itemId, correctedRef.itemId);
+    assert.notEqual(originalRef.revisionId, correctedRef.revisionId);
+    assert.equal((await context.readSessionState(originalRef)).text, body1, 'Replacing the active item preserves immutable historical understanding');
+    assert.equal((await context.listSessionState()).items.length, 1);
     if (publication === 'append_noop_fresh') {
       assert.equal(frames.length, 9);
       assert.equal(sockets.length, 2, 'Append and no-op retain the actual native socket; only explicit renewal replaces it.');
@@ -617,7 +631,7 @@ for (const publication of ['normal', 'lost_receipt', 'rejected', 'append_noop_fr
       assert.ok(JSON.stringify(frames[2]).includes(body1));
       assert.ok(JSON.stringify(frames[6]).includes(body2));
       assert.equal(frames[8].previous_response_id, undefined);
-      assert.ok(!JSON.stringify(frames[8]).includes('Session state replacement'));
+      assert.ok(!JSON.stringify(frames[8]).includes('context-selection-replacement'));
     } else {
       assert.equal(frames.length, 5);
       assert.equal(sockets.length, 3, 'Each explicitly requested fresh renewal opens a fresh provider session');
@@ -632,7 +646,8 @@ for (const publication of ['normal', 'lost_receipt', 'rejected', 'append_noop_fr
     const originatingInput = JSON.parse(
       new TextDecoder().decode(await artifacts.readVerified(revisions[1].sessionState.inference.requestRef))
     );
-    assert.equal(originatingInput.sessionStateRevisionId, revisions[0].id);
+    const originalView = await context.selectedSessionState(revisions[0].window.selection.sessionState);
+    assert.equal(originatingInput.stateSelectionId, originalView.id);
     assert.ok(JSON.stringify(originatingInput.logical).includes(body1));
     assert.notEqual(
       revisions[0].sessionState.inference.requestRef.sha256,
@@ -829,8 +844,8 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) {
         frames.push(body);
         if (body.type === 'response.steer') {
           ws.feed({ type: 'response.steer.accepted', steer: { id: 'state-steer', previous_response_id: 'r1' } },
-            { type: 'response.completed', response: response('r1', [{ ...call('state-call', 'context_transition'),
-              arguments: JSON.stringify({ reason: 'Remember the corrected understanding.', renewal: true, sessionState: { blocks: [{ text }] } }) }]) });
+            { type: 'response.completed', response: response('r1', [{ ...call('state-call', 'context_save_and_activate'),
+              arguments: JSON.stringify({ reason: 'Remember the corrected understanding.', renewal: true, operations: [{ kind: 'create', text }] }) }]) });
         } else if (!body.previous_response_id && frames.length === 1) {
           ws.feed({ type: 'response.created', response: { id: 'r1' } },
             { type: 'response.output_text.delta', response_id: 'r1', delta: 'Working.' });
@@ -853,7 +868,7 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) {
     const runId = `native-state-extension-${publication}`;
     const runtime = new AgentRuntime({ provider, model: 'gpt-6-astra', maxOutputTokens: 512,
       context, inferenceService: inference, tools: context.toolDefinitions(),
-      toolPolicy: { allowedRisks: ['write'] },
+      toolPolicy: { allowedRisks: ['read', 'write'] },
       toolBoundary: { authorizationPolicyId: 'native-extension-state', executionTargetId: 'native-extension-state' },
       repositories: { events, artifacts, session: { repository: sessions, descriptor } },
       onProgress(event) {
@@ -869,7 +884,8 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) {
       assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
       assert.equal(commits, 0);
       assert.equal(transitions.length, 0);
-      assert.equal((await context.sessionState()).revision, null);
+      assert.equal((await context.sessionState()).id, null);
+      assert.deepEqual((await context.listSessionState()).items, [], 'Rejected atomic activation publishes no saved revisions');
       assert.equal(frames.length, 4, 'Rejected state is omitted from the unchanged continuation');
       assert.equal(connections, 1, 'A rejected renewal must preserve the original provider session.');
       assert.equal(resultDeliveries, 1, 'The original mandatory result is delivered exactly once.');
@@ -883,15 +899,15 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) {
     assert.equal(frames.length, 4);
     assert.equal(connections, 2);
     assert.equal(resultDeliveries, 1);
-    assert.equal((await context.sessionState()).content.blocks[0].text, text);
+    assert.equal((await context.sessionState()).items[0].text, text);
     const extension = audit.find(({ event }) => event.type === 'inference.extended').event;
     const origin = await inference.sessionStateOrigin(runId, extension.invocationId);
-    assert.equal(origin.revisionId, null, 'Steering stays bound to the old state until fresh admission');
+    assert.equal(origin.stateSelectionId, null, 'Steering stays bound to the old state until fresh admission');
     assert.ok(origin.capturedHistoryCut.sourceRevision > 0);
     const starts = audit.filter(({ event }) => event.type === 'inference.started');
     const fresh = starts.at(-1).event;
     const freshOrigin = await inference.sessionStateOrigin(runId, fresh.invocationId);
-    assert.equal(freshOrigin.revisionId, transitions[0].id);
+    assert.equal(freshOrigin.stateSelectionId, (await context.sessionState()).id);
     const input = JSON.parse(new TextDecoder().decode(await artifacts.readVerified(freshOrigin.inference.requestRef)));
     assert.ok(JSON.stringify(input.logical).includes(text));
     assert.equal(audit.filter(({ event }) => event.type === 'inference.uncertain').length, 0);

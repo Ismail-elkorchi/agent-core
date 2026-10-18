@@ -90,6 +90,9 @@ test('restricted recovery uses the ordinary executor and restores original appli
   assert.ok(f.recoveryRequests().length > 0);
   assert.ok(f.recoveryRequests()[0].messages.some(item => item.content.includes('x'.repeat(24000))), 'The checkpoint sees the complete original material.');
   assert.equal(f.effects(), 0);
+  assert.deepEqual((await f.options().context.listSessionState()).items, [], 'Successful recovery requires no state write.');
+  assert.match(f.recoveryRequests()[0].messages.at(-1).content, /proceed without a state write/);
+  assert.doesNotMatch(f.recoveryRequests()[0].messages.at(-1).content, /Submit state and selection together/);
   const log = await records(f, 'recover');
   assert.ok(log.some(event => event.type === 'tool.started' && event.toolName === 'context_transition'));
   assert.ok(log.some(event => event.type === 'turn.snapshot.created' && event.snapshot.contextRecovery));
@@ -199,7 +202,7 @@ test('recovery rejects unbounded reads, malformed state, and retired continuatio
     assert.equal(f.recoveryRequests().length, attempts, 'Malformed transition input may receive one bounded correction attempt before unchanged-action suspension.');
     assert.ok(!(await records(f, 'restricted')).some(event => event.type === 'tool.started'));
     assert.equal(f.effects(), 0);
-    assert.equal((await options.context.sessionState()).revision, null);
+    assert.equal((await options.context.sessionState()).id, null);
     assert.equal((await f.sessions.loadReplayState(f.descriptor)).branch.filter(entry => entry.type === 'context_transition').length, 0);
     const durableAttempts = (await records(f, 'restricted')).filter(event => event.type === 'turn.snapshot.created' && event.snapshot.contextRecovery);
     assert.equal(durableAttempts.length, attempts);
@@ -319,21 +322,31 @@ test('inspection reports an impossible whole-envelope bound without dropping pro
 });
 
 
-test('paged inspection of large session state reads only metadata and retains an authorized exact-source reference', async (t) => {
-  const f = await fixture({ sourceBytes: 64, sourceBound: 100000, targetCapacity: 64000 });
-  const context = f.options().context;
+async function seedSelectedState(f, text, id) {
   const cut = await f.history.capture();
   const requestRef = await f.artifacts.storeProtected({ label: 'state-origin', mediaType: 'application/json',
-    content: new TextEncoder().encode(JSON.stringify({ sessionStateRevisionId: null, logical: { model: 'fixture', messages: [] } })) });
-  const body = JSON.stringify({ blocks: [{ text: 'GENERATED-STATE ' + 'x'.repeat(52000) }] });
-  const sessionState = { id: 'large-session-state', previousRevisionId: null, capturedHistoryCut: cut,
-    content: JSON.parse(body),
-    inference: { ownerId: 'owner', invocationId: 'state-origin', requestRef } };
+    content: new TextEncoder().encode(JSON.stringify({ stateSelectionId: null, capturedHistoryCut: cut,
+      logical: { model: 'fixture', messages: [] } })) });
+  const context = new ContextService({ repository: f.sessions, session: f.descriptor, history: f.history, artifacts: f.artifacts,
+    assertStateWrite: async batch => {
+      assert.deepEqual(batch.inference, { ownerId: 'owner', invocationId: id, requestRef });
+      assert.deepEqual(batch.capturedHistoryCut, cut);
+    }, policy: { maxSourceBytes: 100000, historyRead: { history: f.history, isAvailable: () => true } } });
+  const staged = await context.stageSessionState({ idempotencyKey: id, branchId: cut.branchId, capturedHistoryCut: cut,
+    inference: { ownerId: 'owner', invocationId: id, requestRef }, operations: [{ kind: 'create', text }] });
+  const refs = staged.revisions.map(({ itemId, revisionId }) => ({ itemId, revisionId }));
   const update = await context.transition({ expectedWindowId: (await context.history.selectedContext(cut))?.windowId ?? null,
-    expectedSourceRevision: cut.sourceRevision, sessionState, renewal: true, idempotencyKey: 'large-session-state', reason: 'Fixture admitted state',
-    selection: await context.selectSources(cut, {}) },
+    expectedSourceRevision: cut.sourceRevision, sessionState: staged, renewal: true, idempotencyKey: `${id}-activate`,
+    reason: 'Fixture admitted exact state selection', selection: await context.selectSources(cut, { sessionState: refs }) },
     { admit: admitContext });
   assert.equal(update.transition.admission.status, 'admitted');
+  return { context, refs };
+}
+
+test('paged inspection of large session state reads only metadata and retains exact revision range retrieval', async t => {
+  const f = await fixture({ sourceBytes: 64, sourceBound: 100000, targetCapacity: 64000 });
+  const text = 'GENERATED-STATE ' + 'x'.repeat(52000);
+  const { context, refs } = await seedSelectedState(f, text, 'large-session-state');
   const reads = [];
   for (const method of ['readVerified', 'readVerifiedRange']) {
     const original = f.artifacts[method].bind(f.artifacts);
@@ -342,17 +355,25 @@ test('paged inspection of large session state reads only metadata and retains an
   const page = await inspectPresentation(context);
   assert.ok(Buffer.byteLength(page.text) <= 8192);
   assert.deepEqual(reads, []);
-  assert.equal(page.value.sessionState.revisionId, 'large-session-state');
+  assert.equal(page.value.sessionState.selectedCount, 1);
+  assert.equal(page.value.sessionState.selectedCoverage, 'partial');
+  const selectedPage = await context.listSelectedSessionState({ limit: 1, maxBytes: 2048 });
+  assert.deepEqual(selectedPage.items, refs);
+  assert.equal(selectedPage.coverage, 'complete');
   assert.equal(page.value.sessionState.content, undefined);
-  assert.equal(page.value.sessionState.complete, false);
-  assert.equal(page.value.sessionState.totalBytes, Buffer.byteLength(body));
-  const retrieved = await f.history.read({ source: page.value.sessionState.source, maxBytes: 1024 });
-  assert.equal(retrieved.status, 'available');
-  assert.ok(retrieved.item.text.includes('GENERATED-STATE'));
-  assert.deepEqual(reads, [], 'Committed inline state is retrieved from its original journal record, not an artifact.');
+  const retrieved = await context.readSessionState({ ...refs[0], range: { offset: 0, bytes: 1024 } });
+  assert.ok(retrieved.text.startsWith('GENERATED-STATE'));
+  assert.equal(Buffer.byteLength(retrieved.text), 1024);
+  assert.deepEqual(retrieved.range, { offset: 0, bytes: 1024 });
+  const rangedReads = reads.filter(read => read.method === 'readVerifiedRange');
+  assert.equal(rangedReads.length, 1);
+  assert.deepEqual(rangedReads[0].args[1], { offset: 0, length: 1024 });
+  for (const read of reads) assert.deepEqual(read.args[0], rangedReads[0].args[0], 'Integrity verification must refer to the same selected artifact.');
+  reads.length = 0;
   const unpaged = await context.inspect();
-  assert.ok(unpaged.sessionState.preview.includes('GENERATED-STATE'));
-  assert.equal(unpaged.sessionState.complete, false);
+  assert.equal(unpaged.sessionState.stored.items[0].contentBytes, Buffer.byteLength(text));
+  assert.deepEqual(unpaged.sessionState.selected, refs);
+  assert.deepEqual(reads, [], 'Metadata inspection must not hydrate stored narrative bodies.');
 });
 
 test('admission, feedback, and inspection disclose the same compiled control reserve', async () => {
@@ -413,9 +434,9 @@ test('a short request still requires room to retain its large ordinary generatio
   assert.equal(result.state, 'suspended', JSON.stringify(result));
   assert.equal(result.reason, 'context_admission');
   assert.ok(f.recoveryRequests().length > 0);
-  const resumed = await new AgentRuntime({ ...options, maxOutputTokens: 8192 }).resume('large-output').result;
+  const resumed = await new AgentRuntime({ ...options, maxOutputTokens: 4096 }).resume('large-output').result;
   assert.equal(resumed.terminal?.executionStatus, 'completed', JSON.stringify(resumed));
-  assert.equal(f.requests.at(-1).maxOutputTokens, 8192);
+  assert.equal(f.requests.at(-1).maxOutputTokens, 4096);
 });
 
 test('ordinary turns and settled tool batches compile control probes without scanning durable recovery attempts', async t => {
@@ -481,28 +502,21 @@ test('recovery sees the current request independently of a twelve-item inventory
 });
 
 // Preview bounds are independent of state/source size and keep their original identity.
-test('oversized full-context state cannot be replaced by a bounded checkpoint preview', async () => {
+test('oversized selected state cannot be replaced by bounded checkpoint metadata', async () => {
   const f = await fixture({ accounting: 'estimated', sourceBound: 100000, targetCapacity: 14600 });
-  const options = f.options();
-  const context = options.context;
-  const cut = await f.history.capture();
-  const requestRef = await f.artifacts.storeProtected({ label: 'state-origin', mediaType: 'application/json',
-    content: new TextEncoder().encode(JSON.stringify({ sessionStateRevisionId: null, logical: { model: 'fixture', messages: [] } })) });
-  const sessionState = { id: 'preview-state', previousRevisionId: null, capturedHistoryCut: cut,
-    content: { blocks: [{ text: 'Important uncertainty: verify the original. ' + '文😀'.repeat(4000) }] },
-    inference: { ownerId: 'owner', invocationId: 'state-origin', requestRef } };
-  await context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
-    idempotencyKey: 'preview-state', sessionState, renewal: true, reason: 'Fixture admitted state', selection: await context.selectSources(cut, {}) },
-    { admit: admitContext });
-  const result = await new AgentRuntime(options).run({ runId: 'preview-recovery', task: 'Current scoped question.' }).result;
+  const text = 'Important uncertainty: verify the original. ' + '文😀'.repeat(4000);
+  const { context, refs } = await seedSelectedState(f, text, 'preview-state');
+  const result = await new AgentRuntime({ ...f.options(), context }).run({ runId: 'preview-recovery', task: 'Current scoped question.' }).result;
   assert.equal(result.state, 'suspended', JSON.stringify(result));
   assert.equal(result.contextAdmission.recovery, 'request_unavailable');
-  assert.equal(f.recoveryRequests().length, 0, 'A preview cannot replace the full state in a checkpoint.');
-  const preview = await context.inspectSessionState(undefined, 2048);
-  assert.equal(preview.complete, false);
-  assert.ok(Buffer.byteLength(preview.preview) <= 2048);
-  assert.match(preview.preview, /verify the original/);
-  assert.equal((await context.sessionState()).revision.id, 'preview-state');
+  assert.equal(f.recoveryRequests().length, 0, 'Bounded metadata cannot replace full selected state in a checkpoint.');
+  const inspection = await context.inspectSessionState(undefined, 2048);
+  assert.deepEqual(inspection.selected, refs);
+  assert.ok(Buffer.byteLength(JSON.stringify(inspection)) <= 2048);
+  assert.equal(inspection.stored.items[0].contentBytes, Buffer.byteLength(text));
+  const selected = await context.sessionState();
+  assert.equal(selected.items[0].revisionId, refs[0].revisionId);
+  assert.equal(selected.items[0].text, text);
 });
 
 test('oversized steering cannot be silently replaced by its bounded preview', async () => {

@@ -1,5 +1,5 @@
 import * as z from 'zod';
-import { artifactRefSchema } from '../process-output.js';
+import { artifactRefSchema } from './reference.js';
 
 export const readArtifactInputSchema = z.strictObject({
   artifactId: z.string().trim().min(1),

@@ -9,7 +9,7 @@ import { searchTextTool } from '../tools/search-text/definition.js';
 import { findFilesTool } from '../tools/find-files/definition.js';
 import { listDirectoryTool } from '../tools/list-directory/definition.js';
 import { createExecCommandTool } from '../tools/exec-command/definition.js';
-import { readArtifactTool } from '../tools/read-artifact/definition.js';
+import { createReadArtifactTool } from '@agent-core/tools';
 import { stopProcessTool } from '../tools/stop-process/definition.js';
 import { writeStdinTool } from '../tools/write-stdin/definition.js';
 
@@ -24,11 +24,13 @@ export function createWorkspaceToolHost(options: {
   readonly artifacts: ArtifactRepository;
   readonly commandExecution?: CommandExecution;
   readonly enabledTools: readonly string[];
+  readonly artifactReadMaxBytes: number;
   readonly configuration?: LocalToolConfiguration;
 }): WorkspaceToolHost {
   if (!isWorkspaceFiles(options.files)) throw new TypeError('Workspace tool host requires an adopted file authority.');
   const configuration = options.configuration === undefined
     ? DEFAULT_LOCAL_TOOL_CONFIGURATION : parseLocalToolConfiguration(options.configuration);
+  const readArtifact = createReadArtifactTool({ maxReadBytes: options.artifactReadMaxBytes });
   const commandExecution = options.commandExecution === undefined
     ? undefined : adoptCommandExecution(options.commandExecution);
   if (!commandExecution && options.enabledTools.some((name) =>
@@ -57,7 +59,7 @@ export function createWorkspaceToolHost(options: {
     writeStdinTool,
     stopProcessTool,
     viewImageTool,
-    readArtifactTool
+    readArtifact
   ]);
   const known = new Set(all.map((tool) => tool.name));
   const unknown = options.enabledTools.filter((name) => !known.has(name));

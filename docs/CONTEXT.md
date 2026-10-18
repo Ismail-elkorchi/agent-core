@@ -68,119 +68,129 @@ Applications can associate a contribution with a continuation, correction, side
 question, or task replacement. Those relationships remain distinct from whether
 delivery is immediate, steering, or queued.
 
-## Session state
+## Stored narrative items and admitted views
 
-A branch owns one current `SessionStateSnapshot`: revision metadata and one narrative
-`content` body. Revision metadata contains attribution, content digest, and byte size;
-it never duplicates that body. Content has one ordered `blocks` array. Each block
-contains `text` and optional exact history `sources`. Headings, qualifications,
-working notes, uncertainties, and trajectory can be expressed naturally in text;
-there is no mandatory taxonomy, item identity, workflow, or update schedule.
-`decodeSessionStateContent` establishes an owned immutable value;
-`sessionStateContentSchema` exposes the same bounded contract. Content permits at
-most 1,024 blocks, each with 1–65,536 JavaScript string units and at most 256 source
-references. The existing `maxSourceBytes` policy additionally bounds serialized
-UTF-8 content and combined source selection; compiled admission still decides fit.
+Session state is branch-owned, attributed, fallible narrative understanding. Each
+item has an immutable revision and exact history citations; there is no mandatory
+taxonomy or workflow. Runtime-generated item and revision identities come back in
+the save receipt. State cannot grant authority, verify a claim, or override user
+requirements. Citations support retrieval without automatically retaining sources.
 
-The model sends a complete replacement through `context_transition.sessionState`.
-Remove obsolete claims in that replacement. Omitting `sessionState` leaves the
-current interpretation unchanged; `{ blocks: [] }` explicitly clears it. An empty
-object is invalid. Identical content preserves revision identity. Clearing state
-does not erase original history or older state already delivered to a provider.
-State is fallible interpretation, never authority, verification, or a replacement
-for original user requirements and observations.
+`context_state_save` saves an atomic batch of `create`, `replace`, UTF-8 range
+`edit`, or `remove` operations without compiling a request or changing its active
+view. Replacements, edits, and removals require `itemId` and
+`expectedRevisionId`. A stale touched item rejects the whole batch; unrelated
+item updates do not conflict. Idempotency binds the exact batch. Removing a head
+does not erase historical revisions or content already delivered to a provider.
 
-Runtime provenance is separate from model content: the revision records its
-previous revision, exact originating inference request, captured history cut, and
-an optional validated declared cut. Citations must resolve at the captured cut.
-The existing journal entry owns the exact structured snapshot, avoiding separate
-staging artifacts. Protected inference artifacts retain request attribution. The
-`context_transition` entry publishes state and selection atomically only after
-admission of the actual next request. A scheduled tool receipt is not publication.
-Rejected, stale, or oversized proposals leave the previous state intact; retries
-are idempotent. Forks inherit state at the selected historical point.
+For example, the tool input to save an item is:
 
-`ContextService.sessionState()` reads the authoritative current snapshot without
-replaying the archive. `inspect()` supplies bounded content or a partial preview
-plus an exact history reference. Within a supported session format, historical
-revisions stay retrievable through original history.
+```json
+{"operations":[{"kind":"create","text":"The user requested a concise answer; the original request remains authoritative."}]}
+```
 
-Within a provider continuation, the initial checkpoint-state presentation is frozen.
-An admitted state update appends an attributed complete replacement notice,
-identifying its previous and successor revisions. An empty replacement is explicit.
-The exact notice role, bytes, identity, and position are persisted for replay;
-restart and fork preserve the applicable branch ancestry. Earlier state can remain
-visible as explicitly superseded interpretation until renewal. Neither checkpoint
-nor replacement notice becomes system/developer authority or overwrites execution
-facts. A fresh continuation starts from the latest state without older notices.
+Use the returned `itemId` and `revisionId` in `context_state_read` or in a
+`context_transition` selection. A reference is `{ itemId, revisionId }`, optionally
+with `range: { offset, bytes }`. Byte ranges and edits must use exact UTF-8
+boundaries; they are not JavaScript character offsets and are never silently
+truncated. `context_state_list` defaults to current stored heads; `view: "selected"`
+lists the exact active references. Both expose bounded, cut-pinned pages.
+`context_state_search` performs literal search with separate scan and output
+bounds; partial coverage and oversized unread items are explicit.
+
+`ContextService.saveSessionState(batch)` is the corresponding host save API.
+Supply the branch, idempotency key, recorded originating inference, captured
+history cut, and operations; an owned attribution validator is required.
+`listSessionState`, `readSessionState`, and `searchSessionState` retrieve storage.
+`sessionState()` returns only the committed selected view, not all saved heads.
+`SessionStateSnapshot` contains `id` and selected `items`; each selected item
+carries its exact revision, optional range, text and citations.
+
+Revision metadata points to protected artifact content and records its digest,
+size, predecessor, originating inference and history cut. Keep the original
+artifact repository across restarts. Forks inherit revisions at their selected
+branch point. Independent saves survive a later failed activation.
+
+Storage, materialization and request capacity are distinct bounds in
+`ContextPolicy`:
+
+- `sessionStateStorageBytes` defaults to 64 MiB and counts committed retained
+  revision metadata and bodies, including superseded and abandoned-fork revisions
+- `sessionStateMutationBytes` defaults to 1 MiB per staging attempt
+- `sessionStateReadBytes` defaults to 64 KiB per item read
+- `maxSourceBytes` bounds selected source material; compiled request accounting
+  independently decides whether the actual provider request fits
+
+The retained revision allowance is not an artifact-store disk quota. Failed
+staging/admission can leave unreachable content-addressed artifacts; physical
+artifact storage policy belongs to the host’s `ArtifactRepository`. No policy
+silently truncates saved text or discards stored revisions to make a view fit.
 
 ## Context transitions and renewal
 
-One `context_transition` operation proposes state and source changes. The runtime
-chooses the lawful successor from the actual delivered request and provider
-capabilities:
+`context_transition` activates exact existing item revisions, original sources,
+excerpts and public artifacts without saving narrative state. `sessionState` is
+an array of exact item references. Omitting it keeps the selection; `[]` selects
+no state. Saving a newer revision does not implicitly update selected references.
 
-- **Unchanged:** effective state and ordered evidence selection are unchanged,
-  with no required or requested renewal. No state revision, notice, or window is
-  published, and the tool exchange still completes normally
-- **Append:** a source-preserving state replacement lawfully extends the exact
-  delivered prefix with its notice, preserving provider continuation
-- **Fresh:** explicit renewal, source reduction or reorder, incompatible
-  configuration/prefix, or required capacity recovery needs a fresh continuation
+To require both a save and activation to succeed, use
+`context_save_and_activate`. Its `operations` have the same conditional batch
+shape as saving; selection fields match `context_transition`. The default
+`activateSaved: true` replaces selected references for touched items with new
+revisions and removes deleted items from the view. Set it to `false` to preserve
+the explicitly supplied selection. For example:
 
-Use `renewal: true` only when deliberately requesting fresh context, including
-renewal with unchanged state. Callers do not select append or provide reset IDs,
-model bindings, or provider-prefix bookkeeping. If no admitted lawful successor is
-supported, the transition fails without publishing state. Session identity,
-authority, effects, resources, accounting, and unresolved delivery obligations
-survive either committed strategy. Fresh continuation retains portable selected
-originals; signed or opaque native material stays in original storage and is not
-recast as ordinary state. Model changes preserve only compatible provider state.
+```json
+{"reason":"Keep a short working interpretation in view","operations":[{"kind":"create","text":"The comparison is still pending; no result has been verified."}]}
+```
 
-`context_transition` accepts `add` and `release` edits, or `retain` as a complete
-replacement of optional history. `recentFrom` selects the active suffix from an
-exact source. Omitting source edits keeps the selection; empty `retain` releases
-optional history. Complete exchanges, active accepted input, and explicit protections
-remain protected. Citations in every narrative block are exact retrieval references,
-not automatic retention. Use source-selection operations to retain or release
-originals independently of how the state is organized.
+The combined transaction publishes the batch and view only after actual successor
+admission, or publishes neither. A scheduled receipt is not commitment. In
+contrast, ordinary saves need no model request and are never rolled back by a
+separate activation failure.
 
-State replacement may accompany source changes. Both are bound to the originating
-inference revision and the authoritative source cut, with no implicit stale-state
-rebase. Finish the transition tool's exchange before compiling the successor.
-Outstanding effect and result-delivery obligations cannot be dropped to make a
-request fit. Hosts use `transitionContext` at the inspected window and source
-revision. Their `ContextTransitionRequest.selection` contains only evidence:
-`retained`, optional `excerpts`, and optional `protected` sources. Do not copy the
-persisted window's runtime-owned `continuity` into a proposal. For example, reuse
-`inspection.activeSelection.selection` when its status is `available`, with
-`expectedWindowId`, `expectedSourceRevision`, `idempotencyKey`, and `reason` from
-the inspected operation; add `renewal: true` only for deliberate renewal.
+Source selection uses `add`/`release`, or `retain` to replace optional original
+history; `recentFrom` selects the active suffix. Explicit `excerpts` and `artifacts`
+select bounded evidence. Active accepted input, complete exchanges, and explicit
+protections remain protected. Outstanding effect and result-delivery obligations
+cannot be discarded to make a request fit.
 
-`AgentSession.transitionContext()` returns `kind: 'scheduled'` for queued work,
-`kind: 'selected'` with the committed entry, or `kind: 'unchanged'` with a nullable
-window ID. Scheduling is not commitment. Committed transition records expose the
-selected `strategy`, `cause`, and optional `requestedRenewal` separately. The
-correlated `context.transitioned`, `context.transition.unchanged`, or
-`context.transition.rejected` event settles a pending application action. An
-unchanged result is not evidence of pressure relief. Durable publication also is
-not proof of provider delivery; existing invocation and delivery receipts remain
-authoritative.
+The runtime chooses the lawful successor from the actual delivered prefix:
 
-The TUI has one advanced Apply selection action while a request is running; it
-does not force renewal. Idle history remains inspectable without publishing an
-unadmitted window.
+- **Unchanged:** the effective view is unchanged and renewal is not required
+- **Append:** the selected-state change lawfully extends the frozen delivered
+  prefix with an exact attributed view-replacement notice
+- **Fresh:** explicit `renewal: true`, source reduction/reorder, an incompatible
+  prefix/configuration, or required capacity recovery starts fresh continuation
 
-`context_inspect` exposes bounded source metadata and exact references. Follow its
-cursor to inspect more of the captured selection. Original-history inspection,
-search, and reads retain exact branch/cut boundaries, attribution, byte bounds,
-and explicit partial coverage. Stored byte counts do not promise compiled token
-savings. Do not infer complete coverage from a single page or an unread source.
+Older state projections remain superseded interpretation inside a preserved
+prefix. Fresh continuation uses the selected revisions and evidence without old
+notices; it does not hydrate every stored head. Session identity, authority,
+effects, resources, accounting, original history, and unresolved obligations
+survive. Native material remains subject to provider compatibility rules and is
+never recast as narrative state. No supported admitted successor means rejection.
+
+Hosts call `AgentSession.transitionContext()` with an inspected window/source
+revision, `idempotencyKey`, `reason`, and `ContextTransitionRequest.selection`.
+That selection contains `retained` and optional `excerpts`, `protected`,
+`sessionState` and `artifacts`; persisted `continuity` is runtime-owned and must
+not be copied into proposals. Results distinguish `scheduled`, `selected`, and
+`unchanged`. Correlated transitioned/unchanged/rejected events settle queued
+application actions. Publication is distinct from provider delivery, and an
+unchanged result is not evidence of pressure relief. Idle selection intent is
+not a published window.
+
+`context_inspect` gives bounded selected-source metadata and references.
+`context_runtime_inspect` distinguishes `target: "configured"` from
+`target: "last_admitted"`; page capabilities with `offset`, `limit`, and the prior
+`expectedRevision`. Current configuration does not prove that a request has been
+admitted or dispatched. Inspection exposes allowances and active operations
+without granting capabilities or resetting continuing-work budgets.
 
 ## Admission and recovery
 
 Applications set source byte bounds and explicit output reservations. Admission
-compiles the actual task, attachments, instructions, session state, selected
+compiles the actual task, attachments, instructions, the selected state view, selected
 originals, the frozen checkpoint and all active replacement notices, tools, media,
 and protocol requirements. Exact counts, estimates, and
 unknown components remain distinguishable. Only the compiled request's accounting
@@ -206,11 +216,13 @@ ordinary batch.
 
 Appended replacements consume capacity. They are never rewritten or deleted
 inside a preserved prefix. When actual reduction is required, recovery uses an
-admitted fresh request containing the latest state and required evidence,
+admitted fresh request containing a bounded optional state view and required evidence,
 without superseded notices. Unavailable measurements do not establish exhaustion.
 
-Recovery can inspect metadata, retrieve history, and request fresh context through
-the same transition operation. It cannot execute domain effects or answer the user.
+Recovery can inspect metadata, retrieve history, save useful item updates, and
+activate a bounded view. Saved state is optional request material: recovery may
+select fewer items, exact ranges, or no items without deleting durable state. It
+cannot execute domain effects or answer the user.
 Its control requests and original results remain recorded. Repeated unchanged
 attempts and exhausted allowances produce durable, explicit suspension rather
 than resetting limits. Tool-result presentation bounds never alter authoritative
@@ -238,8 +250,8 @@ or acknowledged delivery cannot be resent without evidence that it failed.
 
 ## Compatibility and evidence
 
-Execution and state-sequence formats are versioned. The narrative-state contract uses
-`agent-core.session/4`. This build cannot open, resume, or read historical content
+Execution and session formats are versioned. The item-state contract uses
+`agent-core.session/5`. This build cannot open, resume, or read historical content
 from earlier session formats. It rejects unsupported execution records and
 incompatible session headers without rewriting original journals. Reading those
 originals requires the matching earlier build; this build performs no conversion. It has no aliases, old-format readers, migrations, or

@@ -140,7 +140,7 @@ test('separate reasoning consumes the same compiled capacity as output reservati
   await assert.rejects(admission.admit(compiled, small), ContextAdmissionError);
 });
 
-test('session state is a stable prefix and a bound revision change requires fresh admission', async () => {
+test('selected state references use the shared replacement lifecycle', async () => {
   const window = new ModelWindow();
   const state = {
     id: 'state-1', sourceUri: 'session://state/1', sourceKind: 'generated',
@@ -148,7 +148,7 @@ test('session state is a stable prefix and a bound revision change requires fres
     content: '{"goal":"Finish repair"}', purpose: 'Current understanding'
   };
   const input = { runId: 'run', window, task: 'Repair', instructions: [], tools: [],
-    modelProfile: profile, sessionState: state };
+    modelProfile: profile, contextItems: [state] };
   const settings = { model: profile.id, maxOutputTokens: 500 };
   const initial = await admission.assemble(input, settings, 500);
   window.bindContinuation({ runId: 'run', request: initial.request,
@@ -158,9 +158,11 @@ test('session state is a stable prefix and a bound revision change requires fres
   assert.deepEqual(continued.request.messages.slice(0, initial.request.messages.length), initial.request.messages);
   assert.equal(continued.request.messages.filter(item => item.content.includes('Finish repair')).length, 1);
   assert.equal(continued.request.messages.at(-1).content, 'Progress');
-  await assert.rejects(admission.assemble({ ...input, sessionState: { ...state,
-    id: 'state-2', content: '{"goal":"Verify repair"}' } }, settings, 500), /requires a fresh request/);
-  await assert.rejects(admission.assemble({ ...input, sessionState: undefined }, settings, 500), /requires a fresh request/);
+  const replaced = await admission.assemble({ ...input, contextItems: [{ ...state,
+    id: 'state-2', content: '{"goal":"Verify repair"}' }] }, settings, 500);
+  assert.match(replaced.request.messages.at(-1).content, /context-selection-replacement/);
+  const removed = await admission.assemble({ ...input, contextItems: [] }, settings, 500);
+  assert.match(removed.request.messages.at(-1).content, /There are no current items/);
 });
 
 test('generated tool guidance uses the supported system authority channel', async () => {

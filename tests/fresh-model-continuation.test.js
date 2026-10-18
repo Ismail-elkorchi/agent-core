@@ -51,6 +51,7 @@ async function fixture(sessions = new InMemorySessionRepository(), descriptor) {
     session,
     history,
     artifacts,
+    assertStateWrite: async batch => { await artifacts.readVerified(batch.inference.requestRef); },
     policy: { maxSourceBytes: 1000000, historyRead: { history, isAvailable: () => true } }
   });
   const requests = [];
@@ -458,25 +459,27 @@ test('incompatible persisted reset state is rejected in place without migration 
 test('fresh continuation keeps the current session state separate from selected originals', async () => {
   const f = await fixture();
   await nativeAnswer(f);
-  const requestRef = await f.artifacts.storeProtected({ label: 'original-inference', mediaType: 'application/json', content: new TextEncoder().encode(JSON.stringify({ sessionStateRevisionId: null, logical: { model: 'model', messages: [] } })) });
+  const requestRef = await f.artifacts.storeProtected({ label: 'original-inference', mediaType: 'application/json', content: new TextEncoder().encode(JSON.stringify({ stateSelectionId: null, logical: { model: 'model', messages: [] } })) });
   const cut = await f.history.capture();
-  const sessionState = {
-    id: 'current-understanding', previousRevisionId: null, capturedHistoryCut: cut,
-    content: { blocks: [{ text: 'Keep the original Unicode constraint; understanding does not authorize edits.' }] },
+  const sessionState = await f.context.stageSessionState({
+    idempotencyKey: 'current-understanding', branchId: cut.branchId, capturedHistoryCut: cut,
+    operations: [{ kind: 'create', text: 'Keep the original Unicode constraint; understanding does not authorize edits.' }],
     inference: { ownerId: 'owner', invocationId: 'original', requestRef }
-  };
+  });
+  const selected = sessionState.revisions.map(({ itemId, revisionId }) => ({ itemId, revisionId }));
   const stateEntry = await f.context.transition({
     expectedWindowId: (await f.history.selectedContext(cut))?.windowId ?? null,
-    expectedSourceRevision: cut.sourceRevision, expectedSessionStateRevisionId: null,
+    expectedSourceRevision: cut.sourceRevision,
     sessionState, renewal: true, idempotencyKey: 'current-understanding', reason: 'Seed admitted fixture understanding.',
-    selection: await f.context.selectSources(cut, {})
+    selection: { ...await f.context.selectSources(cut, {}), sessionState: selected }
   }, { admit: async input => ({ ...await admitContext(input), selection: admittedSelection(input, { provider: 'portable', model: 'model' }) }) });
   await f.agent.changeModel({ selection: { provider: 'portable', model: 'model' }, profile: profile(), artifacts: f.artifacts });
   const accepted = await f.agent.submit({ task: 'Explain the preserved constraint without editing.' });
   const result = await accepted.completion;
   assert.equal(result.terminal.executionStatus, 'completed', JSON.stringify(result));
   const context = await f.context.inspect();
-  assert.equal(context.sessionState.revisionId, stateEntry.id);
+  assert.deepEqual(context.sessionState.selected, selected);
+  assert.equal((await f.context.readSessionState(selected[0])).text, 'Keep the original Unicode constraint; understanding does not authorize edits.');
   assert.equal(context.window.selection.retained.some(source => source.entryId === stateEntry.id), false);
   assert.equal(context.window.selection.continuity.sources.some(source => source.entryId === stateEntry.id), false);
   const rendered = JSON.stringify(f.requests[0].messages);

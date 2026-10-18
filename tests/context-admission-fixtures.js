@@ -5,8 +5,8 @@ export function admittedSelection(input, model = { provider: 'fixture', model: '
   return input.strategy === 'fresh' ? {
     ...input.selection,
     continuity: {
-      kind: 'fresh', resetId: `fixture-${hashJson({ cut: input.cut, stateSequence: input.stateSequence })}`,
-      model, sources: input.selection.retained
+      kind: 'fresh', resetId: `fixture-${hashJson({ cut: input.cut, sessionState: input.sessionState })}`,
+      model, sources: input.selection.retained, historyPosition: input.cut
     }
   } : input.selection;
 }

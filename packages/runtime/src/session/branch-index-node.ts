@@ -7,7 +7,7 @@ import { contextCommitRetry, validateContextCommitState } from './context-record
 import type { ContextTransitionCommit } from '../context/contracts.js';
 import * as z from 'zod';
 import { canonicalJsonString, parseJsonObject, type JsonValue } from '@agent-core/json';
-import { hashJson } from '@agent-core/persistence';
+import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
 import {
   appendJsonlRecord, withPersistenceFileLock, jsonlBoundaryMarker, jsonlCommittedBytes,
   jsonlStorageStamp, readJsonlBytes, readJsonlLines, sameJsonlStorageStamp,
@@ -16,7 +16,8 @@ import {
 import { assertSessionBinding, type SessionBindingInput } from './binding.js';
 import { SessionHistorySourceError, SessionHistoryIndexPublicationError, type HistoryIndexRebuildOptions } from './history-index.js';
 import { branchNavigation, branchEntryMetadata, type BranchEntryPosition, type BranchPageSource } from './branch-page.js';
-import { sessionStateAtEntry, sessionStateChangeSchema, type SessionStateRevision } from './session-state.js';
+import { sessionStateBatchStorageBytes, sessionStateItemRefSchema, validateSessionStateCommit, type SessionStateBatchCommit, type SessionStateItemRevision, type SessionStatePageRequest, type SessionStatePage } from './session-state.js';
+import { assertStateSelection, stateBatch, statePageLimits, stateItemMetadata, statePageResult, decodeStatePageCursor } from './state-records.js';
 import { assertSubmissionOwnership, assertSubmissionTransition, createSessionAdmission } from './submission-lifecycle.js';
 import { SessionIndexStore } from './projection-store-node.js';
 import { SessionIndexTree, SessionIndexNodeError } from './projection-tree-node.js';
@@ -33,29 +34,29 @@ const locatorSchema = z.strictObject({offset: integer, bytes: z.number().int().p
 type Locator = z.infer<typeof locatorSchema>;
 const stampSchema = z.strictObject({size: integer, mtimeMs: z.number(), ctimeMs: z.number()});
 const rootSchema = z.strictObject({
-  format: z.literal('agent-core.session-projection/8'), generation: id, lineage: z.uuid(), header: z.unknown(),
+  format: z.literal('agent-core.session-projection/9'), generation: id, lineage: z.uuid(), header: z.unknown(),
   summary: z.strictObject({id, timestamp: id, updatedAt: id, preview: z.string().max(160).optional(), provider: id.optional(), model: id.optional(), bindingSchemaId: id, bindingSchemaVersion: z.number().int().positive(), bindingSha256: hash}),
-  tree: hash.nullable(), confirmedRunsRoot: hash.nullable(), leafId: id.nullable(), sourceRevision: integer, indexedRecords: integer,
+  tree: hash.nullable(), confirmedRunsRoot: hash.nullable(), leafId: id.nullable(), sourceRevision: integer, acceptedInputRevision: integer, retainedStateBytes: integer, indexedRecords: integer,
   headerBytes: z.number().int().positive().max(16 * 1024 * 1024), completeBytes: integer, lineCount: integer, marker: z.string(), stamp: stampSchema,
   queueFirst: id.nullable(), queueLast: id.nullable(), occupied: id.nullable(), queuedCount: integer, capacity: integer.nullable()
 });
 type Root = Omit<z.infer<typeof rootSchema>, 'header'> & {header: SessionHeader};
-const sessionStateSchema = sessionStateChangeSchema.omit({content: true}).extend({ parentId: id.nullable(), timestamp: id, contentSha256: hash, contentBytes: integer });
+const statePointerSchema = z.strictObject({entryId:id,itemId:id,revisionId:id,contentBytes:integer,contentSha256:hash,deleted:z.boolean()});
 const positionSchema = locatorSchema.extend({
   depth: integer, ancestors: z.array(id).max(53), branchId: id,
   lookupRoot: hash.nullable(), inheritedHeadsRoot: hash.nullable(), activeRunsRoot: hash.nullable(), finalizedRunsRoot: hash.nullable(), unconfirmedRunsRoot: hash.nullable(), confirmedRunsRoot: hash.nullable(),
-  parentId: id.nullable(), identity: id, type: z.enum(['input','steering','assistant','tool_call','observation','branch','model_settings','context_transition']),
+  parentId: id.nullable(), identity: id, type: z.enum(['input','steering','assistant','tool_call','observation','branch','model_settings','context_transition','session_state_batch']),
   timestamp: id, runId: id.optional(), toolName: id.optional(), source: historyEventSourceSchema.optional(),
   fromEntryId: id.nullable().optional(), historyPosition: historyCutSchema.optional(),
-  sessionStateId: id.nullable(), modelSourceId: id.nullable(), contextId: id.nullable(),
+  stateHeadsRoot: hash.nullable(), stateRevisionsRoot: hash.nullable(), latestInputDepth: z.number().int().min(-1), modelSourceId: id.nullable(), contextId: id.nullable(),
   context: z.strictObject({
-    type: z.enum(['input','steering','assistant','tool_call','observation','branch','model_settings','context_transition']),
+    type: z.enum(['input','steering','assistant','tool_call','observation','branch','model_settings','context_transition','session_state_batch']),
     description: z.string().max(400), runId: id.optional(), exchangeId: id.optional(),
     callIndex: integer.optional(), toolBatchId: id.optional(), expectedCalls: integer.optional(),
     prefixBound: z.boolean().optional(), contextRecovery: z.literal(true).optional()
   })
 });
-type Position = BranchEntryPosition & Locator & SessionIndexState & {readonly sessionStateId: string | null; readonly modelSourceId: string | null; readonly contextId: string | null;};
+type Position = BranchEntryPosition & Locator & SessionIndexState & {readonly stateHeadsRoot: string | null; readonly stateRevisionsRoot: string | null; readonly latestInputDepth: number; readonly modelSourceId: string | null; readonly contextId: string | null;};
 const submissionSchema = z.strictObject({
   submissionId: id, runId: id, state: z.enum(['queued','claimed','suspended','completed','failed','cancelled']),
   claimId: id.optional(), previous: id.nullable(), next: id.nullable(), admission: locatorSchema, input: locatorSchema, latest: locatorSchema
@@ -219,7 +220,7 @@ export class JsonlBranchIndex {
       const points: {point: SessionBranchPoint; offset: number}[] = [];
       for await (const [key, value] of this.main(root).entries(root.tree)) {
         if (!key.startsWith('point:')) continue;
-        const item = z.strictObject({offset: integer, entryId: id, timestamp: id, kind: z.enum(['run_finalization','context_transition']), runId: id.optional(), finalizationId: id.optional()}).parse(value);
+        const item = z.strictObject({offset: integer, entryId: id, timestamp: id, kind: z.enum(['run_finalization','context_transition','session_state_batch']), runId: id.optional(), finalizationId: id.optional()}).parse(value);
         points.push({offset: item.offset, point: {entryId: item.entryId, timestamp: item.timestamp, kind: item.kind,
           ...(item.runId === undefined ? {} : {runId: item.runId}),
           ...(item.finalizationId === undefined ? {} : {finalizationId: item.finalizationId})}});
@@ -296,17 +297,87 @@ export class JsonlBranchIndex {
       return contextCommitRetry([record], input);
     });
   }
-  async sessionState(session: SessionDescriptor, leafId?: string | null): Promise<SessionStateRevision | null> {
+  private async statePosition(root: Root, leafId?: string | null): Promise<Position | undefined> {
+    const selected = leafId === undefined ? root.leafId : leafId;
+    return selected === null ? undefined : this.positionValue(await this.main(root).get(root.tree, `entry:${selected}`));
+  }
+  private async stateItem(root: Root, pointer: unknown): Promise<SessionStateItemRevision | undefined> {
+    if (pointer === undefined) return undefined;
+    const selected = statePointerSchema.parse(pointer);
+    const entry = await this.branchRecord(await this.locate(root, `entry:${selected.entryId}`), selected.entryId, root);
+    const item = stateBatch(entry)?.revisions.find(item => item.revisionId === selected.revisionId);
+    if (item?.itemId !== selected.itemId || item.contentBytes !== selected.contentBytes || item.contentSha256 !== selected.contentSha256 || item.deleted !== selected.deleted)
+      throw new SessionIndexNodeError('Session-state index differs from its committed revision.');
+    return item;
+  }
+  async findStateBatch(session: SessionDescriptor, idempotencyKey: string) {
     return this.query(session, async root => {
-      const selected = leafId === undefined ? root.leafId : leafId;
-      const leaf = selected === null ? undefined : this.positionValue(await this.main(root).get(root.tree, `entry:${selected}`));
-      return this.stateAt(root, leaf?.sessionStateId ?? null);
+      const leaf = await this.statePosition(root);
+      const pointer = await this.tree.get(leaf?.lookupRoot ?? null, `state-batch:${idempotencyKey}`);
+      if (pointer === undefined) return undefined;
+      const target = z.strictObject({entryId:id}).parse(pointer);
+      return this.branchRecord(await this.locate(root, `entry:${target.entryId}`),target.entryId,root);
     });
   }
-  private async stateAt(root: Root, stateId: string | null): Promise<SessionStateRevision | null> {
-    return stateId === null ? null : Object.freeze(sessionStateSchema.parse(
-      await this.main(root).get(root.tree, `session-state:${stateId}`)
-    ));
+  async currentStateItem(session: SessionDescriptor, itemId: string, leafId?: string | null) {
+    return this.query(session, async root => {
+      const leaf = await this.statePosition(root,leafId);
+      return this.stateItem(root,await this.tree.get(leaf?.stateHeadsRoot ?? null,itemId));
+    });
+  }
+  async readStateItem(session: SessionDescriptor, input: Parameters<SessionRepository['readSessionStateItem']>[1], leafId?: string | null) {
+    const ref = sessionStateItemRefSchema.parse(input);
+    return this.query(session, async root => {
+      const leaf = await this.statePosition(root,leafId);
+      const item = await this.stateItem(root,await this.tree.get(leaf?.stateRevisionsRoot ?? null,ref.revisionId));
+      if (item?.itemId !== ref.itemId) throw new Error('Session-state revision is unavailable on this branch.');
+      if (ref.range && ref.range.offset + ref.range.bytes > item.contentBytes) throw new Error('Session-state range exceeds its immutable revision.');
+      return item;
+    });
+  }
+  async listState(session: SessionDescriptor, request: SessionStatePageRequest = {}): Promise<SessionStatePage> {
+    const {limit,maxBytes} = statePageLimits(request);
+    const cursor = decodeStatePageCursor(session.id,request);
+    return this.query(session, async root => {
+      const selected = cursor ? cursor.leafId : request.leafId === undefined ? root.leafId : request.leafId;
+      const leaf = await this.statePosition(root,selected);
+      const items: import('./session-state.js').SessionStateItemMetadata[] = [];
+      let after = cursor?.after, visited = 0, partial = false;
+      const iterator = this.tree.entriesAfter(leaf?.stateHeadsRoot ?? null,cursor?.after);
+      let current = await iterator.next();
+      while (!current.done && visited < 256) {
+        const [key,value] = current.value;
+        const pointer = statePointerSchema.parse(value);
+        visited++;
+        if (pointer.deleted) {after = key;current = await iterator.next();continue;}
+        const metadata = {itemId:pointer.itemId,revisionId:pointer.revisionId,contentBytes:pointer.contentBytes,contentSha256:pointer.contentSha256};
+        if (items.length >= limit) {partial = true;break;}
+        const next = await iterator.next();
+        try {statePageResult(session.id,selected,[...items,metadata],!next.done,key,maxBytes);}
+        catch (error) {if (items.length === 0) throw error;partial = true;break;}
+        items.push(Object.freeze(metadata));after = key;current = next;
+      }
+      partial ||= !current.done;
+      return statePageResult(session.id,selected,items,partial,after,maxBytes);
+    });
+  }
+  async validateState(session: SessionDescriptor, batch: SessionStateBatchCommit): Promise<void> {
+    return this.query(session, async root => this.validateStateAt(root,await this.statePosition(root),batch));
+  }
+  private async validateStateAt(root: Root, leaf: Position | undefined, batch: SessionStateBatchCommit): Promise<void> {
+    const cut = batch.capturedHistoryCut;
+    const branchId = leaf?.branchId ?? this.sessionId;
+    const captured = await this.statePosition(root,cut.throughEntryId);
+    const source: BranchPageSource = {sessionId:this.sessionId,leafId:root.leafId,positions:new Map(),validate:() => Promise.resolve(),
+      readPosition:async entryId => {const value = await this.main(root).get(root.tree,`entry:${entryId}`); return value === undefined ? undefined : this.positionValue(value);},
+      read:async entryId => this.branchRecord(await this.locate(root,`entry:${entryId}`),entryId,root)};
+    const navigation = await branchNavigation(source,{sessionId:this.sessionId,leafId:root.leafId,leafHash:leaf?.hash ?? null});
+    if (cut.sessionId !== this.sessionId || batch.branchId !== branchId || cut.branchId !== branchId || cut.sourceRevision > root.sourceRevision || cut.sourceRevision < root.acceptedInputRevision ||
+        (cut.throughEntryId !== null && !(await navigation.contains(cut.throughEntryId))) || (leaf?.latestInputDepth ?? -1) > (captured?.depth ?? -1))
+      throw new PersistenceConflictError('Session-state source cut changed branch or accepted input.');
+    if (await this.tree.get(leaf?.lookupRoot ?? null,`state-batch:${batch.idempotencyKey}`) !== undefined)
+      throw new PersistenceConflictError('Session-state batch is already committed.');
+    await validateSessionStateCommit(batch,async itemId => this.stateItem(root,await this.tree.get(leaf?.stateHeadsRoot ?? null,itemId)),root.retainedStateBytes);
   }
   async validateContext(session: SessionDescriptor, input: ContextTransitionCommit): Promise<void> {
     return this.query(session, async root => {
@@ -327,7 +398,6 @@ export class JsonlBranchIndex {
       const runs = new Set<string>();
       const selectedRefs = new Map([
         ...input.window.selection.retained,
-        ...(input.window.stateSequence.parent ? [input.window.stateSequence.parent] : []),
         ...(input.window.selection.excerpts ?? []).map(excerpt => excerpt.source)
       ].map(ref => [hashJson(ref), ref]));
       for (const ref of selectedRefs.values()) {
@@ -347,7 +417,7 @@ export class JsonlBranchIndex {
       const context = leaf?.contextId ? await this.branchRecord(await this.locate(root, `entry:${leaf.contextId}`), leaf.contextId, root) : undefined;
       validateContextCommitState(this.sessionId, {
         leafId: root.leafId, context: context?.type === 'context_transition' ? context : null,
-        sessionState: await this.stateAt(root, leaf?.sessionStateId ?? null), refs, finalizations
+        refs, finalizations
       }, root.sourceRevision, input);
     });
   }
@@ -477,7 +547,7 @@ export class JsonlBranchIndex {
       lookupRoot: parsed.lookupRoot, inheritedHeadsRoot: parsed.inheritedHeadsRoot, activeRunsRoot: parsed.activeRunsRoot, finalizedRunsRoot: parsed.finalizedRunsRoot, unconfirmedRunsRoot: parsed.unconfirmedRunsRoot, confirmedRunsRoot: parsed.confirmedRunsRoot,
       offset: parsed.offset, bytes: parsed.bytes, line: parsed.line, hash: parsed.hash,
       parentId: parsed.parentId, identity: parsed.identity, type: parsed.type, timestamp: parsed.timestamp,
-      sessionStateId: parsed.sessionStateId, modelSourceId: parsed.modelSourceId, contextId: parsed.contextId,
+      stateHeadsRoot: parsed.stateHeadsRoot, stateRevisionsRoot: parsed.stateRevisionsRoot, latestInputDepth: parsed.latestInputDepth, modelSourceId: parsed.modelSourceId, contextId: parsed.contextId,
       ...(parsed.runId === undefined ? {} : {runId: parsed.runId}),
       ...(parsed.toolName === undefined ? {} : {toolName: parsed.toolName}),
       ...(parsed.source === undefined ? {} : {source: parsed.source}),
@@ -576,11 +646,11 @@ export class JsonlBranchIndex {
     await this.store.repairStorage();
     const stamp = await jsonlStorageStamp(this.filePath);
     const lineage = randomUUID();
-    const root: Root = {format: 'agent-core.session-projection/8', generation: randomUUID(), lineage, header, summary: {
+    const root: Root = {format: 'agent-core.session-projection/9', generation: randomUUID(), lineage, header, summary: {
       id: header.id, timestamp: header.timestamp, updatedAt: header.timestamp,
       ...(header.provider ? {provider: header.provider} : {}), ...(header.model ? {model: header.model} : {}),
       bindingSchemaId: header.binding.schemaId, bindingSchemaVersion: header.binding.schemaVersion, bindingSha256: header.binding.bindingSha256
-    }, tree: null, confirmedRunsRoot: null, queueFirst: null, queueLast: null, occupied: null, queuedCount: 0, capacity: null, leafId: null, sourceRevision: 0, indexedRecords: 0, headerBytes: 0, completeBytes: 0, lineCount: 0, marker: '', stamp};
+    }, tree: null, confirmedRunsRoot: null, queueFirst: null, queueLast: null, occupied: null, queuedCount: 0, capacity: null, leafId: null, sourceRevision: 0, acceptedInputRevision: 0, retainedStateBytes: 0, indexedRecords: 0, headerBytes: 0, completeBytes: 0, lineCount: 0, marker: '', stamp};
     await this.store.commit(async () => {
       await this.scan(root, stamp, options);
       this.store.retireNamespaces(`main-${lineage}`);
@@ -648,6 +718,7 @@ export class JsonlBranchIndex {
     const set = (key: string, value: unknown) => {changes.set(key, parseJsonObject(value));};
     const flush = async () => {if (changes.size > 0) root.tree = await this.main(root).setMany(root.tree, [...changes]);};
     root.sourceRevision++;
+    if (record.type === 'input' || record.type === 'steering' || record.type === 'submission.admitted' || record.type === 'submission.revised') root.acceptedInputRevision = root.sourceRevision;
     root.summary = {...root.summary, updatedAt: record.timestamp > root.summary.updatedAt ? record.timestamp : root.summary.updatedAt,
       ...(root.summary.preview === undefined && record.type === 'input' ? {preview: record.task.replace(/\s+/gu, ' ').slice(0,160)} : {})};
     if ('submissionId' in record) {
@@ -788,13 +859,28 @@ export class JsonlBranchIndex {
       activeRunsRoot = await this.tree.set(activeRunsRoot, record.runId, {entriesRoot: updated});
       unconfirmedRunsRoot = await this.tree.set(unconfirmedRunsRoot, record.runId, {runId: record.runId, finalized: false});
     }
-    const sessionState = sessionStateAtEntry(record);
-    if (sessionState) set(`session-state:${sessionState.id}`, sessionState);
+    const batch = stateBatch(record);
+    let stateHeadsRoot = parent?.stateHeadsRoot ?? null, stateRevisionsRoot = parent?.stateRevisionsRoot ?? null;
+    if (batch) {
+      await this.validateStateAt({...root,sourceRevision:root.sourceRevision - 1},parent,batch);
+      const pointers = batch.revisions.map(item => ({entryId:record.id,...stateItemMetadata(item),deleted:item.deleted}));
+      stateHeadsRoot = await this.tree.setMany(stateHeadsRoot,pointers.map(item => [item.itemId,parseJsonObject(item)]));
+      stateRevisionsRoot = await this.tree.setMany(stateRevisionsRoot,pointers.map(item => [item.revisionId,parseJsonObject(item)]));
+      const addedBytes = sessionStateBatchStorageBytes(batch);
+      root.retainedStateBytes += addedBytes;
+      lookupChanges.push([`state-batch:${batch.idempotencyKey}`,{entryId:record.id}]);
+    }
+    if (record.type === 'context_transition') {
+      for (const ref of record.window.selection.sessionState ?? []) {
+        const value = await this.tree.get(stateRevisionsRoot,ref.revisionId);
+        assertStateSelection(ref,value === undefined ? undefined : statePointerSchema.parse(value));
+      }
+    }
     const position: Position = {...metadata, ...locator, parentId: record.parentId,
       depth: (parent?.depth ?? -1) + 1, ancestors, branchId: record.type === 'branch' ? record.id : parent?.branchId ?? this.sessionId,
       lookupRoot: await this.tree.setMany(parent?.lookupRoot ?? null, lookupChanges), inheritedHeadsRoot, activeRunsRoot, unconfirmedRunsRoot, finalizedRunsRoot,
       confirmedRunsRoot: parent?.confirmedRunsRoot ?? null,
-      sessionStateId: sessionState?.id ?? parent?.sessionStateId ?? null, modelSourceId,
+      stateHeadsRoot,stateRevisionsRoot,latestInputDepth:record.type === 'input' || record.type === 'steering' ? (parent?.depth ?? -1) + 1 : parent?.latestInputDepth ?? -1, modelSourceId,
       contextId: record.type === 'context_transition' ? record.id : parent?.contextId ?? null};
     set(`entry:${record.id}`, position);
     const key = sessionRetryKey(record);
@@ -802,7 +888,7 @@ export class JsonlBranchIndex {
       if (record.type !== 'context_transition' && await this.main(root).get(root.tree, key) !== undefined) throw new Error('Duplicate session retry identity.');
       set(key, locator);
     }
-    if (record.type === 'context_transition') set(`point:context:${record.id}`, {offset: locator.offset, entryId: record.id, timestamp: record.timestamp, kind: 'context_transition'});
+    if (record.type === 'context_transition' || record.type === 'session_state_batch') set(`point:context:${record.id}`, {offset: locator.offset, entryId: record.id, timestamp: record.timestamp, kind: record.type});
     root.indexedRecords++; root.leafId = record.id;
     await flush();
   }

@@ -1,8 +1,23 @@
-import { sessionStateChangeSchema } from '../session/session-state.js';
+import { decodeOwnedArtifactRef } from '@agent-core/persistence';
+import { parseJsonObject } from '@agent-core/json';
+import { sessionStateBatchCommitSchema, sessionStateItemRefSchema } from '../session/session-state.js';
 import { parseModelSelection } from '@agent-core/model';
 import * as z from 'zod';
 import { historyCutSchema, sourceSchema, sourceExcerptSchema } from '../history/schema.js';
+const publicArtifact = z.unknown().transform(value => {
+  const ref = decodeOwnedArtifactRef(parseJsonObject(value));
+  if (ref.visibility !== 'public') throw new Error('Only public artifacts may be selected.');
+  return ref;
+});
+export const contextArtifactSelectionSchema = z.discriminatedUnion('representation', [
+  z.strictObject({ artifact: publicArtifact, representation: z.literal('reference') }).readonly(),
+  z.strictObject({ artifact: publicArtifact, representation: z.literal('text'), range: z.strictObject({
+    offset: z.int().nonnegative(), bytes: z.int().positive()
+  }).readonly().optional() }).readonly()
+]);
 const sourceSelectionShape = {
+  sessionState: z.array(sessionStateItemRefSchema).max(10000).readonly().optional(),
+  artifacts: z.array(contextArtifactSelectionSchema).max(10000).readonly().optional(),
   excerpts: z.array(sourceExcerptSchema).max(10000).readonly().optional(),
   protected: z.array(sourceSchema).max(10000).readonly().optional(),
   retained: z.array(sourceSchema).max(10_000).readonly()
@@ -12,6 +27,7 @@ export const contextSelectionSchema = z.strictObject({
   ...sourceSelectionShape,
   continuity: z.strictObject({
     kind: z.literal('fresh'),
+    historyPosition: historyCutSchema,
     resetId: z.string().min(1),
     model: z.unknown().transform((value) => parseModelSelection(value)),
     sources: z.array(sourceSchema).max(10000).readonly()
@@ -21,8 +37,7 @@ export const contextTransitionRequestSchema = z
   .strictObject({
     renewal: z.boolean().optional(),
     expectedCut: historyCutSchema.optional(),
-    sessionState: sessionStateChangeSchema.optional(),
-    expectedSessionStateRevisionId: z.string().min(1).nullable().optional(),
+    sessionState: sessionStateBatchCommitSchema.optional(),
     toolInvocation: z
       .strictObject({
         runId: z.string().min(1),
@@ -41,21 +56,8 @@ export const contextTransitionRequestSchema = z
     selection: contextSourceSelectionSchema
   })
   .readonly();
-export const contextStateSequenceSchema = z.strictObject({
-  checkpointRevisionId: z.string().min(1).nullable(),
-  lineage: historyCutSchema.nullable(),
-  parent: sourceSchema.nullable(),
-  notice: z.strictObject({
-    id: z.string().min(1),
-    previousRevisionId: z.string().min(1).nullable(),
-    revisionId: z.string().min(1),
-    after: historyCutSchema,
-    message: z.strictObject({ role: z.literal('user'), content: z.string() }).readonly()
-  }).readonly().optional()
-}).readonly();
 export const contextWindowSchema = z
   .strictObject({
-    stateSequence: contextStateSequenceSchema,
     windowId: z.string().min(1),
     parentWindowId: z.string().min(1).nullable(),
     historyPosition: historyCutSchema,
@@ -76,16 +78,14 @@ export const contextTransitionSchema = z
     windowId: z.string().min(1),
     requestFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
     selectionFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
-    stateSequenceFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
     requestedSourceRevision: z.number().int().min(0).optional(),
-    requestedSessionStateRevisionId: z.string().min(1).nullable().optional(),
     committedAt: z.string().min(1)
   })
   .readonly();
 export const contextEntrySchema = z
   .strictObject({
     type: z.literal('context_transition'),
-    sessionState: sessionStateChangeSchema.omit({ id: true }).optional(),
+    sessionState: sessionStateBatchCommitSchema.optional(),
     id: z.string().min(1),
     parentId: z.string().min(1).nullable(),
     timestamp: z.string().min(1),

@@ -1,3 +1,5 @@
+import { commitResourceRelease } from './orchestration/resource-settlement.js';
+import { resolveEffectiveToolCatalog, inspectCapabilitySnapshot, type EffectiveCapabilitySnapshot } from './run/capabilities.js';
 import { NativeContextIncompatibilityError } from './orchestration/model-change.js';
 import { CONTEXT_RECOVERY_LIMITS, assembleContextControlRequest, contextControlReserve, contextControlPreview, contextControlSteering } from './context/recovery.js';
 import { resolveToolModelContent } from './orchestration/observation-source.js';
@@ -32,18 +34,16 @@ import {
   type ModelResponseFormat,
   type RequestEstimator
 } from '@agent-core/model';
-import { hashJson, type EventAppendReceipt } from '@agent-core/persistence';
+import { hashJson, PersistenceDriverOwnershipLostError, type EventAppendReceipt } from '@agent-core/persistence';
 import {
   READ_ONLY_TOOL_POLICY,
   serializeToolModelContent,
   ResourceLeaseCoordinator,
   ToolRegistry,
-  isToolAvailable,
   parseToolPolicy,
   planToolCall,
   recoverToolCallPlan,
   releaseToolCallPlan,
-  toolRequirementsSatisfied,
   type CompiledToolDefinition,
   type ExecutionResources,
   type ToolAuthorizationBoundary,
@@ -199,6 +199,7 @@ export interface AgentRuntimeOptions {
   readonly toolResourceLeases?: ResourceLeaseCoordinator;
   readonly resources?: ExecutionResources;
   readonly inferenceOwnerId?: string;
+  readonly modelBindingId?: string;
   readonly toolPolicy?: ToolPolicy;
   readonly toolAuthorizer?: ToolAuthorizer;
   readonly toolContextPrerequisite?: import('./orchestration/tool-execution.js').ToolContextPrerequisite;
@@ -444,6 +445,8 @@ export class AgentRuntime {
   private recoveryActionBoundary: string | undefined;
   private contextControlReserve: { readonly identity: string; readonly tokens: number } | undefined;
   private presentationSnapshot: TurnSnapshot | undefined;
+  private lastAdmittedCapabilities: { readonly inputIdentity: string; readonly protocolCapabilityRevision: string;
+    readonly snapshot: EffectiveCapabilitySnapshot } | undefined;
   private activeContextIdentity: string | null | undefined;
   private activeHistoryCut: import('./history/contracts.js').HistorySourceCut | undefined;
   private pendingCompatibilityTransition = false;
@@ -489,6 +492,22 @@ export class AgentRuntime {
       options.inferenceService ?? InferenceService.inMemory({ provider: options.provider });
     this.requestAdmission = new RequestAdmission(this.requestAssembler, this.inferenceService);
     this.unbindContext = options.context?.bindRuntime({
+      inspectOperational: (page) => this.inspectOperational(page),
+      withStateOwnership: (operation) => this.withStateOwnership(operation),
+      assertStateWrite: async (batch) => {
+        const run = this.activeRunDriver;
+        if (run?.state().control.status !== 'owned' || run.state().runId !== this.activeRunId)
+          throw new Error('Session-state publication requires the current run owner.');
+        const ownerId = this.options.inferenceOwnerId ?? run.state().runId;
+        if (batch.inference.ownerId !== ownerId) throw new Error('Session-state inference belongs to another owner.');
+        const origin = await this.inferenceService.sessionStateOrigin(ownerId, batch.inference.invocationId);
+        if (hashJson(origin.inference) !== hashJson(batch.inference) ||
+            hashJson(origin.capturedHistoryCut) !== hashJson(batch.capturedHistoryCut))
+          throw new Error('Session-state publication does not match its admitted inference.');
+        const tail = await this.options.repositories.events.tail(run.state().runId);
+        if (tail.driverGeneration !== run.state().driverGeneration || run.state().control.status !== 'owned')
+          throw new AgentRunOwnershipLostError(run.state().runId);
+      },
       origin: async (invocation) => {
         const run = this.activeRunDriver;
         if (run?.state().runId !== invocation.runId)
@@ -532,6 +551,47 @@ export class AgentRuntime {
 
   private assertOpen(): void {
     if (this.closed) throw new Error('AgentRuntime has been closed.');
+  }
+
+  private async withStateOwnership<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.activeRunDriver;
+    if (run?.state().control.status !== 'owned' || run.state().runId !== this.activeRunId)
+      throw new Error('Session-state publication requires the current run owner.');
+    const runId = run.state().runId;
+    const generation = run.state().driverGeneration;
+    try {
+      return await this.options.repositories.events.withDriverGeneration(runId, generation, async () => {
+        if (this.activeRunDriver !== run || run.state().control.status !== 'owned' ||
+            run.state().driverGeneration !== generation || this.activeRunId !== runId)
+          throw new AgentRunOwnershipLostError(runId);
+        return operation();
+      });
+    } catch (cause) {
+      if (cause instanceof PersistenceDriverOwnershipLostError) throw new AgentRunOwnershipLostError(runId);
+      throw cause;
+    }
+  }
+
+  /** These facts are observations; only the actual request/effect admission grants authority. */
+  async inspectOperational(page: { readonly offset?: number; readonly limit?: number; readonly expectedRevision?: string; readonly target?: 'configured' | 'last_admitted' } = {}) {
+    const profile = parseModelProfile(await this.options.provider.describeModel(this.options.model));
+    const catalog = this.capabilityCatalog(profile);
+    const ownerId = this.options.inferenceOwnerId ?? this.activeRunId;
+    const selected = page.target === 'last_admitted' ? this.lastAdmittedCapabilities?.snapshot : catalog.snapshot;
+    return Object.freeze({ capabilityTarget: page.target ?? 'configured',
+      capabilities: selected ? inspectCapabilitySnapshot(selected, page) : null,
+      configuredRevision: catalog.snapshot.revision,
+      lastAdmittedCoverage: this.lastAdmittedCapabilities ? 'available' : 'not_observed_in_this_runtime',
+      lastAdmittedRequest: this.lastAdmittedCapabilities ? { inputIdentity: this.lastAdmittedCapabilities.inputIdentity,
+        protocolCapabilityRevision: this.lastAdmittedCapabilities.protocolCapabilityRevision,
+        catalogRevision: this.lastAdmittedCapabilities.snapshot.revision,
+        bindingId: this.lastAdmittedCapabilities.snapshot.bindingId } : null,
+      generation: { outputReservation: this.maxOutputTokens,
+        enforcement: supportsParameter(profile, 'maxOutputTokens') ? 'provider-cap' : 'reservation-only' },
+      ...(ownerId ? { allowance: await this.inferenceService.inspectOwnerAllowance(ownerId) } : {}),
+      resources: this.resourceLeases.inspect(),
+      meaning: 'Configured eligibility may differ from the last admitted request. These independently captured capability, ledger and resource observations are not an atomic cross-domain snapshot or permission. Per-call authorization and transactional request admission still apply.'
+    });
   }
 
   inspectRun(runId: string) {
@@ -1713,7 +1773,7 @@ export class AgentRuntime {
           const unsupported = response.terminationReason !== 'tool_calls' || toolCalls.length === 0 || toolCalls.length > CONTEXT_RECOVERY_LIMITS.toolCalls ||
             toolCalls.some((call) => !snapshot.tools.some((tool) => tool.name === call.name && isContextCheckpointTool(tool))) ||
             toolCalls.some((call) => call.input.kind === 'json' &&
-              ((snapshot.tools.find((tool) => tool.name === call.name)?.implementationId !== 'agent-core.context-transition.v1' &&
+              ((!isContextMutationTool(snapshot.tools.find((tool) => tool.name === call.name)) &&
                   (typeof call.input.value.maxBytes !== 'number' || call.input.value.maxBytes > CONTEXT_RECOVERY_LIMITS.resultBytes))));
           if (repeated || unsupported) {
             const settled = providerWork(runtime.run.state(), snapshot.record);
@@ -1891,7 +1951,7 @@ export class AgentRuntime {
       observationStore,
       ...(this.options.context && this.options.contextRenewal?.automatic ? {
         stagePresentations: (phase: AgentToolPhase) => !phase.source.nativeCatalogIdentity &&
-          (this.catalogTools.get(phase.source.catalog.revision) ?? this.tools).some(tool => tool.implementationId === 'agent-core.context-transition.v1') &&
+          (this.catalogTools.get(phase.source.catalog.revision) ?? this.tools).some(tool => isContextActivationTool(tool)) &&
           providerWork(runtime.run.state(), phase.identity).stage === 'consumed',
         selectPresentations: (phase: AgentToolPhase, observations: readonly {
           readonly callIndex: number; readonly committed: CommittedToolObservation; readonly published: boolean;
@@ -1908,6 +1968,19 @@ export class AgentRuntime {
     });
   }
 
+  private async recordedTurnSnapshot(runId: string, identity: Pick<AgentTurnIdentity, 'turnId' | 'requestAttempt'>): Promise<AgentTurnSnapshotRecord> {
+    const records = await this.options.repositories.events.readMetadataRange(runId, {
+      types: ['turn.snapshot.created'], metadata: { exchangeId: `assistant:${identity.turnId}:${String(identity.requestAttempt)}:ended` },
+      limit: 1, maxBytes: 1024 * 1024
+    });
+    const reference = records.records[0]?.reference;
+    const event = reference ? (await this.options.repositories.events.readReference(reference)).event : undefined;
+    if (event?.type !== 'turn.snapshot.created' || event.snapshot.turnId !== identity.turnId ||
+        event.snapshot.requestAttempt !== identity.requestAttempt)
+      throw new Error('Tool operation is missing its exact admitted turn snapshot.');
+    return event.snapshot;
+  }
+
   /** Admit a complete settled ordinary batch before publishing its selected presentations. */
   private async selectToolPresentations(
     runtime: RunExecutionRuntime,
@@ -1919,14 +1992,7 @@ export class AgentRuntime {
     if (source.stage !== 'consumed') return observations.map(item => item.committed);
     let snapshot = this.presentationSnapshot;
     if (!snapshot || !sameTurnIdentity(snapshot.record, phase.identity)) {
-      const records = await this.options.repositories.events.readMetadataRange(runtime.runId, {
-        types: ['turn.snapshot.created'], metadata: { exchangeId: `assistant:${phase.identity.turnId}:${String(phase.identity.requestAttempt)}:ended` },
-        limit: 1, maxBytes: 1024 * 1024
-      });
-      const reference = records.records[0]?.reference;
-      const event = reference ? (await this.options.repositories.events.readReference(reference)).event : undefined;
-      if (event?.type !== 'turn.snapshot.created') throw new Error('Settled tool batch is missing its source snapshot.');
-      snapshot = await this.restoreTurnSnapshot(event.snapshot);
+      snapshot = await this.restoreTurnSnapshot(await this.recordedTurnSnapshot(runtime.runId, phase.identity));
     }
     if (snapshot.record.contextRecovery) return observations.map(item => item.committed);
     if (observations.length !== phase.calls.length)
@@ -1950,7 +2016,7 @@ export class AgentRuntime {
           ...(item.call.id ? { toolCallId: item.call.id } : {}),
           ...(item.modelImages.length ? { images: item.modelImages } : {}) }))
       ] };
-      const compiled = await this.requestAdmission.compile(logical, snapshot.profile, snapshot.requestWindow.maxOutputTokens);
+      const compiled = await this.requestAdmission.compile(logical, snapshot.profile, snapshot.requestWindow.maxOutputTokens, admitted.presentation);
       const probe = await this.assembleContextRecovery({ runId: runtime.runId, input: runtime.input, snapshot,
         signal: runtime.signal, run: runtime.run }, new ContextAdmissionError(compiled,
         new Error('Settled tool presentations must leave an admissible context-management request.')), runtime.append, true);
@@ -2252,7 +2318,7 @@ export class AgentRuntime {
         'Native execution requires compiled streaming, continuation and result-delivery reconciliation.'
       );
     }
-    const nativeSessionStateRevisionId = assembly.fingerprint.sessionStateRevisionId;
+    const nativeStateSelectionId = assembly.fingerprint.stateSelectionId;
     this.nativeSteering?.bind(session, true);
     const deliverToolResults = session.deliverToolResults.bind(session);
     const continueNative = session.continueNative.bind(session);
@@ -2375,7 +2441,7 @@ export class AgentRuntime {
         : {
             ...turnIdentity(snapshot.record),
             requestId: context.invocationId,
-            sessionStateRevisionId: nativeSessionStateRevisionId,
+            stateSelectionId: nativeStateSelectionId,
             compiledInputIdentity: context.compiled.inputIdentity,
             capabilityRevision: context.compiled.capabilityRevision,
             ...(context.parentInvocationId ? { parentRequestId: context.parentInvocationId } : {}),
@@ -2453,7 +2519,7 @@ export class AgentRuntime {
     try {
       await this.inferenceService.invokeNative({
         invocationId: assembly.fingerprint.requestId,
-        sessionStateRevisionId: () => nativeSessionStateRevisionId,
+        stateSelectionId: () => nativeStateSelectionId,
         capturedHistoryCut: () => this.options.context?.history.capture(),
         ownerId: this.options.inferenceOwnerId ?? runtime.runId,
         purpose: 'agent_step',
@@ -3159,7 +3225,7 @@ export class AgentRuntime {
       // own no-progress allowance, under the unchanged owner/run budgets.
       recoveryBoundary: hashJson({
         windowId: inspection.window?.windowId ?? null,
-        sessionStateRevisionId: inspection.sessionState.revisionId,
+        stateSelectionId: inspection.sessionState.selectionId,
         task: ordinary.input.task, images: ordinary.input.images ?? null,
         configuration: ordinary.snapshot.configuration, profile: ordinary.snapshot.profile,
         instructions: ordinary.snapshot.instructions, catalog: ordinary.snapshot.record.toolCatalog.revision,
@@ -3169,7 +3235,7 @@ export class AgentRuntime {
     // Keep the original catalog/protocol binding. The execution gate permits
     // only checkpoint capabilities; domain calls are rejected before execution.
     const tools = ordinary.snapshot.tools;
-    if (!tools.some(tool => tool.implementationId === 'agent-core.context-transition.v1')) throw failure;
+    if (!tools.some(tool => isContextActivationTool(tool))) throw failure;
     // Probes compile bounded material only. Durable no-progress accounting is
     // read exactly when entering recovery, indexed to this unchanged boundary.
     const events = this.options.repositories.events;
@@ -3242,8 +3308,7 @@ export class AgentRuntime {
         sourceIdentity: { kind: 'accepted_run_input', runId: ordinary.runId } },
       steering: { ...steering, sourceIdentity: { kind: 'effective_steering', runId: ordinary.runId, turnId: ordinary.snapshot.record.turnId } },
       conflict, attempt: attempts + 1, maximumAttempts: CONTEXT_RECOVERY_LIMITS.requestsPerBoundary, inventory: manifest,
-      sessionState: { ...sessionState, authority: 'fallible_model_interpretation',
-        coverage: sessionState.complete ? 'complete' : 'partial' },
+      sessionState: { ...sessionState, authority: 'fallible_model_interpretation' },
       legalTransitions: inspection.legalTransitions,
       sourceBudget: inspection.budget,
       recentRecoveryResults: probe ? [] : recoveryResults,
@@ -3265,10 +3330,8 @@ export class AgentRuntime {
     let assembled: Awaited<ReturnType<typeof assembleContextControlRequest>>;
     try {
       assembled = await assembleContextControlRequest(this.requestAdmission, {
-        original: failure.compiled.logicalRequest,
-        model: snapshot.configuration.model, profile: snapshot.profile,
-        tools: toolsForModel([...tools], snapshot.profile),
-        summaries: promptToolSpecs([...tools], snapshot.profile, this.options.toolContext),
+        original: failure.compiled,
+        profile: snapshot.profile,
         task: content, maxOutputTokens: outputReservation, signal: request.signal
       });
     } catch (error) {
@@ -3292,7 +3355,7 @@ export class AgentRuntime {
     });
     const fingerprint: InferenceRequestFingerprintRecord = {
       ...turnIdentity(snapshot.record), requestId: randomUUID(),
-      sessionStateRevisionId: inspection.sessionState.revisionId,
+      stateSelectionId: inspection.sessionState.selectionId,
       compiledInputIdentity: assembled.compiled.inputIdentity,
       capabilityRevision: assembled.compiled.capabilityRevision,
       // No application/provider context is recollected: original compiled messages are preserved below.
@@ -3342,12 +3405,9 @@ export class AgentRuntime {
     let capacityNotice: PromptContextItemInput | undefined;
     const assemble = async (
       window: ModelWindow,
-      sessionState: SessionStateSnapshot
+      sessionState: SessionStateSnapshot,
+      artifacts: readonly PromptContextItemInput[] = []
     ) => {
-      const stateSequence = window.stateSequence();
-      const checkpoint = stateSequence && stateSequence.checkpointRevisionId !== (sessionState.revision?.id ?? null) && this.options.context
-        ? await this.options.context.checkpointState(stateSequence) : sessionState;
-      const stateContext = sessionStateContext(checkpoint)[0];
       const result = await this.requestAdmission.assemble(
         {
           window,
@@ -3368,8 +3428,7 @@ export class AgentRuntime {
                 ...(item.sourceUri ? { sourceUri: item.sourceUri } : {})
               }))
           }),
-          contextItems: capturedContext,
-          ...(stateContext ? { sessionState: stateContext } : {}),
+          contextItems: [...capturedContext, ...sessionStateContext(sessionState), ...artifacts],
           ...(capacityNotice ? { capacityNotice } : {}),
           tools: promptToolSpecs(
             [...request.snapshot.tools],
@@ -3398,7 +3457,7 @@ export class AgentRuntime {
         },
         request.snapshot.requestWindow.maxOutputTokens
       );
-      return { ...result, sessionStateRevisionId: sessionState.revision?.id ?? null };
+      return { ...result, stateSelectionId: sessionState.id };
     };
     const contextPublication = { committed: false, fresh: false, candidateAdmitted: false };
     const controlReserves = new Map<string, number>();
@@ -3414,7 +3473,7 @@ export class AgentRuntime {
       let renewal;
       try {
         proposed = await this.contextWindowForAdmission(input, request);
-        result = await assemble(proposed.window, input.checkpointState);
+        result = await assemble(proposed.window, input.sessionState, input.artifacts);
         await admitOrdinary(result.compiled);
       } catch (error) {
         if (input.strategy !== 'append' ||
@@ -3422,15 +3481,10 @@ export class AgentRuntime {
               !(error instanceof ContextAdmissionError && error.capacityExceeded) &&
               !(error instanceof AppendContextRenewalRequired))) throw error;
         if (!this.options.context) throw error;
-        const stateSequence = {
-          checkpointRevisionId: input.sessionState.revision?.id ?? null,
-          lineage: input.cut, parent: null
-        };
-        proposed = await this.contextWindowForAdmission({ ...input, stateSequence,
-          checkpointState: input.sessionState, strategy: 'fresh' }, request);
-        renewal = { selection: proposed.selection, stateSequence,
+        proposed = await this.contextWindowForAdmission({ ...input, strategy: 'fresh' }, request);
+        renewal = { selection: proposed.selection,
           cause: error instanceof ContextAdmissionError ? 'capacity' as const : 'prefix_incompatibility' as const };
-        result = await assemble(proposed.window, input.sessionState);
+        result = await assemble(proposed.window, input.sessionState, input.artifacts);
         await admitOrdinary(result.compiled);
       }
       if (result.compiled.inputIdentity === rejected?.inputIdentity)
@@ -3476,7 +3530,7 @@ export class AgentRuntime {
               transition: entry.transition
             });
           },
-          rejected: async (requestId, message, idempotencyKey) => {
+          rejected: async (requestId, message, idempotencyKey, details) => {
             // Admission alone is not publication. A failed commit must not dispatch its candidate.
             contextPublication.candidateAdmitted = false;
             capturedContext.push({
@@ -3486,11 +3540,11 @@ export class AgentRuntime {
               representation: 'full',
               mediaType: 'text/plain',
               title: 'Context selection rejected',
-              content: message,
+              content: details ? JSON.stringify({ message, details }) : message,
               purpose:
                 'The requested selection was not committed; the preceding window remains active.'
             });
-            await emit({ type: 'context.transition.rejected', requestId, idempotencyKey, message });
+            await emit({ type: 'context.transition.rejected', requestId, idempotencyKey, message, ...(details ? { details } : {}) });
           },
           signal: request.signal
         });
@@ -3509,12 +3563,11 @@ export class AgentRuntime {
     // refreshes the window if accepted sources advanced during validation/replay.
     const cut = this.activeHistoryCut ?? await this.options.context?.history.capture();
     const sessionState = (await this.options.context?.sessionState(cut)) ?? {
-      revision: null,
-      content: { blocks: [] }
+      id: null, items: []
     };
     let result: Awaited<ReturnType<typeof assemble>>;
     try {
-      result = await assemble(request.modelWindow, sessionState);
+      result = await assemble(request.modelWindow, sessionState, await this.options.context?.selectedArtifactContext(cut) ?? []);
     } catch (error) {
       if (!(error instanceof NativeContextTransitionRequired)) throw error;
       await this.scheduleModelCompatibilityTransition(request.runId);
@@ -3579,7 +3632,7 @@ export class AgentRuntime {
     const fingerprint: InferenceRequestFingerprintRecord = Object.freeze({
       ...identity,
       requestId: randomUUID(),
-      sessionStateRevisionId: result.sessionStateRevisionId,
+      stateSelectionId: result.stateSelectionId,
       compiledInputIdentity: compiled.inputIdentity,
       capabilityRevision: compiled.capabilityRevision,
       configuredContextIds: contextSourceIds(contextInputs.configured, 'configured'),
@@ -3612,6 +3665,13 @@ export class AgentRuntime {
           }
         : {})
     });
+    const boundTools = Object.freeze(request.snapshot.tools.map(tool => Object.freeze({ name: tool.name,
+      implementationId: tool.implementationId, available: true, reasons: Object.freeze([]) })));
+    const boundCapabilities = { bindingId: this.options.modelBindingId ?? this.capabilityCatalog(request.snapshot.profile).snapshot.bindingId,
+      policyRevision: hashJson(this.toolPolicy), tools: boundTools };
+    this.lastAdmittedCapabilities = Object.freeze({ inputIdentity: compiled.inputIdentity,
+      protocolCapabilityRevision: compiled.capabilityRevision,
+      snapshot: Object.freeze({ ...boundCapabilities, revision: hashJson(boundCapabilities) }) });
     await this.options.onRequestAdmitted?.({
       requestId: fingerprint.requestId,
       sourceIds: [
@@ -3635,7 +3695,7 @@ export class AgentRuntime {
     await this.requestAdmission.admit(compiled, request.snapshot.profile);
     const context = this.options.context;
     if (!this.options.contextRenewal?.automatic || !context ||
-        !request.snapshot.tools.some((tool) => tool.implementationId === 'agent-core.context-transition.v1')) return;
+        !request.snapshot.tools.some((tool) => isContextActivationTool(tool))) return;
     const cut = await context.history.capture();
     const identity = hashJson({
       cut, inputIdentity: compiled.inputIdentity, accounting: compiled.accounting,
@@ -3684,8 +3744,6 @@ export class AgentRuntime {
         throw new AppendContextRenewalRequired('Historical excerpts require a fresh request without an exact bound request.');
       const window = new ModelWindow(this.estimator);
       window.replaceWith(request.modelWindow);
-      window.setStateSequence(input.stateSequence);
-      if (input.stateSequence.notice) window.recordStateNotice(input.stateSequence.notice);
       return { window, selection: input.selection };
     }
     if (request.snapshot.profile.capabilities.protocol?.contextReset !== 'fresh_request')
@@ -3694,7 +3752,8 @@ export class AgentRuntime {
       profile: request.snapshot.profile, artifacts: this.options.repositories.artifacts });
     const selection = { ...input.selection, continuity: {
       kind: 'fresh' as const,
-      resetId: `renewal-${hashJson({ cut: input.cut, state: input.sessionState.revision?.id ?? null, model: request.snapshot.configuration.model })}`,
+      historyPosition: input.cut,
+      resetId: `renewal-${hashJson({ cut: input.cut, state: input.sessionState.id, model: request.snapshot.configuration.model })}`,
       model: { provider: request.snapshot.profile.provider, model: request.snapshot.configuration.model,
         ...(request.snapshot.configuration.reasoning === undefined ? {} : { reasoning: request.snapshot.configuration.reasoning }),
         ...(request.snapshot.configuration.temperature === undefined ? {} : { temperature: request.snapshot.configuration.temperature }) },
@@ -3705,7 +3764,6 @@ export class AgentRuntime {
       this.options.repositories.artifacts,
       new Set(selection.retained.map(source => source.entryId)), request.runId);
     recordContextExcerpts(window, input.excerpts);
-    window.setStateSequence(input.stateSequence);
     return { window, selection };
   }
 
@@ -3854,13 +3912,14 @@ export class AgentRuntime {
       const expected = transition.expectedCut;
       const exchangeId = assistantResponseKey(runId, transition.toolInvocation);
       const toolSources = await this.options.context.history.toolSources(transition.toolInvocation, cut);
+      const originCatalog = (await this.recordedTurnSnapshot(runId, transition.toolInvocation)).toolCatalog;
       let toolCallId: string | undefined;
       let originInput: import('@agent-core/persistence').ProtectedArtifactRef | undefined;
       for (const source of toolSources) {
         retained.set(source.entryId, source);
         const entry = await this.options.context.history.resolve(source, cut, 1024 * 1024);
         if (entry?.type === 'tool_call' && entry.callIndex === transition.toolInvocation.callIndex &&
-            decodeToolCall(entry.call).name === 'context_transition') toolCallId = entry.callId;
+            isContextActivationTool(originCatalog.entries.find(tool => tool.name === decodeToolCall(entry.call).name))) toolCallId = entry.callId;
         if (entry?.type === 'assistant') originInput = entry.inferenceInput;
       }
       let acknowledged = false;
@@ -4522,17 +4581,19 @@ export class AgentRuntime {
       run: Object.freeze([...(input.contextItems ?? [])])
     });
   }
-  private availableTools(profile?: ModelProfile): CompiledToolDefinition[] {
+  private capabilityCatalog(profile?: ModelProfile) {
     const context = this.toolContext(new AbortController().signal);
-    return this.tools.filter(
-      (tool) =>
-        isToolAvailable(tool, this.toolPolicy) &&
-        toolRequirementsSatisfied(tool, {
-          ...(context.services ? { services: context.services } : {}),
-          ...(profile ? { modelInputModalities: profile.modalities.input } : {}),
-          hostCapabilities: this.options.resources?.capabilities ?? []
-        })
-    );
+    return resolveEffectiveToolCatalog({
+      bindingId: this.options.modelBindingId ?? hashJson({ provider: this.options.provider.id, implementationId: this.options.provider.implementationId,
+        model: this.options.model, profile: profile ?? null }),
+      tools: this.tools, policy: this.toolPolicy,
+      host: { ...(context.services ? { services: context.services } : {}),
+        ...(profile ? { modelInputModalities: profile.modalities.input } : {}),
+        hostCapabilities: this.options.resources?.capabilities ?? [] }
+    });
+  }
+  private availableTools(profile?: ModelProfile): CompiledToolDefinition[] {
+    return [...this.capabilityCatalog(profile).tools];
   }
   private async releaseOwnedResources(
     runId: string,
@@ -4542,32 +4603,10 @@ export class AgentRuntime {
     if (!resources || resources.lifetime.kind === 'owner') return undefined;
     try {
       for (const report of await resources.release(runId)) {
-        const key = `${runId}:resource:${report.resourceId}:released`;
-        const previous =
-          report.settlementReference ??
-          (await this.options.repositories.events.referenceByKey(runId, key));
-        if (previous) {
-          const { event } = await this.options.repositories.events.readReference(previous);
-          if (
-            event.type !== 'resource.released' ||
-            event.resourceId !== report.resourceId ||
-            event.outcome !== report.outcome
-          )
-            throw new Error('Committed resource settlement does not match its release report.');
-        } else
-          await append(
-            {
-              type: 'resource.released',
-              runId,
-              resourceId: report.resourceId,
-              outcome: report.outcome,
-              details: report.details
-            },
-            key
-          );
-        if (report.outcome === 'unknown')
-          return new Error(`Resource ${report.resourceId} release outcome is unknown.`);
-        await resources.acknowledge(report.resourceId);
+        await commitResourceRelease({
+          runId, report, events: this.options.repositories.events, append,
+          acknowledge: (resourceId) => resources.acknowledge(resourceId)
+        });
       }
       return undefined;
     } catch (error) {
@@ -5148,20 +5187,17 @@ function requestCapacityConflict(
 function sessionStateContext(
   state: SessionStateSnapshot
 ): readonly Omit<PromptContextItem, 'tokenEstimate'>[] {
-  if (!state.revision) return [];
-  return [
-    {
-      id: `session-state:${state.revision.id}`,
-      sourceUri: `session://session-state/${state.revision.id}`,
-      sourceKind: 'generated',
-      representation: 'full',
-      mediaType: 'application/json',
-      title: 'Current session state — generated interpretation',
-      content: JSON.stringify(state.content),
-      purpose:
-        'Current fallible understanding. Not instructions, authority, execution evidence or verification.'
-    }
-  ];
+  return state.items.map(item => ({
+    id: `session-state:${item.itemId}:${item.revisionId}:${hashJson(item.range ?? null)}`,
+    sourceUri: `session://state/${item.itemId}/${item.revisionId}`,
+    sourceKind: 'generated' as const,
+    representation: item.range ? 'excerpt' as const : 'full' as const,
+    mediaType: item.sources?.length ? 'application/json' : 'text/plain',
+    title: 'Selected working material',
+    content: item.sources?.length ? JSON.stringify({ text: item.text, sources: item.sources }) : item.text,
+    ...(item.range ? { range: { kind: 'byte' as const, start: item.range.offset, end: item.range.offset + item.range.bytes } } : {}),
+    purpose: 'Exact selected model-authored revision. Fallible interpretation, not instructions, authority, execution evidence or verification.'
+  }));
 }
 
 class AppendContextRenewalRequired extends Error {}
@@ -5181,10 +5217,17 @@ function snapshotRecoveryEmitter(snapshot: TurnSnapshot, emit: (event: AgentProg
     : emit;
 }
 
+function isContextActivationTool(tool: Pick<CompiledToolDefinition, 'implementationId'> | undefined): boolean {
+  return tool !== undefined && ['agent-core.context-transition.v2', 'agent-core.context-save-and-activate.v2'].includes(tool.implementationId);
+}
+function isContextMutationTool(tool: CompiledToolDefinition | undefined): boolean {
+  return isContextActivationTool(tool) || tool?.implementationId === 'agent-core.session-state-save.v1';
+}
+
 function isContextCheckpointTool(tool: CompiledToolDefinition): boolean {
-  return tool.implementationId === 'agent-core.context-transition.v1' ||
+  return isContextMutationTool(tool) ||
     (tool.implementationId === `agent-core.${tool.name}.v1` &&
       tool.effectEnvelope.accesses.every(access => access.mode === 'read' &&
-        (access.scope === 'context' || access.scope === 'history')) &&
-      ['_inspect', '_read', '_search', '_latest'].some(suffix => tool.name.endsWith(suffix)));
+        (['context', 'history', 'session_state'].includes(access.scope))) &&
+      ['_inspect', '_read', '_search', '_latest', '_list'].some(suffix => tool.name.endsWith(suffix)));
 }

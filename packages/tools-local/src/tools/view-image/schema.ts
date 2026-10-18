@@ -1,5 +1,5 @@
 import * as z from 'zod';
-import { artifactRefSchema } from '../process-output.js';
+import { artifactRefSchema } from '@agent-core/tools';
 
 export const viewImageInputSchema = z.strictObject({
   path: z.string().trim().min(1),

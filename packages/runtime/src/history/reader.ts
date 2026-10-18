@@ -1640,8 +1640,9 @@ function publicText(entry: SessionBranchEntry): string {
       });
     case 'branch':
       return JSON.stringify({ fromEntryId: entry.fromEntryId, label: entry.label });
+    case 'session_state_batch':
+      return JSON.stringify({idempotencyKey:entry.batch.idempotencyKey,revisions:entry.batch.revisions.map(({itemId,revisionId,deleted,contentBytes}) => ({itemId,revisionId,deleted,contentBytes}))});
     case 'context_transition':
-      if (entry.sessionState) return JSON.stringify(entry.sessionState.content);
       return JSON.stringify({
         windowId: entry.window.windowId,
         reason: entry.window.reason,

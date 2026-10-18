@@ -3,6 +3,7 @@ import {
   RequestTokenEstimator,
   type ModelInputItem,
   type ModelProfile,
+  type ModelRequest,
   type RequestEstimator
 } from '@agent-core/model';
 import { hashJson, type ArtifactRepository } from '@agent-core/persistence';
@@ -15,8 +16,10 @@ import {
   type PromptContextDelivery,
   type PromptContextItem,
   type PromptContextItemInput,
+  type PromptContextPresentation,
   type PromptInstructionBlock,
   type PromptMaterial,
+  type PromptRuntimeControl,
   type PromptToolSummary
 } from './prompt-material.js';
 
@@ -34,7 +37,6 @@ export interface ModelRequestAssemblyInput {
   readonly images?: readonly import('../session/images.js').SessionImageInput[];
   readonly instructions: readonly PromptInstructionBlock[];
   readonly contextItems?: readonly PromptContextItemInput[];
-  readonly sessionState?: PromptContextItemInput;
   readonly capacityNotice?: PromptContextItemInput;
   readonly tools: readonly PromptToolSummary[];
   readonly modelProfile: ModelProfile;
@@ -62,18 +64,45 @@ export class ModelRequestAssembler {
     private readonly artifacts?: ArtifactRepository
   ) {}
 
+  /** Append typed control to a captured request without reconstructing its native prefix. */
+  async assembleControl(input: {
+    readonly original: ModelRequest;
+    readonly presentation: RequestPresentation;
+    readonly control: PromptRuntimeControl;
+    readonly modelProfile: ModelProfile;
+  }): Promise<ModelRequestAssembly> {
+    const material = createPromptMaterial({
+      task: input.control.content,
+      runtimeControl: { kind: input.control.kind, id: input.control.id },
+      instructions: [], context: [], tools: []
+    });
+    const suffix = await compilePromptMaterial(material);
+    const messages = Object.freeze([...input.original.messages, ...suffix]);
+    return Object.freeze({
+      presentation: Object.freeze({ ...input.presentation, runtimeControl: Object.freeze({
+        kind: input.control.kind, id: input.control.id, revision: hashJson(suffix)
+      }) }),
+      continuationSource: input.original,
+      material, messages, historyMessages: input.original.messages,
+      context: Object.freeze({ items: Object.freeze([]), totalTokens: 0 }),
+      estimate: Object.freeze({
+        modelWindowTokens: accountModelRequest({ ...input.original, messages }, input.modelProfile,
+          { estimator: this.estimator }).estimatedInputTokens,
+        contextTokens: 0
+      })
+    });
+  }
+
   async assemble(input: ModelRequestAssemblyInput): Promise<ModelRequestAssembly> {
     const history = input.window.messagesFor(input.modelProfile);
     const prior = input.window.priorMessagesFor(input.modelProfile);
     const context = deliverPromptContext(input.contextItems ?? [], this.estimator);
-    const state = deliverPromptContext(input.sessionState ? [input.sessionState] : [], this.estimator);
     const notices = deliverPromptContext(input.capacityNotice ? [input.capacityNotice] : [], this.estimator);
     const material = createPromptMaterial({
       task: input.task,
       ...(input.images === undefined ? {} : { images: input.images }),
       instructions: input.instructions,
       context: context.items,
-      ...(state.items[0] ? { sessionState: state.items[0] } : {}),
       ...(notices.items[0] ? { capacityNotice: notices.items[0] } : {}),
       tools: input.tools,
       ...(input.metadata ? { metadata: input.metadata } : {})
@@ -90,8 +119,8 @@ export class ModelRequestAssembler {
         authorityRole: input.modelProfile.capabilities.protocol?.roles.includes('developer') ? 'developer' : 'system'
       }
     );
-    const presentation: RequestPresentation = {
-      ...(material.capacityNotice ? { capacityNotice: hashJson(renderContext([material.capacityNotice])) } : {}),
+    const presentation: RequestPresentation = Object.freeze({
+      capacityNotice: contextPresentation('runtime-notice', material.capacityNotice ? [material.capacityNotice] : []),
       authority: hashJson(
         messages.filter((item) => item.role === 'system' || item.role === 'developer')
       ),
@@ -100,11 +129,8 @@ export class ModelRequestAssembler {
           .filter((item) => item.role === 'user')
           .map(({ role, content }) => ({ role, content }))
       ),
-      context: hashJson(renderContext(material.context)),
-      sessionState: hashJson(
-        material.sessionState ? renderContext([material.sessionState]) : null
-      )
-    };
+      context: contextPresentation('host-context', material.context)
+    });
     const bound = input.window.continuation();
     const continuationSource = bound
       ? {
@@ -117,11 +143,6 @@ export class ModelRequestAssembler {
         throw new NativeContextTransitionRequired(
           continuationSource,
           'Current instructions differ from the authority bound to earlier reasoning.'
-        );
-      if (presentation.sessionState !== bound.input.presentation.sessionState)
-        throw new NativeContextTransitionRequired(
-          continuationSource,
-          'Session state changed and requires a fresh request.'
         );
       const newRun = input.runId !== bound.input.runId;
       const inputMessages =
@@ -148,13 +169,17 @@ export class ModelRequestAssembler {
         ...bound.prior,
         ...inputMessages,
         ...bound.current,
-        ...(presentation.context !== bound.input.presentation.context &&
-        material.context.length
-          ? [{ role: 'user' as const, content: renderContext(material.context) }]
+        ...(presentation.context.fingerprint !== bound.input.presentation.context.fingerprint
+          ? [{ role: 'user' as const, content: renderContextReplacement(
+              bound.input.presentation.context, presentation.context, material.context
+            ) }]
           : []),
-        ...(presentation.capacityNotice !== bound.input.presentation.capacityNotice &&
-        material.capacityNotice
-          ? [{ role: 'user' as const, content: renderContext([material.capacityNotice]) }]
+        ...(presentation.capacityNotice.fingerprint !== bound.input.presentation.capacityNotice.fingerprint
+          ? [{ role: 'user' as const, content: renderContextReplacement(
+              bound.input.presentation.capacityNotice,
+              presentation.capacityNotice,
+              material.capacityNotice ? [material.capacityNotice] : []
+            ) }]
           : [])
       ];
     }
@@ -166,8 +191,8 @@ export class ModelRequestAssembler {
       messages,
       historyMessages: history.messages,
       context: Object.freeze({
-        items: Object.freeze([...context.items, ...state.items, ...notices.items]),
-        totalTokens: context.totalTokens + state.totalTokens + notices.totalTokens
+        items: Object.freeze([...context.items, ...notices.items]),
+        totalTokens: context.totalTokens + notices.totalTokens
       }),
       estimate: Object.freeze({
         modelWindowTokens: accountModelRequest(
@@ -175,10 +200,51 @@ export class ModelRequestAssembler {
           input.modelProfile,
           { estimator: this.estimator }
         ).estimatedInputTokens,
-        contextTokens: context.totalTokens + state.totalTokens + notices.totalTokens
+        contextTokens: context.totalTokens + notices.totalTokens
       })
     });
   }
+}
+
+/** A replacement revokes current applicability; the immutable prefix remains historical evidence. */
+function renderContextReplacement(
+  previous: PromptContextPresentation,
+  current: PromptContextPresentation,
+  items: readonly PromptContextItem[]
+): string {
+  const label = current.kind === 'host-context' ? 'Application reference material' : 'Runtime notices';
+  const previousRevisions = new Map(previous.items.map(item => [item.id, item.revision]));
+  const currentRevisions = new Map(current.items.map(item => [item.id, item.revision]));
+  const superseded = previous.items.filter(item => currentRevisions.get(item.id) !== item.revision);
+  const changedItems = items.filter((item, index) => previousRevisions.get(item.id) !== current.items[index]?.revision);
+  return [
+    `${label} selection replacement. Removed or superseded item revisions remain historical evidence only. Unchanged exact item revisions remain applicable through the preserved prefix. The current ordered manifest below defines the complete applicable selection; only introduced or changed item bodies are repeated. This replacement does not change instruction authority or erase original evidence.`,
+    `<context-selection-replacement kind="${current.kind}" previous="${escapeAttr(previous.fingerprint)}" current="${escapeAttr(current.fingerprint)}">`,
+    `<superseded>${escapeText(JSON.stringify(superseded))}</superseded>`,
+    `<current>${escapeText(JSON.stringify(current.items))}</current>`,
+    items.length === 0
+      ? `There are no current items in this ${current.kind} selection.`
+      : changedItems.length
+        ? renderContext(changedItems)
+        : 'No new item bodies. Resolve unchanged exact revisions from the preserved prefix in the current manifest order.',
+    '</context-selection-replacement>'
+  ].join('\n');
+}
+
+function contextPresentation<TKind extends PromptContextPresentation['kind']>(
+  kind: TKind,
+  items: readonly PromptContextItem[]
+): PromptContextPresentation & { readonly kind: TKind } {
+  return Object.freeze({
+    kind,
+    applicability: 'current-request',
+    update: 'replace',
+    items: Object.freeze(items.map((item) => Object.freeze({
+      id: item.id,
+      revision: hashJson(renderContext([item]))
+    }))),
+    fingerprint: hashJson(renderContext(items))
+  });
 }
 
 /** Stable reference material and session state precede append-only conversation. */
@@ -228,13 +294,9 @@ export async function compilePromptMaterial(
   const contextMessage: ModelInputItem | undefined = contextText
     ? Object.freeze({ role: 'user', content: contextText })
     : undefined;
-  const sessionState: ModelInputItem | undefined = material.sessionState
-    ? Object.freeze({ role: 'user', content: renderContext([material.sessionState]) })
-    : undefined;
   return Object.freeze([
     ...instructionMessages.filter((item) => item.role !== 'user'),
     ...(contextMessage ? [contextMessage] : []),
-    ...(sessionState ? [sessionState] : []),
     ...conversation.prior,
     ...instructionMessages.filter((item) => item.role === 'user'),
     taskMessage,

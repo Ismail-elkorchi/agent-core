@@ -857,7 +857,7 @@ for (const change of ['no state', 'unchanged state', 'revised state', 'new user'
       window: new ModelWindow(), task: 'Inspect the directory.', modelProfile: profile,
       instructions: [{ id: 'guidance-1', role: 'developer', priority: 0, content: 'Preserve unrelated work.' }],
       tools: [{ name: 'exec_command', description: 'Inspect the directory.', inputFormat: 'JSON', accessModes: ['execute'] }],
-      ...(change === 'no state' ? {} : { sessionState: state })
+      ...(change === 'no state' ? {} : { contextItems: [state] })
     };
     const settings = { model: profile.id, tools: [{ type: 'function', function: {
       name: 'exec_command', description: 'Inspect the directory.',
@@ -868,11 +868,14 @@ for (const change of ['no state', 'unchanged state', 'revised state', 'new user'
       const result = await inference.invoke({
         ownerId: 'continuity-session', invocationId, purpose: 'generation', session,
         request: admitted.request, compiled: admitted.compiled, profile,
-        sessionStateRevisionId: input.sessionState?.id ?? null, outputReservation: 100
+        stateSelectionId: input.contextItems?.[0]?.id ?? null, outputReservation: 100
       });
       return { ...admitted, response: result.response };
     };
     const first = await dispatch(initial, 'first');
+    if (change === 'revised state') initial.window.bindContinuation({
+      request: first.request, presentation: first.assembly.presentation
+    });
     initial.window.recordModelOutput({
       turnIndex: 1, output: first.response.output, content: first.response.content,
       toolCalls: first.response.toolCalls ?? []
@@ -881,7 +884,7 @@ for (const change of ['no state', 'unchanged state', 'revised state', 'new user'
       turnIndex: 1, toolName: call.name, toolCallType: call.type, callId: call.id, immediateContent: '/workspace'
     });
     const next = { ...initial };
-    if (change === 'revised state') next.sessionState = { ...state, id: 'state-2', content: 'Revised understanding.' };
+    if (change === 'revised state') next.contextItems = [{ ...state, id: 'state-2', content: 'Revised understanding.' }];
     if (change === 'guidance') next.instructions = [{ ...initial.instructions[0], id: 'guidance-2', content: 'Preserve unrelated work. Review changed files.' }];
     if (change === 'new user') {
       next.window = new ModelWindow();
@@ -892,16 +895,26 @@ for (const change of ['no state', 'unchanged state', 'revised state', 'new user'
     }
     if (change === 'window replacement') {
       next.window = new ModelWindow();
-      next.sessionState = { ...state, id: 'state-2', content: 'Revised understanding.' };
+      next.contextItems = [{ ...state, id: 'state-2', content: 'Revised understanding.' }];
     }
     const second = await dispatch(next, 'second');
     const wire = JSON.parse(sockets[0].sent[1]);
-    const reusable = ['no state', 'unchanged state', 'new user'].includes(change);
+    const reusable = ['no state', 'unchanged state', 'revised state', 'new user'].includes(change);
     assert.equal(second.response.transport.strategy, reusable ? 'websocket_delta' : 'websocket_full_replay');
     if (reusable) {
       assert.equal(wire.previous_response_id, 'response-1');
-      assert.deepEqual(wire.input.map(item => item.type), change === 'new user' ? ['function_call_output', undefined] : ['function_call_output']);
+      assert.deepEqual(wire.input.map(item => item.type), ['new user', 'revised state'].includes(change) ? ['function_call_output', undefined] : ['function_call_output']);
       if (change === 'new user') assert.deepEqual(wire.input.at(-1), { role: 'user', content: 'Explain the inspection.' });
+      if (change === 'revised state') {
+        assert.deepEqual(second.request.messages.slice(0, first.request.messages.length), first.request.messages,
+          'Changing selected understanding preserves the admitted native prefix');
+        assert.equal(wire.input.at(-1).role, 'user');
+        assert.match(wire.input.at(-1).content, /context-selection-replacement kind="host-context"/);
+        assert.match(wire.input.at(-1).content, /Removed or superseded item revisions remain historical evidence only/);
+        assert.match(wire.input.at(-1).content, /Revised understanding\./);
+        assert.equal(second.assembly.presentation.context.items.length, 1);
+        assert.equal(second.assembly.presentation.context.items[0].id, 'state-2');
+      }
       assert.equal(wire.input[0].call_id, 'inspect-1');
       assert.equal(wire.input[0].output, '/workspace');
     } else {
@@ -912,7 +925,7 @@ for (const change of ['no state', 'unchanged state', 'revised state', 'new user'
       assert.deepEqual(body, second.compiled.body);
       const interpretations = body.input.filter(item => /(?:Current|Revised) understanding\./u.test(JSON.stringify(item)));
       assert.equal(interpretations.length, 1);
-      assert.ok(JSON.stringify(interpretations[0]).includes(next.sessionState.content));
+      assert.ok(JSON.stringify(interpretations[0]).includes(next.contextItems[0].content));
     }
   });
 }

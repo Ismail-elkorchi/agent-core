@@ -440,6 +440,7 @@ test(
       maxTotalInvocations: 300
     });
     assert.equal(report.measurement, 'deterministic-simulation');
+    assert.ok(report.limitations.some(message => message.includes('do not evaluate narrative state mutation')));
     assert.equal(report.defaultRecommendation, null);
     assert.equal(
       report.configuration.gates.maximumSuccessRegression,

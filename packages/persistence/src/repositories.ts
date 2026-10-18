@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { readContentAddressedJsonNode, writeContentAddressedJsonNode } from './content-addressed-node.js';
 import { canonicalJsonString, parseJsonObject, type JsonObject } from '@agent-core/json';
 import { createHash, randomUUID } from 'node:crypto';
@@ -5,6 +6,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import {
   assertEventReference,
+  captureEventForAppend,
   firstSequenceAfter,
   eventMetadataRouteKey,
   eventMetadataRouteKeys,
@@ -20,6 +22,7 @@ import {
   type EventSourceMetadata,
   type EventPage,
   PersistenceConflictError,
+  PersistenceDriverOwnershipLostError,
   PersistenceIndexRecoveryRequiredError,
   PersistenceCorruptionError,
   type ConditionalEventAppendOptions,
@@ -64,11 +67,14 @@ export interface JsonlEventRepositoryOptions<TEvent extends TypedEvent> {
   readonly lockTimeoutMs?: number;
 }
 
+const eventOwnershipScope = new AsyncLocalStorage<ReadonlySet<string>>();
+
 export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRepository<TEvent> {
   private readonly rootDir: string;
   private readonly codec: EventCodec<TEvent>;
   private readonly metadataIndexes: readonly EventMetadataIndex[];
   private readonly decoded = new WeakMap<EncodedEnvelope, TEvent>();
+  private readonly appendMetadata = new WeakMap<EncodedEnvelope,{readonly metadata:Readonly<Record<string,string>>;readonly routeKeys:readonly string[]}>();
   private readonly lockTimeoutMs: number;
   private readonly queues = new Map<string, Promise<void>>();
   private readonly indexes = new Map<string, EventAppendIndex>();
@@ -119,7 +125,8 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
         this.filePath(runId),
         this.lockTimeoutMs,
         async (assertOwned) => {
-          const encodedEvent = this.codec.encode(event);
+          const captured = captureEventForAppend(this.codec,event,this.metadataIndexes);
+          const encodedEvent = captured.encoded;
           await this.ensureHeader(runId);
           const index = await this.refreshIndex(runId, true);
           if (options.idempotencyKey) {
@@ -140,7 +147,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
             sequence: index.recordCount,
             timestamp: options.timestamp ?? new Date().toISOString(),
             schemaVersion: '1',
-            actor: options.actor ?? inferActor(event.type),
+            actor: options.actor ?? inferActor(captured.type),
             event: encodedEvent,
             ...(options.causationId ? { causationId: options.causationId } : {}),
             ...(options.correlationId ? { correlationId: options.correlationId } : {}),
@@ -149,6 +156,8 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
             driverGeneration: previous?.driverGeneration ?? 0
           });
           const encodedEnvelope: EncodedEnvelope = Object.freeze({ ...base, hash: hashJson(base) });
+          this.decoded.set(encodedEnvelope,captured.event);
+          this.appendMetadata.set(encodedEnvelope,{metadata:captured.metadata,routeKeys:captured.routeKeys});
           await assertOwned();
           await appendJsonlRecord(this.filePath(runId), encodedEnvelope);
           await this.acceptIndexedAppend(runId, index, encodedEnvelope);
@@ -166,7 +175,8 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     return this.enqueue(runId, async () => {
       assertConditionalOptions(options);
       assertIdentifier(options.idempotencyKey, 'idempotencyKey');
-      const encodedEvent = this.codec.encode(event);
+      const captured = captureEventForAppend(this.codec,event,this.metadataIndexes);
+      const encodedEvent = captured.encoded;
       const acquisition = { completed: false };
       try {
         return await withPersistenceFileLock(
@@ -208,7 +218,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
               sequence: currentTail.sequence + 1,
               timestamp: options.timestamp ?? new Date().toISOString(),
               schemaVersion: '1' as const,
-              actor: options.actor ?? inferActor(event.type),
+              actor: options.actor ?? inferActor(captured.type),
               event: encodedEvent,
               ...(options.causationId ? { causationId: options.causationId } : {}),
               ...(options.correlationId ? { correlationId: options.correlationId } : {}),
@@ -220,6 +230,8 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
               ...base,
               hash: hashJson(base)
             });
+            this.decoded.set(encodedEnvelope,captured.event);
+            this.appendMetadata.set(encodedEnvelope,{metadata:captured.metadata,routeKeys:captured.routeKeys});
             try {
               await assertOwned();
               await appendJsonlRecord(this.filePath(runId), encodedEnvelope);
@@ -251,6 +263,18 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
         if (acquisition.completed || error instanceof PersistenceCorruptionError) throw error;
         return Object.freeze({ kind: 'not_committed', failure: persistenceFailure(error) });
       }
+    });
+  }
+
+  withDriverGeneration<T>(runId: string, generation: number, publish: () => Promise<T>): Promise<T> {
+    assertIdentifier(runId, 'runId');
+    if (!Number.isSafeInteger(generation) || generation < 0) throw new TypeError('Invalid driver generation.');
+    return this.withIndexRead(runId, async () => {
+      let tail: EventLedgerTail;
+      try { tail = tailFromEncoded((await this.refreshIndex(runId, false, true)).tail); }
+      catch (error) { if (nodeCode(error) !== 'ENOENT') throw error; tail = tailFromEncoded(undefined); }
+      if (tail.driverGeneration !== generation) throw new PersistenceDriverOwnershipLostError(runId,generation,tail.driverGeneration);
+      return eventOwnershipScope.run(new Set([...(eventOwnershipScope.getStore() ?? []),path.resolve(this.filePath(runId))]), publish);
     });
   }
 
@@ -498,13 +522,13 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       runId,
       type: eventType(envelope),
       bytes,
-      metadata: parseEventMetadata(this.codec.metadata?.(this.domainEvent(envelope)) ?? {})
+      metadata: this.appendMetadata.get(envelope)?.metadata ?? parseEventMetadata(this.codec.metadata?.(this.domainEvent(envelope)) ?? {})
     };
     await atomicWritePrivateJson(this.sequencePath(runId, envelope.sequence), {
       ...content,
       contentHash: hashJson(content)
     });
-    for (const routeKey of eventMetadataRouteKeys(this.metadataIndexes, content.type, content.metadata)) {
+    for (const routeKey of this.appendMetadata.get(envelope)?.routeKeys ?? eventMetadataRouteKeys(this.metadataIndexes, content.type, content.metadata)) {
       const digest = routingDigest(routeKey);
       const known = await this.routingCatalogContains(runId, index.routingRootHash, digest);
       await this.appendRoutingSequence(runId, routeKey, envelope.sequence, known);
@@ -1287,6 +1311,8 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   }
 
   private enqueue<T>(runId: string, operation: () => Promise<T>): Promise<T> {
+    if (eventOwnershipScope.getStore()?.has(path.resolve(this.filePath(runId))))
+      return Promise.reject(new Error('Event repository access inside ownership publication is not allowed.'));
     const prior = this.queues.get(runId) ?? Promise.resolve();
     const result = prior
       .catch(() => undefined)

@@ -266,20 +266,11 @@ export function contextView(
           ...(state.inspection?.sessionState
             ? [
                 text({
-                  content: `Current session state · generated interpretation · ${state.inspection.sessionState.revisionId ?? 'empty'}`
+                  content: `Working material · ${String(state.inspection.sessionState.selectedCount)} exact revisions selected`
                 }),
-                text({
-                  content: ('content' in state.inspection.sessionState
-                    ? JSON.stringify(state.inspection.sessionState.content, null, 2)
-                    : 'preview' in state.inspection.sessionState ? state.inspection.sessionState.preview : undefined) ?? 'No session-state content.'
-                }),
-                ...(!state.inspection.sessionState.complete
-                  ? [
-                      text({
-                        content:
-                          'Partial state preview. Retrieve its original through session history for the remaining content.'
-                      })
-                    ]
+                text({ content: JSON.stringify(state.inspection.sessionState.stored ?? { selected: state.inspection.sessionState.selected }, null, 2) }),
+                ...(state.inspection.sessionState.stored?.coverage === 'partial'
+                  ? [text({ content: 'Partial material inventory. Read an item by its exact revision or continue the bounded listing.' })]
                   : [])
               ]
             : [])

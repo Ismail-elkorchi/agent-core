@@ -261,7 +261,7 @@ export interface AgentTurnSnapshotRecord {
 
 /** The immutable request truth created only after every dynamic input has resolved. */
 export interface InferenceRequestFingerprintRecord extends AgentTurnIdentity {
-  readonly sessionStateRevisionId: string | null;
+  readonly stateSelectionId: string | null;
   readonly parentRequestId?: string;
   readonly compiledInputIdentity: string;
   readonly capabilityRevision: string;

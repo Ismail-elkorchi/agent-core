@@ -174,7 +174,7 @@ test('explicit selection retains original evidence and complete parallel exchang
   assert.ok(observations.every(item => /"revision"\s*:\s*2/u.test(item.content)), JSON.stringify(observations));
   const after = await state.context.inspect();
   assert.ok(after.window.selection.retained.length > 1);
-  assert.equal(after.sessionState.revisionId, null);
+  assert.deepEqual(after.sessionState.selected, []);
 });
 
 test('model selection uses invocation identity and retains its own complete tool exchange', async () => {
@@ -195,8 +195,8 @@ test('model selection uses invocation identity and retains its own complete tool
             {
               type: 'function',
               id: 'renew-call',
-              name: 'context_transition',
-              input: { kind: 'json', value: { reason: 'Keep the current purpose', sessionState: stateContent('Current accepted task remains active.') } }
+              name: 'context_save_and_activate',
+              input: { kind: 'json', value: { reason: 'Keep the current purpose', operations: createStateOperations('Current accepted task remains active.') } }
             }
           ]
         };
@@ -541,8 +541,8 @@ test('a model-selected fresh context keeps parallel observations and commits sta
     return ++turn === 1 ? {
       provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
       toolCalls: [
-        { id: 'context-call', name: 'context_transition', type: 'function', input: { kind: 'json', value: {
-          reason: 'Continue with selected originals', renewal: true, retain: [], sessionState: stateContent('Use original evidence.')
+        { id: 'context-call', name: 'context_save_and_activate', type: 'function', input: { kind: 'json', value: {
+          reason: 'Continue with selected originals', renewal: true, retain: [], operations: createStateOperations('Use original evidence.')
         } } },
         { id: 'fact-call', name: 'read_fact', type: 'function', input: { kind: 'json', value: {} } }
       ]
@@ -775,8 +775,8 @@ for (const capacity of [32000, 16000]) {
         f.requests.push(request);
         if (f.requests.length === 1) return {
           provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
-          toolCalls: [{ id: 'state', type: 'function', name: 'context_transition', input: { kind: 'json',
-            value: { reason: 'Consolidate useful understanding', sessionState: stateContent(body), ...(combined ? { retain: [] } : {}) } } }]
+          toolCalls: [{ id: 'state', type: 'function', name: 'context_save_and_activate', input: { kind: 'json',
+            value: { reason: 'Consolidate useful understanding', operations: createStateOperations(body), ...(combined ? { retain: [] } : {}) } } }]
         };
         const live = await f.context.sessionState();
         assert.equal(stateText(live), capacity === 32000 ? body : '', 'Rejected admission cannot publish a revision');
@@ -845,8 +845,8 @@ for (const lostReceipt of ['request', 'publication', 'completion_prewrite', 'com
       f.requests.push(request);
       return f.requests.length === 1
         ? { provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
-            toolCalls: [{ id: 'state', name: 'context_transition', type: 'function', input: { kind: 'json',
-              value: { reason: 'Remember constraints', sessionState: stateContent('Keep exact original requirements.') } } }] }
+            toolCalls: [{ id: 'state', name: 'context_save_and_activate', type: 'function', input: { kind: 'json',
+              value: { reason: 'Remember constraints', operations: createStateOperations('Keep exact original requirements.') } } }] }
         : { provider: 'fixture', model: 'context', content: 'Done.', terminationReason: 'stop' };
     };
     const runtime = new AgentRuntime(f.options);
@@ -865,27 +865,33 @@ for (const lostReceipt of ['request', 'publication', 'completion_prewrite', 'com
   });
 }
 
-test('state replacement and clear append once while unchanged interpretation creates no revision or notice', async () => {
+test('state activation and explicit clear append once while unchanged exact selection creates no revision', async () => {
   const f = await fixture();
-  const bodies = ['Scoped understanding.', 'Scoped understanding.', ''];
   f.provider.complete = async request => {
     const index = f.requests.push(request) - 1;
-    return index < bodies.length
+    const selected = (await f.context.sessionState()).items.map(({ itemId, revisionId }) => ({ itemId, revisionId }));
+    return index < 3
       ? { provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
-          toolCalls: [{ id: `state-${index}`, name: 'context_transition', type: 'function', input: { kind: 'json',
-            value: { reason: 'Revise interpretation only when useful', sessionState: stateContent(bodies[index]) } } }] }
+          toolCalls: [{ id: `state-${index}`, name: index === 0 ? 'context_save_and_activate' : 'context_transition',
+            type: 'function', input: { kind: 'json', value: {
+              reason: 'Select exact understanding only while applicable',
+              ...(index === 0 ? { operations: [{ kind: 'create', text: 'Scoped understanding.' }] }
+                : { sessionState: index === 1 ? selected : [] })
+            } } }] }
       : { provider: 'fixture', model: 'context', content: 'Done.', terminationReason: 'stop' };
   };
   const result = await new AgentRuntime(f.options).run({ task: 'Keep requirements explicit.' }).result;
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
   const entries = (await f.sessions.loadReplayState(f.session)).branch.filter(item => item.type === 'context_transition');
-  assert.equal(entries.length, 2, 'Unchanged interpretation creates neither a revision nor a projection notice');
+  assert.equal(entries.length, 2, 'Unchanged exact selection creates no activation');
   assert.ok(entries.every(entry => entry.transition.strategy === 'append'));
   assert.ok(entries.every(entry => entry.transition.admission.status === 'admitted'));
-  assert.equal(entries.filter(entry => entry.window.stateSequence.notice).length, 2);
   assert.equal(stateText(await f.context.sessionState()), '');
-  assert.equal(entries[1].sessionState.previousRevisionId, entries[0].id);
-  assert.deepEqual(entries[0].sessionState.content, stateContent(bodies[0]));
+  assert.equal(entries.filter(entry => entry.sessionState).length, 1, 'Clearing a view does not delete durable state');
+  const stored = await f.context.listSessionState();
+  assert.equal(stored.items.length, 1);
+  assert.equal((await f.context.readSessionState({ itemId: stored.items[0].itemId, revisionId: stored.items[0].revisionId })).text, 'Scoped understanding.');
+  assert.deepEqual(entries[1].window.selection.sessionState, []);
   const receipt = f.requests[2].messages.find(item => item.role === 'tool' && item.toolCallId === 'state-1');
   assert.match(receipt.content, /scheduled/);
 });
@@ -960,8 +966,8 @@ function answerWithStateThenFinish(f) {
     f.requests.push(request);
     return f.requests.length === 1
       ? { provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
-          toolCalls: [{ id: 'state', name: 'context_transition', type: 'function', input: { kind: 'json',
-            value: { reason: 'Preserve useful understanding', sessionState: stateContent('Accepted durable interpretation.') } } }] }
+          toolCalls: [{ id: 'state', name: 'context_save_and_activate', type: 'function', input: { kind: 'json',
+            value: { reason: 'Preserve useful understanding', operations: createStateOperations('Accepted durable interpretation.') } } }] }
       : { provider: 'fixture', model: 'context', content: 'Done.', terminationReason: 'stop' };
   };
 }
@@ -1019,11 +1025,11 @@ test('abort after publication with a lost receipt preserves committed state and 
   assert.equal(f.requests.length, 1);
 });
 
-function stateContent(text) {
-  return { blocks: text ? [{ text }] : [] };
+function createStateOperations(text) {
+  return [{ kind: 'create', text }];
 }
 function stateText(snapshot) {
-  return snapshot.content.blocks?.[0]?.text ?? '';
+  return snapshot.items.map(item => item.text).join('\n');
 }
 // Structural source-selection tests supply an explicit immutable compilation boundary.
 // Full runtime tests above separately verify successor prompt assembly and transport.
@@ -1100,8 +1106,8 @@ test('state publication with active historical excerpts uses fresh when no bound
     f.requests.push(request);
     return ++turns === 1
       ? { provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
-          toolCalls: [{ id: 'excerpt-state', name: 'context_transition', type: 'function', input: { kind: 'json',
-            value: { reason: 'Replace interpretation while retaining evidence', sessionState: stateContent('Interpretation based on exact evidence.') } } }] }
+          toolCalls: [{ id: 'excerpt-state', name: 'context_save_and_activate', type: 'function', input: { kind: 'json',
+            value: { reason: 'Replace interpretation while retaining evidence', operations: createStateOperations('Interpretation based on exact evidence.') } } }] }
       : { provider: 'fixture', model: 'context', content: 'Done.', terminationReason: 'stop' };
   };
   const result = await new AgentRuntime(f.options).run({ task: 'Continue with the selected evidence.' }).result;
@@ -1111,7 +1117,7 @@ test('state publication with active historical excerpts uses fresh when no bound
   assert.equal(records.at(-1).transition.strategy, 'fresh');
   assert.equal(records.at(-1).transition.admission.status, 'admitted');
   assert.deepEqual(records.at(-1).window.selection.excerpts, selection.excerpts);
-  assert.equal(records.at(-1).window.stateSequence.notice, undefined);
+  assert.equal(records.at(-1).window.selection.sessionState.length, 1);
   assert.ok(JSON.stringify(f.requests.at(-1)).includes('Interpretation based on exact evidence.'));
 });
 
@@ -1130,9 +1136,11 @@ test('append and no-op preserve the actual provider session while explicit renew
         const turn = requests.length;
         if (turn <= 3) return {
           provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
-          toolCalls: [{ id: `session-state-${turn}`, name: 'context_transition', type: 'function', input: { kind: 'json',
+          toolCalls: [{ id: `session-state-${turn}`, name: turn === 1 ? 'context_save_and_activate' : 'context_transition', type: 'function', input: { kind: 'json',
             value: { reason: 'Maintain interpretation without unnecessary transport replacement',
-              sessionState: stateContent('Stable interpretation.'), ...(turn === 3 ? { renewal: true } : {}) } } }]
+              ...(turn === 1 ? { operations: [{ kind: 'create', text: 'Stable interpretation.' }] }
+                : { sessionState: (await f.context.sessionState()).items.map(({ itemId, revisionId }) => ({ itemId, revisionId })) }),
+              ...(turn === 3 ? { renewal: true } : {}) } } }]
         };
         return { provider: 'fixture', model: 'context', content: 'Done.', terminationReason: 'stop' };
       },
@@ -1148,7 +1156,7 @@ test('append and no-op preserve the actual provider session while explicit renew
   assert.deepEqual(records.map(entry => entry.transition.strategy), ['append', 'fresh']);
   assert.deepEqual(records.map(entry => entry.transition.cause), ['state_update', 'explicit_renewal']);
   assert.equal(records.filter(entry => entry.sessionState).length, 1);
-  assert.equal((await f.context.sessionState()).revision.id, records[0].id);
+  assert.deepEqual((await f.context.sessionState()).items.map(({ itemId, revisionId }) => ({ itemId, revisionId })), records[0].window.selection.sessionState);
 });
 
 for (const invalidAccounting of ['unknown_reasoning', 'output_only_limit']) {
@@ -1174,16 +1182,16 @@ for (const invalidAccounting of ['unknown_reasoning', 'output_only_limit']) {
       f.requests.push(request);
       return f.requests.length === 1
         ? { provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
-            toolCalls: [{ id: 'invalid-accounting-state', name: 'context_transition', type: 'function', input: { kind: 'json',
-              value: { reason: 'Attempt an ordinary state append', sessionState: stateContent(interpretation) } } }] }
+            toolCalls: [{ id: 'invalid-accounting-state', name: 'context_save_and_activate', type: 'function', input: { kind: 'json',
+              value: { reason: 'Attempt an ordinary state append', operations: createStateOperations(interpretation) } } }] }
         : { provider: 'fixture', model: 'context', content: 'Kept the original admitted context.', terminationReason: 'stop' };
     };
     const runId = `invalid-state-accounting-${invalidAccounting}`;
     const result = await new AgentRuntime(f.options).run({ runId, task: 'Keep requirements and transport lineage intact.' }).result;
     assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
     assert.equal(candidates.length, 1, 'A non-capacity admission failure must not compile a fresh fallback.');
-    assert.ok(candidates[0].messages.some(message => message.content.includes('Session state replacement')));
-    assert.equal((await f.context.sessionState()).revision, null);
+    assert.ok(candidates[0].messages.some(message => message.role === 'user' && message.content.includes(interpretation)));
+    assert.equal((await f.context.sessionState()).id, null);
     assert.equal((await f.context.inspect()).window, null);
     const records = (await f.sessions.loadReplayState(f.session)).branch;
     assert.equal(records.filter(entry => entry.type === 'context_transition').length, 0);
@@ -1280,3 +1288,51 @@ test('inspection reports honest bounds for small and large caller allowances', a
     }
   }
 });
+
+for (const code of ['session_state_conflict', 'session_state_limit']) {
+  test(`deferred ${code} rejection preserves structured feedback and the committed state view`, async () => {
+    const f = await fixture();
+    const transition = f.context.transition.bind(f.context);
+    let before;
+    let beforeWindow;
+    let details;
+    let turn = 0;
+    f.context.transition = async (...args) => {
+      if (details) throw Object.assign(new Error('Deferred state publication rejected.'), { details });
+      return transition(...args);
+    };
+    f.provider.complete = async request => {
+      f.requests.push(request);
+      turn++;
+      if (turn === 2) {
+        before = await f.context.sessionState();
+        beforeWindow = (await f.context.inspect()).window;
+        const item = before.items[0];
+        details = code === 'session_state_conflict'
+          ? { code, itemId: item.itemId, expectedRevisionId: item.revisionId, currentRevisionId: 'competing-revision', status: 'changed' }
+          : { code, resource: 'retained_bytes', limit: 1024, observedBytes: 2048 };
+      }
+      return turn <= 2
+        ? { provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
+            toolCalls: [{ id: `deferred-${turn}`, type: 'function', name: 'context_save_and_activate',
+              input: { kind: 'json', value: { reason: 'Keep useful interpretation.',
+                operations: [{ kind: 'create', text: turn === 1 ? 'Committed interpretation.' : 'Rejected interpretation.' }] } } }] }
+        : { provider: 'fixture', model: 'context', content: 'Kept the prior view.', terminationReason: 'stop' };
+    };
+    const runId = `deferred-${code}`;
+    const result = await new AgentRuntime(f.options).run({ runId, task: 'Keep exact state on publication failure.' }).result;
+    assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+    assert.equal(turn, 3);
+    assert.deepEqual(await f.context.sessionState(), before);
+    assert.deepEqual((await f.context.inspect()).window, beforeWindow);
+    assert.equal((await f.context.listSessionState()).items.length, 1);
+    const events = await Array.fromAsync(f.events.read(runId));
+    const rejected = events.filter(({ event }) => event.type === 'context.transition.rejected');
+    assert.equal(rejected.length, 1);
+    assert.deepEqual(rejected[0].event.details, details, 'Durable event codec retains exact structured rejection details.');
+    const feedback = JSON.stringify(f.requests.at(-1).messages);
+    assert.ok(feedback.includes(code), 'Deferred callback delivers machine-readable feedback to the next model request.');
+    for (const value of Object.values(details)) assert.ok(feedback.includes(String(value)));
+    assert.equal((await f.sessions.loadReplayState(f.session)).branch.filter(entry => entry.type === 'context_transition').length, 1);
+  });
+}

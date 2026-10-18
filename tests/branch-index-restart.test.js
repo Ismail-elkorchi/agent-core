@@ -232,22 +232,20 @@ test('a checksummed but false derived boundary cannot authorize truncating commi
 function contextCommit(session, snapshot, key, retained, excerpts = []) {
   const evidence = {retained, ...(excerpts.length ? {excerpts} : {})};
   // This fixture exercises the repository commit boundary, whose admitted selection owns lineage.
-  const selection = {...evidence, continuity: {kind: 'fresh', resetId: key, model: {provider: 'test', model: 'test'}, sources: retained}};
   const reason = 'Retain exactly the requested source';
   const timestamp = new Date().toISOString();
   const cut = {format: 'agent-core.history/1', sessionId: session.id, branchId: snapshot.branchId,
     throughEntryId: snapshot.boundary.leafId, sourceRevision: snapshot.sourceRevision, ledgerCoverage: 'session'};
-  const stateSequence = {checkpointRevisionId: null, lineage: cut, parent: null};
+  const selection = {...evidence, continuity: {kind: 'fresh', resetId: key, model: {provider: 'test', model: 'test'}, sources: retained, historyPosition: cut}};
   return {
-    expectedSessionStateRevisionId: null,
     expectedLeafId: snapshot.boundary.leafId,
     expectedSourceRevision: snapshot.sourceRevision,
     expectedWindowId: null,
     window: {windowId: key, parentWindowId: null, createdAt: timestamp, reason, selection,
-      historyPosition: cut, stateSequence},
+      historyPosition: cut},
     transition: {transitionId: key, idempotencyKey: key, previousWindowId: null, windowId: key,
       committedAt: timestamp, requestedSourceRevision: snapshot.sourceRevision,
-      strategy: 'fresh', cause: 'explicit_renewal', requestedRenewal: true, stateSequenceFingerprint: hashJson(stateSequence),
+      strategy: 'fresh', cause: 'explicit_renewal', requestedRenewal: true,
       admission: {status: 'admitted', compiledInputIdentity: key, capabilityRevision: 'test'}, selectionFingerprint: hashJson(selection),
       requestFingerprint: hashJson({expectedWindowId: null, idempotencyKey: key, selection: evidence, renewal: true, reason, expectedSourceRevision: snapshot.sourceRevision})}
   };

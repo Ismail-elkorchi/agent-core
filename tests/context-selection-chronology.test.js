@@ -9,13 +9,13 @@ import { AgentRuntime, ContextService, HistoryReader, agentEventCodec } from '@a
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 import { admitContext } from './context-admission-fixtures.js';
 
-test('stateless archived runs replay exact notices around corrections and respect a historical fork', async t => {
-  const root = await mkdtemp(path.join(tmpdir(), 'state-notice-chronology-'));
+test('stateless archived runs restore the selected item view and preserve correction chronology across a historical fork', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'context-selection-chronology-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const artifacts = new InMemoryArtifactRepository();
   const events = new InMemoryEventRepository(agentEventCodec);
   let repository = new JsonlSessionRepository(root);
-  const session = await repository.create({ binding: { schemaId: 'notice-chronology', schemaVersion: 1, subject: {} } });
+  const session = await repository.create({ binding: { schemaId: 'selection-chronology', schemaVersion: 1, subject: {} } });
   const requests = [];
   const provider = {
     id: 'fixture', implementationId: 'fixture@1',
@@ -38,7 +38,7 @@ test('stateless archived runs replay exact notices around corrections and respec
   let context;
   const connect = () => {
     history = new HistoryReader({ repository, session, events, artifacts });
-    context = new ContextService({ repository, session, events, artifacts, history,
+    context = new ContextService({ repository, session, events, artifacts, history, assertStateWrite: async () => {},
       policy: { maxSourceBytes: 1024 * 1024, historyRead: { history, isAvailable: () => true } } });
   };
   connect();
@@ -53,39 +53,44 @@ test('stateless archived runs replay exact notices around corrections and respec
   };
   const requestRef = await artifacts.storeProtected({ label: 'state-inference', mediaType: 'application/json',
     content: new TextEncoder().encode('{}') });
-  const update = async (id, previousRevisionId, text) => {
+  let current;
+  const update = async (id, text) => {
     const cut = await history.capture();
+    const staged = await context.stageSessionState({ idempotencyKey: id, branchId: cut.branchId,
+      capturedHistoryCut: cut, inference: { ownerId: 'owner', invocationId: id, requestRef },
+      operations: [current ? { kind: 'replace', itemId: current.itemId,
+        expectedRevisionId: current.revisionId, text } : { kind: 'create', text }] });
+    const selected = staged.revisions.map(({ itemId, revisionId }) => ({ itemId, revisionId }));
     const result = await context.transition({ expectedWindowId: (await history.selectedContext(cut))?.windowId ?? null,
-      idempotencyKey: id, reason: 'Update interpretation', selection: await context.selectSources(cut, {}),
-      sessionState: { id, previousRevisionId, content: { blocks: [{ text }] }, capturedHistoryCut: cut,
-        inference: { ownerId: 'owner', invocationId: id, requestRef } }
+      idempotencyKey: id, reason: 'Update interpretation',
+      selection: { ...await context.selectSources(cut, {}), sessionState: selected }, sessionState: staged
     }, { admit: admitContext });
-    assert.equal(result.transition.strategy, 'append');
+    current = selected[0];
     return result;
   };
   await run('run-original', 'Original requirement');
-  const first = await update('state-a', null, 'Original interpretation');
+  const first = await update('state-a', 'Original interpretation');
   await run('run-correction', 'Correction: use the revised requirement');
-  const second = await update('state-b', 'state-a', 'Revised interpretation');
+  const second = await update('state-b', 'Revised interpretation');
   repository = new JsonlSessionRepository(root);
   connect();
   const messages = await run('run-inspect', 'Inspect reconstructed context');
   const contents = messages.map(message => message.content);
-  const firstNotice = first.window.stateSequence.notice.message;
-  const secondNotice = second.window.stateSequence.notice.message;
-  assert.deepEqual(messages.filter(message => message.content === firstNotice.content), [firstNotice]);
-  assert.deepEqual(messages.filter(message => message.content === secondNotice.content), [secondNotice]);
-  const positions = ['Original requirement', firstNotice.content, 'Correction: use the revised requirement',
-    secondNotice.content, 'Inspect reconstructed context'].map(content => contents.indexOf(content));
+  assert.ok(contents.some(content => content?.includes('Revised interpretation')));
+  assert.equal((await context.sessionState()).items[0].text, 'Revised interpretation');
+  assert.deepEqual((await context.sessionState()).items.map(({ itemId, revisionId }) => ({ itemId, revisionId })), second.window.selection.sessionState);
+  const positions = ['Original requirement', 'Correction: use the revised requirement',
+    'Inspect reconstructed context'].map(content => contents.indexOf(content));
   assert.ok(positions.every(index => index >= 0), JSON.stringify(contents));
   assert.deepEqual(positions, [...positions].sort((a, b) => a - b));
   await repository.branchFrom(session, first.id, 'Before correction');
   repository = new JsonlSessionRepository(root);
   connect();
   const fork = await run('run-fork', 'Inspect historical fork');
-  assert.deepEqual(fork.filter(message => message.content === firstNotice.content), [firstNotice]);
-  assert.ok(!fork.some(message => message.content === secondNotice.content));
+  assert.equal((await context.sessionState()).items[0].text, 'Original interpretation');
+  assert.ok(fork.some(message => message.content?.includes('Original interpretation')));
+  assert.ok(!fork.some(message => message.content?.includes('Revised interpretation')));
   assert.ok(!fork.some(message => message.content === 'Correction: use the revised requirement'));
-  assert.ok(fork.findIndex(message => message.content === firstNotice.content) <
+  assert.ok(fork.findIndex(message => message.content === 'Original requirement') <
     fork.findIndex(message => message.content === 'Inspect historical fork'));
 });

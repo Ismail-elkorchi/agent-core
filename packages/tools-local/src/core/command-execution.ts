@@ -591,17 +591,11 @@ export class LocalCommandExecution implements CommandExecution {
     }
     for (const report of this.recovered.values())
       if (report.result.owner.ownerId === ownerId) reports.push(report);
-    return Object.freeze(
-      reports.sort((left, right) => left.result.processId.localeCompare(right.result.processId))
-    );
+    return Object.freeze(reports);
   }
 
   recoveredTerminalReports(): readonly CommandExecutionReport[] {
-    return Object.freeze(
-      [...this.recovered.values()].sort((left, right) =>
-        left.result.processId.localeCompare(right.result.processId)
-      )
-    );
+    return Object.freeze([...this.recovered.values()]);
   }
 
   /** Call only after resource.released persistence succeeds or another durable handoff exists. */
@@ -864,7 +858,13 @@ export class LocalCommandExecution implements CommandExecution {
   }
 
   private finish(record: ManagedProcess): Promise<CommandExecutionReport> {
-    record.finishPromise ??= this.finishOnce(record);
+    record.finishPromise ??= this.finishOnce(record).then((report) => {
+      if (report.result.finalizationPending) delete record.finishPromise;
+      return report;
+    }, (error: unknown) => {
+      delete record.finishPromise;
+      throw error;
+    });
     return record.finishPromise;
   }
 
@@ -900,8 +900,10 @@ export class LocalCommandExecution implements CommandExecution {
     } catch (error) {
       record.diagnostic = appendDiagnostic(record.diagnostic, `Process terminal metadata storage failed: ${errorMessage(error)}`);
     }
-    const result = this.processResult(record, 4_000, 0, artifacts.publicArtifact);
+    const receipt = await this.readTerminalRecord(record.id);
+    const result = this.processResult(record, 4_000, 0, artifacts.publicArtifact, receipt === undefined);
     const report = Object.freeze({ result,
+      ...(receipt === undefined ? {} : terminalFacts(receipt)),
       ...(artifacts.protectedArtifact === undefined ? {} : { protectedArtifact: artifacts.protectedArtifact })
     });
     await this.handoffTerminalReport(report);
@@ -1160,11 +1162,14 @@ export class LocalCommandExecution implements CommandExecution {
     )) throw new Error('Process terminal record does not match its authenticated supervisor.');
     const report = Object.freeze({
       result: recoveredTerminalResult(entry, terminal, stopped, receipt, outputDiagnostic),
+      ...(receipt === undefined ? {} : terminalFacts(receipt)),
       ...(receipt?.protectedArtifact === undefined ? {} : { protectedArtifact: receipt.protectedArtifact })
     });
-    if (!receipt) await this.storeTerminalRecord(
-      terminalRecordFromReport(report, entry.rootPath, this.descriptor.recoveryIdentity)
-    );
+    if (!receipt) {
+      const recorded = terminalRecordFromReport(report, entry.rootPath, this.descriptor.recoveryIdentity);
+      await this.storeTerminalRecord(recorded);
+      return Object.freeze({ ...report, ...terminalFacts(recorded) });
+    }
     return report;
   }
 
@@ -1559,4 +1564,15 @@ function nodeCode(error: unknown): string | undefined {
 function positive(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(label + ' must be positive.');
   return value;
+}
+
+function terminalFacts(receipt: ProcessTerminalRecord) {
+  return Object.freeze({
+    terminalOutput: Object.freeze({
+      stdout: Object.freeze({ ...receipt.stdout }),
+      stderr: Object.freeze({ ...receipt.stderr }),
+      combined: Object.freeze({ ...receipt.combined })
+    }),
+    ...(receipt.diagnostic === undefined ? {} : { terminalDiagnostic: receipt.diagnostic })
+  });
 }
