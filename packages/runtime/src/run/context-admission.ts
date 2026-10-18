@@ -7,6 +7,7 @@ export type ContextAdmissionAction =
 
 /** An inference-boundary admission conflict; unavailable preparation does not prove overflow. */
 interface ContextAdmissionMeasurements {
+  readonly pressure?: 'hard_capacity' | 'recovery_reserve';
   readonly recoveryBoundary?: string;
   readonly recovery?: 'unsupported_action' | 'unchanged_action' | 'attempt_limit' | 'request_unavailable';
   readonly message: string;
@@ -95,6 +96,7 @@ export function decodeContextAdmissionConflict(value: unknown): ContextAdmission
   });
   const fields = [
     'kind',
+    'pressure',
     'reason',
     'recovery',
     'recoveryBoundary',
@@ -116,6 +118,10 @@ export function decodeContextAdmissionConflict(value: unknown): ContextAdmission
     throw new TypeError('Invalid context recovery status.');
   if (object.recoveryBoundary !== undefined && (typeof object.recoveryBoundary !== 'string' || !/^[a-f0-9]{64}$/u.test(object.recoveryBoundary)))
     throw new TypeError('Invalid context recovery boundary.');
+  if (object.pressure !== undefined &&
+      ((object.pressure !== 'hard_capacity' && object.pressure !== 'recovery_reserve') ||
+       (object.kind !== 'request_capacity' && object.kind !== 'provider_capacity')))
+    throw new TypeError('Invalid admission pressure.');
   const recoveryBoundary = object.recoveryBoundary;
   const recovery = object.recovery as ContextAdmissionConflict['recovery'];
   if (typeof object.message !== 'string' || object.message.trim().length === 0)
@@ -227,7 +233,8 @@ export function decodeContextAdmissionConflict(value: unknown): ContextAdmission
     object.source !== undefined
   )
     throw new TypeError('Incompatible context capacity conflict.');
-  const requestConflict = {
+  const requestConflict: ContextAdmissionMeasurements = {
+    ...(object.pressure === undefined ? {} : { pressure: object.pressure }),
     message: object.message,
     ...(recovery ? { recovery } : {}),
       ...(recoveryBoundary ? { recoveryBoundary } : {}),

@@ -1,7 +1,10 @@
+import { captureRequestCapabilities } from './inference/capability-capture.js';
+import { captureContextCapabilities } from './context/service.js';
+import { inspectSessionOperational, type ContextOperationalInspectionPage } from './session/operational.js';
 import { commitResourceRelease } from './orchestration/resource-settlement.js';
-import { resolveEffectiveToolCatalog, inspectCapabilitySnapshot, type EffectiveCapabilitySnapshot } from './run/capabilities.js';
+import { resolveEffectiveToolCatalog, type EffectiveCapabilitySnapshot } from './run/capabilities.js';
 import { NativeContextIncompatibilityError } from './orchestration/model-change.js';
-import { CONTEXT_RECOVERY_LIMITS, assembleContextControlRequest, contextControlReserve, contextControlPreview, contextControlSteering } from './context/recovery.js';
+import { parseContextControlPolicy, parseOutputReservationPolicy, resolveOutputReservation, contextControlRole, type ContextControlPolicy, type OutputReservationPolicy, assembleContextControlRequest, contextControlReserve, contextControlPreview, contextControlSteering } from './context/recovery.js';
 import { resolveToolModelContent } from './orchestration/observation-source.js';
 import { NativeContextTransitionRequired } from './inference/input.js';
 import type { SessionStateSnapshot } from './session/session-state.js';
@@ -209,6 +212,8 @@ export interface AgentRuntimeOptions {
   readonly contextItems?: readonly PromptContextItemInput[];
   readonly contextProvider?: AgentContextProvider;
   readonly context?: ContextService;
+  readonly contextControlPolicy?: Partial<ContextControlPolicy>;
+  readonly outputReservationPolicy?: OutputReservationPolicy;
   readonly contextRenewal?: { readonly automatic: boolean };
   readonly onRequestAdmitted?: (input: {
     readonly requestId: string;
@@ -431,6 +436,8 @@ export class AgentRuntime {
   private readonly metadata: Readonly<Record<string, string>> | undefined;
   private readonly estimator: RequestEstimator;
   private readonly maxOutputTokens: number;
+  private readonly contextControlPolicy: ContextControlPolicy;
+  private readonly outputReservationPolicy: OutputReservationPolicy | undefined;
   private readonly toolPolicy: ToolPolicy;
   private tools: readonly CompiledToolDefinition[];
   private readonly resourceLeases: ResourceLeaseCoordinator;
@@ -525,6 +532,13 @@ export class AgentRuntime {
     if (!Number.isSafeInteger(options.maxOutputTokens) || options.maxOutputTokens < 1)
       throw new TypeError('AgentRuntime requires an explicit positive maxOutputTokens allowance.');
     this.maxOutputTokens = options.maxOutputTokens;
+    this.contextControlPolicy = parseContextControlPolicy(options.contextControlPolicy);
+    this.outputReservationPolicy = options.outputReservationPolicy === undefined ? undefined : parseOutputReservationPolicy(options.outputReservationPolicy);
+    if (this.outputReservationPolicy) {
+      const { minimum, maximum } = this.outputReservationPolicy;
+      if (!Number.isSafeInteger(minimum) || minimum < 1 || !Number.isSafeInteger(maximum) || maximum < minimum || maximum > this.maxOutputTokens)
+        throw new TypeError('Output reservation policy must be positive, ordered and within the configured output allowance.');
+    }
     this.toolPolicy = parseToolPolicy(options.toolPolicy ?? READ_ONLY_TOOL_POLICY);
     this.tools = Object.freeze(new ToolRegistry(options.tools ?? []).list());
     this.resourceLeases =
@@ -573,25 +587,17 @@ export class AgentRuntime {
   }
 
   /** These facts are observations; only the actual request/effect admission grants authority. */
-  async inspectOperational(page: { readonly offset?: number; readonly limit?: number; readonly expectedRevision?: string; readonly target?: 'configured' | 'last_admitted' } = {}) {
+  async inspectOperational(page: ContextOperationalInspectionPage = {}) {
     const profile = parseModelProfile(await this.options.provider.describeModel(this.options.model));
-    const catalog = this.capabilityCatalog(profile);
     const ownerId = this.options.inferenceOwnerId ?? this.activeRunId;
-    const selected = page.target === 'last_admitted' ? this.lastAdmittedCapabilities?.snapshot : catalog.snapshot;
-    return Object.freeze({ capabilityTarget: page.target ?? 'configured',
-      capabilities: selected ? inspectCapabilitySnapshot(selected, page) : null,
-      configuredRevision: catalog.snapshot.revision,
-      lastAdmittedCoverage: this.lastAdmittedCapabilities ? 'available' : 'not_observed_in_this_runtime',
-      lastAdmittedRequest: this.lastAdmittedCapabilities ? { inputIdentity: this.lastAdmittedCapabilities.inputIdentity,
-        protocolCapabilityRevision: this.lastAdmittedCapabilities.protocolCapabilityRevision,
-        catalogRevision: this.lastAdmittedCapabilities.snapshot.revision,
-        bindingId: this.lastAdmittedCapabilities.snapshot.bindingId } : null,
-      generation: { outputReservation: this.maxOutputTokens,
-        enforcement: supportsParameter(profile, 'maxOutputTokens') ? 'provider-cap' : 'reservation-only' },
-      ...(ownerId ? { allowance: await this.inferenceService.inspectOwnerAllowance(ownerId) } : {}),
-      resources: this.resourceLeases.inspect(),
-      meaning: 'Configured eligibility may differ from the last admitted request. These independently captured capability, ledger and resource observations are not an atomic cross-domain snapshot or permission. Per-call authorization and transactional request admission still apply.'
-    });
+    return inspectSessionOperational({ configured: this.capabilityCatalog(profile).snapshot, profile,
+      outputReservation: await this.selectedOutputReservation(), configuredOutputReservation: this.maxOutputTokens,
+      contextControlPolicy: this.contextControlPolicy,
+      ...(this.outputReservationPolicy ? { outputReservationPolicy: this.outputReservationPolicy } : {}),
+      inference: this.inferenceService,
+      ...(ownerId ? { ownerId } : {}),
+      ...(this.lastAdmittedCapabilities ? { contextAdmission: this.lastAdmittedCapabilities } : {}),
+      resources: this.resourceLeases.inspect(), page });
   }
 
   inspectRun(runId: string) {
@@ -1118,7 +1124,7 @@ export class AgentRuntime {
         const conflict =
           (admissionError instanceof ContextSourceCapacityError || admissionError instanceof ContextContinuityError || admissionError instanceof ContextRecoveryStoppedError)
             ? admissionError.conflict
-            : requestCapacityConflict(admissionError);
+            : requestCapacityConflict(admissionError, this.outputReservationPolicy);
         await this.advanceRun(run, instruction.procedure, {
           phase: {
             kind: 'suspended',
@@ -1475,7 +1481,7 @@ export class AgentRuntime {
     this.activeHistoryCut = replay.historyCut;
     const observationStore = new ObservationStore({
       ...(this.options.context && this.options.contextRenewal?.automatic
-        ? { maxPresentationBytes: CONTEXT_RECOVERY_LIMITS.resultBytes } : {}),
+        ? { maxPresentationBytes: this.contextControlPolicy.resultBytes } : {}),
       ...(this.options.repositories.artifacts
         ? { artifacts: this.options.repositories.artifacts }
         : {})
@@ -1543,7 +1549,7 @@ export class AgentRuntime {
         let toolBatchId: string;
         let assistant: AssistantTurnResult;
         if (providerResume) {
-          snapshot = await this.restoreTurnSnapshot(providerResume.turnSnapshot);
+          snapshot = await this.restoreTurnSnapshot(providerResume.turnSnapshot, providerResume.requestEstimate.outputReserveTokens);
           toolBatchId = providerResume.toolBatchId;
           activeTurnIdentity = providerResume.identity;
           lastStartedTurnIndex = turnIndex;
@@ -1607,7 +1613,7 @@ export class AgentRuntime {
             configuration.temperature,
             configuration.reasoning
           );
-          const requestWindow = requestWindowForModel(profile, this.maxOutputTokens);
+          const requestWindow = requestWindowForModel(profile, await this.selectedOutputReservation());
           const continuationEligible =
             modelSession !== undefined && sessionModel === configuration.model;
           if (!continuationEligible) {
@@ -1770,11 +1776,12 @@ export class AgentRuntime {
         const { response, toolCalls } = assistant;
         if (snapshot.record.contextRecovery) {
           const repeated = toolCalls.some((call) => this.recoveryActions.has(`${runtime.runId}:${snapshot.record.contextRecovery?.recoveryBoundary ?? "unbound"}:${hashJson({name: call.name, input: call.input})}`));
-          const unsupported = response.terminationReason !== 'tool_calls' || toolCalls.length === 0 || toolCalls.length > CONTEXT_RECOVERY_LIMITS.toolCalls ||
+          const unsupported = response.terminationReason !== 'tool_calls' || toolCalls.length === 0 || toolCalls.length > this.contextControlPolicy.toolCalls ||
             toolCalls.some((call) => !snapshot.tools.some((tool) => tool.name === call.name && isContextCheckpointTool(tool))) ||
-            toolCalls.some((call) => call.input.kind === 'json' &&
-              ((!isContextMutationTool(snapshot.tools.find((tool) => tool.name === call.name)) &&
-                  (typeof call.input.value.maxBytes !== 'number' || call.input.value.maxBytes > CONTEXT_RECOVERY_LIMITS.resultBytes))));
+            toolCalls.some((call) => !isContextMutationTool(snapshot.tools.find((tool) => tool.name === call.name)) &&
+              (call.input.kind !== 'json' || typeof call.input.value.maxBytes !== 'number' ||
+               !Number.isSafeInteger(call.input.value.maxBytes) || call.input.value.maxBytes < 1 ||
+               call.input.value.maxBytes > this.contextControlPolicy.resultBytes));
           if (repeated || unsupported) {
             const settled = providerWork(runtime.run.state(), snapshot.record);
             if (settled.stage !== 'settled') throw new Error('Recovery response has no durable settlement.');
@@ -1990,14 +1997,14 @@ export class AgentRuntime {
   ): Promise<readonly CommittedToolObservation[]> {
     const source = providerWork(runtime.run.state(), phase.identity);
     if (source.stage !== 'consumed') return observations.map(item => item.committed);
+    const admitted = await this.inferenceService.admittedInput(this.options.inferenceOwnerId ?? runtime.runId, source.invocationId);
     let snapshot = this.presentationSnapshot;
     if (!snapshot || !sameTurnIdentity(snapshot.record, phase.identity)) {
-      snapshot = await this.restoreTurnSnapshot(await this.recordedTurnSnapshot(runtime.runId, phase.identity));
+      snapshot = await this.restoreTurnSnapshot(await this.recordedTurnSnapshot(runtime.runId, phase.identity), admitted.outputReservation);
     }
     if (snapshot.record.contextRecovery) return observations.map(item => item.committed);
     if (observations.length !== phase.calls.length)
       throw new ContextContinuityError('unsupported', 'A settled tool batch lacks a complete recorded result for every original call; its protocol cannot be reconstructed for context recovery.');
-    const admitted = await this.inferenceService.admittedInput(this.options.inferenceOwnerId ?? runtime.runId, source.invocationId);
     const settled = await this.readProviderSettlement(runtime.runId, source.effect.intent.effectId, source.responseId, source.settlementReference);
     if (settled?.event.type !== 'provider.attempt.settled') throw new Error('Tool batch source response is unavailable.');
     const original = observations.map(item => item.committed);
@@ -2016,7 +2023,7 @@ export class AgentRuntime {
           ...(item.call.id ? { toolCallId: item.call.id } : {}),
           ...(item.modelImages.length ? { images: item.modelImages } : {}) }))
       ] };
-      const compiled = await this.requestAdmission.compile(logical, snapshot.profile, snapshot.requestWindow.maxOutputTokens, admitted.presentation);
+      const compiled = await this.requestAdmission.compile(logical, snapshot.profile, admitted.outputReservation, admitted.presentation);
       const probe = await this.assembleContextRecovery({ runId: runtime.runId, input: runtime.input, snapshot,
         signal: runtime.signal, run: runtime.run }, new ContextAdmissionError(compiled,
         new Error('Settled tool presentations must leave an admissible context-management request.')), runtime.append, true);
@@ -2029,7 +2036,7 @@ export class AgentRuntime {
       }
     }
     if (!failure) throw new Error('Tool presentation admission did not produce a candidate.');
-    throw new ContextRecoveryStoppedError(requestCapacityConflict(failure),
+    throw new ContextRecoveryStoppedError(requestCapacityConflict(failure, this.outputReservationPolicy),
       'Settled tool results are preserved, but even their artifact-backed presentations cannot fit a context-management request.');
   }
 
@@ -2266,7 +2273,7 @@ export class AgentRuntime {
     });
   }
 
-  private async restoreTurnSnapshot(record: AgentTurnSnapshotRecord): Promise<TurnSnapshot> {
+  private async restoreTurnSnapshot(record: AgentTurnSnapshotRecord, outputReservation: number): Promise<TurnSnapshot> {
     if (record.provider !== this.options.provider.id || record.model !== this.options.model)
       throw new Error(
         `Persisted turn ${record.turnId} does not match the configured provider and model.`
@@ -2284,7 +2291,7 @@ export class AgentRuntime {
       return tool;
     });
     assertToolCatalogCurrent(record.toolCatalog, tools);
-    const requestWindow = requestWindowForModel(profile, this.maxOutputTokens);
+    const requestWindow = requestWindowForModel(profile, outputReservation);
     const configuration: RuntimeModelConfiguration = Object.freeze({
       model: record.model,
       ...(record.temperature === undefined ? {} : { temperature: record.temperature }),
@@ -2360,23 +2367,32 @@ export class AgentRuntime {
       context: NativeGenerationContext,
       turn: AssistantTurnRequest
     ): Promise<void> => {
+      if (context.compiled.accounting.outputReservation !== await this.selectedOutputReservation())
+        throw new RangeError('Native successor changed the selected output reservation without an admitted context transition.');
       // Exact result delivery is mandatory while synchronous native obligations remain.
       // It admits real capacity, but discretionary control room waits for a legal boundary.
-      if (context.dispatch?.sourceCalls.length)
+      if (context.dispatch?.sourceCalls.length) {
         await this.requestAdmission.admit(context.compiled, context.profile);
+        this.stageAdmittedCapabilities(context.compiled, turn);
+      }
       else await this.admitContextRequest(context.compiled, turn, runtime.append);
+      this.publishAdmittedCapabilities(context.compiled, turn);
+    };
+    const nativeTools = (context: NativeGenerationContext) => {
+      const tools =
+        context.dispatch?.kind === 'steering'
+          ? (active?.request.snapshot.tools ?? nextTools)
+          : nextTools;
+      if (hashJson(toolsForModel([...tools], context.profile)) !== hashJson(context.compiled.logicalRequest.tools ?? [])) {
+        throw new Error('Native dispatch changed the captured tool catalog.');
+      }
+      return tools;
     };
     const createGeneration = async (context: NativeGenerationContext): Promise<Generation> => {
       const first = context.generationDeliveryId === 'initial';
       if (!first) runtime.controller.reserveModelTurn();
       const request = context.compiled.logicalRequest;
-      const tools =
-        context.dispatch?.kind === 'steering'
-          ? (active?.request.snapshot.tools ?? nextTools)
-          : nextTools;
-      if (hashJson(toolsForModel([...tools], context.profile)) !== hashJson(request.tools ?? [])) {
-        throw new Error('Native dispatch changed the captured tool catalog.');
-      }
+      const tools = nativeTools(context);
       const snapshot = first
         ? initial.snapshot
         : this.createTurnSnapshot({
@@ -2392,7 +2408,7 @@ export class AgentRuntime {
                 : { responseFormat: request.responseFormat })
             },
             profile: context.profile,
-            requestWindow: initial.snapshot.requestWindow,
+            requestWindow: requestWindowForModel(context.profile, context.compiled.accounting.outputReservation),
             tools,
             instructions: initial.snapshot.instructions,
             controller: runtime.controller,
@@ -2527,6 +2543,7 @@ export class AgentRuntime {
         request: assembly.request,
         compiled: assembly.compiled,
         profile: initial.snapshot.profile,
+        capabilities: context => this.boundCapabilitySnapshot({ profile: context.profile, tools: nativeTools(context) }),
         session,
         signal: initial.signal,
         start: async (context) => {
@@ -2861,9 +2878,9 @@ export class AgentRuntime {
                 decision: failedGenerationDecision(completedAttempt.diagnostic, request.turnIndex)
               };
             if (recoveryAssembly?.recoveryAttempt !== undefined &&
-                recoveryAssembly.recoveryAttempt >= CONTEXT_RECOVERY_LIMITS.requestsPerBoundary && request.snapshot.record.contextRecovery)
+                recoveryAssembly.recoveryAttempt >= this.contextControlPolicy.requestsPerBoundary && request.snapshot.record.contextRecovery)
               throw new ContextRecoveryStoppedError(request.snapshot.record.contextRecovery,
-                'Bounded context recovery exhausted four requests without progress.', 'attempt_limit');
+                'Context recovery exhausted its configured request allowance without progress.', 'attempt_limit');
             generationRetries++;
             await this.waitForProviderRetry(request, completedAttempt.diagnostic,
               generationRetries, 'Generation', emit);
@@ -3143,7 +3160,7 @@ export class AgentRuntime {
       requestAttempt: 1,
       configuration,
       profile,
-      requestWindow: requestWindowForModel(profile, this.maxOutputTokens),
+      requestWindow: requestWindowForModel(profile, await this.selectedOutputReservation()),
       tools,
       instructions: [
         ...(await this.currentApplicationInstructions()),
@@ -3205,7 +3222,7 @@ export class AgentRuntime {
     }
   }
 
-  /** Recovery is an ordinary governed turn with a narrower catalog and no domain output. */
+  /** Recovery retains the bound catalog and native prefix, with host-granted control execution only. */
   private async assembleContextRecovery<T extends Pick<AssistantTurnRequest, 'runId' | 'input' | 'snapshot' | 'signal' | 'run'>>(
     ordinary: T,
     failure: ContextAdmissionError | ContextSourceCapacityError,
@@ -3216,8 +3233,8 @@ export class AgentRuntime {
     const context = this.options.context;
     if (!context || !ordinary.snapshot.profile.capabilities.toolCalling || !(failure instanceof ContextAdmissionError)) throw failure;
     cut ??= await context.history.capture();
-    const originalConflict = requestCapacityConflict(failure);
-    const inspection = await context.inspect(cut, { limit: CONTEXT_RECOVERY_LIMITS.inventoryItems, maxBytes: CONTEXT_RECOVERY_LIMITS.inventoryBytes });
+    const originalConflict = requestCapacityConflict(failure, this.outputReservationPolicy);
+    const inspection = await context.inspect(cut, { limit: this.contextControlPolicy.inventoryItems, maxBytes: this.contextControlPolicy.inventoryBytes });
     const conflict = {
       ...originalConflict,
       // Audit writes, inspections, and rejection notices are not progress. A new
@@ -3229,7 +3246,7 @@ export class AgentRuntime {
         task: ordinary.input.task, images: ordinary.input.images ?? null,
         configuration: ordinary.snapshot.configuration, profile: ordinary.snapshot.profile,
         instructions: ordinary.snapshot.instructions, catalog: ordinary.snapshot.record.toolCatalog.revision,
-        outputReservation: ordinary.snapshot.requestWindow.maxOutputTokens
+        outputReservation: failure.compiled.accounting.outputReservation
       })
     } satisfies ContextAdmissionConflict;
     // Keep the original catalog/protocol binding. The execution gate permits
@@ -3251,24 +3268,24 @@ export class AgentRuntime {
       const tail = await events.tail(ordinary.runId, { metadataOnly: true });
       const snapshots = await events.readMetadataRange(ordinary.runId, {
         through: tail, types: ['turn.snapshot.created'], metadata: { recoveryBoundary: conflict.recoveryBoundary },
-        limit: CONTEXT_RECOVERY_LIMITS.requestsPerBoundary + 1, maxBytes: 2 * CONTEXT_RECOVERY_LIMITS.resultBytes
+        limit: this.contextControlPolicy.requestsPerBoundary + 1, maxBytes: 2 * this.contextControlPolicy.resultBytes
       });
       if (snapshots.oversized || !snapshots.complete)
         throw new ContextRecoveryStoppedError(conflict, 'Context recovery exhausted its bounded durable request inventory.', 'attempt_limit');
       attempts = snapshots.records.length;
-      if (attempts >= CONTEXT_RECOVERY_LIMITS.requestsPerBoundary)
+      if (attempts >= this.contextControlPolicy.requestsPerBoundary)
         throw new ContextRecoveryStoppedError(conflict, 'Context renewal could not prepare an admissible successor within its request allowance. Original history and committed state remain intact.', 'attempt_limit');
       for (const snapshot of snapshots.records) {
         const exchangeId = snapshot.metadata.exchangeId;
         if (!exchangeId) throw new Error('Recovery snapshot is missing its exchange identity.');
         const records = await events.readMetadataRange(ordinary.runId, {
           through: tail, types: ['assistant.ended', 'observation.record.created'],
-          metadata: { exchangeId }, limit: 16, maxBytes: 2 * CONTEXT_RECOVERY_LIMITS.resultBytes
+          metadata: { exchangeId }, limit: this.contextControlPolicy.exchangeRecords, maxBytes: 2 * this.contextControlPolicy.resultBytes
         });
         if (!records.complete || records.oversized)
           throw new ContextRecoveryStoppedError(conflict, 'Recovery exchange exceeds its bounded control protocol.');
         for (const metadata of records.records) {
-          if (metadata.bytes > 32768) {
+          if (metadata.bytes > this.contextControlPolicy.sourceReadBytes) {
             recoveryResults.push({ tool: metadata.metadata.toolName ?? 'context', content: 'Recorded recovery result exceeds the bounded presentation read. Use its original history source.', original: metadata.reference.eventId, coverage: 'partial' });
           } else {
             const event = (await events.readReference(metadata.reference)).event;
@@ -3276,23 +3293,23 @@ export class AgentRuntime {
               for (const call of event.toolCalls ?? []) this.recoveryActions.add(`${ordinary.runId}:${conflict.recoveryBoundary}:${hashJson({name: call.name, input: call.input})}`);
             if (event.type === 'observation.record.created') {
               const sourceBytes = event.modelContentRef?.size ?? Buffer.byteLength(JSON.stringify(event.modelContent));
-              const content = sourceBytes <= 32768
+              const content = sourceBytes <= this.contextControlPolicy.sourceReadBytes
                 ? serializeToolModelContent(await resolveToolModelContent(event, this.options.repositories.artifacts))
                 : 'Recovery presentation exceeds its byte bound; the original remains recorded.';
-              const bounded = textRange(content, 0, CONTEXT_RECOVERY_LIMITS.resultBytes);
+              const bounded = textRange(content, 0, this.contextControlPolicy.resultBytes);
               recoveryResults.push({tool: event.toolName, content: bounded.text, original: metadata.reference.eventId,
-                coverage: sourceBytes <= 32768 && bounded.nextOffset >= Buffer.byteLength(content) ? 'complete' : 'partial'});
+                coverage: sourceBytes <= this.contextControlPolicy.sourceReadBytes && bounded.nextOffset >= Buffer.byteLength(content) ? 'complete' : 'partial'});
             }
           }
-          if (recoveryResults.length > CONTEXT_RECOVERY_LIMITS.recentResults) recoveryResults.shift();
+          if (recoveryResults.length > this.contextControlPolicy.recentResults) recoveryResults.shift();
         }
       }
       const rejection = await events.latestReferenceOfType(ordinary.runId, 'context.transition.rejected', { metadataOnly: true });
       if (rejection) {
         const metadata = await events.readMetadataRange(ordinary.runId, { afterSequence: rejection.sequence - 1, through: tail, limit: 1 });
-        if (metadata.records[0] && metadata.records[0].bytes <= 8192) {
+        if (metadata.records[0] && metadata.records[0].bytes <= this.contextControlPolicy.rejectionBytes) {
           const event = (await events.readReference(rejection)).event;
-          if (event.type === 'context.transition.rejected') rejectionMessages.push(textRange(event.message, 0, 2048).text);
+          if (event.type === 'context.transition.rejected') rejectionMessages.push(textRange(event.message, 0, this.contextControlPolicy.rejectionPreviewBytes).text);
         }
       }
     }
@@ -3300,21 +3317,24 @@ export class AgentRuntime {
       ? inspection.activeSelection.manifest : inspection.activeSelection;
     // The live request and steering are independent of the oldest-first inventory page.
     // These are bounded presentations of the existing request, never additional authority.
-    const currentRequest = contextControlPreview(ordinary.input.task, CONTEXT_RECOVERY_LIMITS.currentRequestBytes);
-    const steering = contextControlSteering(ordinary.snapshot.instructions.filter(item => item.provenance === 'steering'));
-    const sessionState = await context.inspectSessionState(inspection.cut, CONTEXT_RECOVERY_LIMITS.statePreviewBytes);
+    const currentRequest = contextControlPreview(ordinary.input.task, this.contextControlPolicy.currentRequestBytes);
+    const steering = contextControlSteering(ordinary.snapshot.instructions.filter(item => item.provenance === 'steering'), this.contextControlPolicy);
+    const sessionState = await context.inspectSessionState(inspection.cut, this.contextControlPolicy.statePreviewBytes);
     const content = JSON.stringify({
       currentRequest: { ...currentRequest, runId: ordinary.runId,
         sourceIdentity: { kind: 'accepted_run_input', runId: ordinary.runId } },
       steering: { ...steering, sourceIdentity: { kind: 'effective_steering', runId: ordinary.runId, turnId: ordinary.snapshot.record.turnId } },
-      conflict, attempt: attempts + 1, maximumAttempts: CONTEXT_RECOVERY_LIMITS.requestsPerBoundary, inventory: manifest,
+      conflict, attempt: attempts + 1, maximumAttempts: this.contextControlPolicy.requestsPerBoundary, inventory: manifest,
       sessionState: { ...sessionState, authority: 'fallible_model_interpretation' },
       legalTransitions: inspection.legalTransitions,
       sourceBudget: inspection.budget,
       recentRecoveryResults: probe ? [] : recoveryResults,
-      rejectedTransitions: rejectionMessages.slice(-2)
+      controlPolicy: this.contextControlPolicy,
+      controlTools: tools.flatMap(tool => { const role = contextControlRole(tool); return role ? [{ name: tool.name, role }] : []; }),
+      outputReservationPolicy: this.outputReservationPolicy ?? { fixed: this.maxOutputTokens },
+      rejectedTransitions: rejectionMessages
     });
-    const outputReservation = Math.min(CONTEXT_RECOVERY_LIMITS.outputTokens, ordinary.snapshot.requestWindow.maxOutputTokens);
+    const outputReservation = Math.min(this.contextControlPolicy.outputTokens, failure.compiled.accounting.outputReservation);
     const snapshot: TurnSnapshot = {
       ...ordinary.snapshot,
       record: {
@@ -3330,7 +3350,7 @@ export class AgentRuntime {
     let assembled: Awaited<ReturnType<typeof assembleContextControlRequest>>;
     try {
       assembled = await assembleContextControlRequest(this.requestAdmission, {
-        original: failure.compiled,
+        policy: this.contextControlPolicy, original: failure.compiled,
         profile: snapshot.profile,
         task: content, maxOutputTokens: outputReservation, signal: request.signal
       });
@@ -3365,12 +3385,22 @@ export class AgentRuntime {
       modelWindowHash: hashJson(assembled.assembly.messages)
     };
     if (!probe) {
+      this.publishAdmittedCapabilities(assembled.compiled, request);
       this.presentationSnapshot = snapshot;
       await append({ type: 'prompt.context.delivered', delivery: assembled.assembly.context });
       await append({ type: 'prompt.material.selected', material: assembled.assembly.material });
       await append({ type: 'budget.estimate.created', ...turnIdentity(snapshot.record), attempt: 1, estimate });
     }
     return { request, assembly: { capturedHistoryCut: cut, request: assembled.request, compiled: assembled.compiled, estimate, fingerprint, recoveryAttempt: attempts + 1 } };
+  }
+
+  private validateOutputReservation(value: number | undefined): number {
+    return resolveOutputReservation(this.maxOutputTokens, this.outputReservationPolicy, value);
+  }
+
+  private async selectedOutputReservation(): Promise<number> {
+    const window = await this.options.context?.history.selectedContext();
+    return this.validateOutputReservation(window?.outputReservation);
   }
 
   private async assembleModelRequest(
@@ -3406,8 +3436,10 @@ export class AgentRuntime {
     const assemble = async (
       window: ModelWindow,
       sessionState: SessionStateSnapshot,
-      artifacts: readonly PromptContextItemInput[] = []
+      artifacts: readonly PromptContextItemInput[] = [],
+      proposedOutputReservation?: number
     ) => {
+      const outputReservation = this.validateOutputReservation(proposedOutputReservation ?? await this.selectedOutputReservation());
       const result = await this.requestAdmission.assemble(
         {
           window,
@@ -3442,7 +3474,7 @@ export class AgentRuntime {
           model: request.snapshot.configuration.model,
           tools: toolsForModel([...request.snapshot.tools], request.snapshot.profile),
           ...(supportsParameter(request.snapshot.profile, 'maxOutputTokens')
-            ? { maxOutputTokens: request.snapshot.requestWindow.maxOutputTokens }
+            ? { maxOutputTokens: outputReservation }
             : {}),
           signal: request.signal,
           ...(request.snapshot.configuration.temperature === undefined
@@ -3455,7 +3487,7 @@ export class AgentRuntime {
             ? {}
             : { responseFormat: request.snapshot.configuration.responseFormat })
         },
-        request.snapshot.requestWindow.maxOutputTokens
+        outputReservation
       );
       return { ...result, stateSelectionId: sessionState.id };
     };
@@ -3473,7 +3505,7 @@ export class AgentRuntime {
       let renewal;
       try {
         proposed = await this.contextWindowForAdmission(input, request);
-        result = await assemble(proposed.window, input.sessionState, input.artifacts);
+        result = await assemble(proposed.window, input.sessionState, input.artifacts, input.outputReservation);
         await admitOrdinary(result.compiled);
       } catch (error) {
         if (input.strategy !== 'append' ||
@@ -3484,7 +3516,7 @@ export class AgentRuntime {
         proposed = await this.contextWindowForAdmission({ ...input, strategy: 'fresh' }, request);
         renewal = { selection: proposed.selection,
           cause: error instanceof ContextAdmissionError ? 'capacity' as const : 'prefix_incompatibility' as const };
-        result = await assemble(proposed.window, input.sessionState, input.artifacts);
+        result = await assemble(proposed.window, input.sessionState, input.artifacts, input.outputReservation);
         await admitOrdinary(result.compiled);
       }
       if (result.compiled.inputIdentity === rejected?.inputIdentity)
@@ -3505,6 +3537,7 @@ export class AgentRuntime {
         compiledInputIdentity: result.compiled.inputIdentity,
         capabilityRevision: result.compiled.capabilityRevision,
         selection: proposed.selection,
+        ...(input.outputReservation === undefined ? {} : { outputReservation: input.outputReservation }),
         ...(renewal ? { renewal } : {})
       };
     };
@@ -3605,7 +3638,7 @@ export class AgentRuntime {
     let feedbackFailure: string | undefined;
     if (this.options.context) {
       try {
-        feedback = await this.options.context.capacityFeedback(result.compiled, controlReserves.get(result.compiled.inputIdentity));
+        feedback = await this.options.context.capacityFeedback(result.compiled, controlReserves.get(result.compiled.inputIdentity), this.contextControlPolicy.reserveMode);
         if (feedback) {
           capacityNotice = feedback.notice;
           const withFeedback = await assemble(
@@ -3651,27 +3684,21 @@ export class AgentRuntime {
       attempt: 1,
       estimate
     });
+    this.publishAdmittedCapabilities(compiled, request);
     this.options.context?.recordAdmission({
       status: 'admitted',
       inputIdentity: compiled.inputIdentity,
       accounting: compiled.accounting,
-      ...(continuityHeadroomTokens === undefined ? {} : { continuityHeadroomTokens }),
+      ...(continuityHeadroomTokens === undefined ? {} : { continuityHeadroomTokens, continuityHeadroomPolicy: this.contextControlPolicy.reserveMode }),
       ...(feedback ? { feedback } : {}),
       ...(feedbackFailure ? { message: feedbackFailure } : {}),
-      ...(!feedbackFailure && requestCapacity(result.compiled.accounting, controlReserves.get(result.compiled.inputIdentity)).pressure === 'continuity'
+      ...(!feedbackFailure && requestCapacity(result.compiled.accounting, controlReserves.get(result.compiled.inputIdentity), this.contextControlPolicy.reserveMode).pressure === 'continuity'
         ? {
             message:
               'Context is near capacity. Select sources or explicitly renew native continuity; session-state maintenance is not required.'
           }
         : {})
     });
-    const boundTools = Object.freeze(request.snapshot.tools.map(tool => Object.freeze({ name: tool.name,
-      implementationId: tool.implementationId, available: true, reasons: Object.freeze([]) })));
-    const boundCapabilities = { bindingId: this.options.modelBindingId ?? this.capabilityCatalog(request.snapshot.profile).snapshot.bindingId,
-      policyRevision: hashJson(this.toolPolicy), tools: boundTools };
-    this.lastAdmittedCapabilities = Object.freeze({ inputIdentity: compiled.inputIdentity,
-      protocolCapabilityRevision: compiled.capabilityRevision,
-      snapshot: Object.freeze({ ...boundCapabilities, revision: hashJson(boundCapabilities) }) });
     await this.options.onRequestAdmitted?.({
       requestId: fingerprint.requestId,
       sourceIds: [
@@ -3682,9 +3709,34 @@ export class AgentRuntime {
     request.modelWindow.recordAdmission({
       runId: request.runId,
       request: compiled.logicalRequest,
+      outputReservation: compiled.accounting.outputReservation,
       presentation: assembly.presentation
     });
     return { request: result.request, compiled, estimate, fingerprint, freshContext: contextPublication.fresh, ...(cut ? { capturedHistoryCut: cut } : {}) };
+  }
+
+  private boundCapabilitySnapshot(snapshot: Pick<TurnSnapshot, 'profile' | 'tools'>): EffectiveCapabilitySnapshot {
+    const boundTools = Object.freeze(snapshot.tools.map(tool => {
+      const controlRole = contextControlRole(tool);
+      return Object.freeze({ name: tool.name, implementationId: tool.implementationId,
+        available: true, reasons: Object.freeze([]), ...(controlRole ? { controlRole } : {}) });
+    }));
+    const bound = { bindingId: this.options.modelBindingId ?? this.capabilityCatalog(snapshot.profile).snapshot.bindingId,
+      policyRevision: hashJson(this.toolPolicy), tools: boundTools };
+    return Object.freeze({ ...bound, revision: hashJson(bound) });
+  }
+
+  private stageAdmittedCapabilities(compiled: CompiledModelRequest, request: Pick<AssistantTurnRequest, 'snapshot'>) {
+    const captured = Object.freeze({ inputIdentity: compiled.inputIdentity,
+      protocolCapabilityRevision: compiled.capabilityRevision, snapshot: this.boundCapabilitySnapshot(request.snapshot) });
+    captureRequestCapabilities(compiled, captured.snapshot);
+    return captured;
+  }
+
+  /** Publish only after candidate selection and its source/publication fences succeed. */
+  private publishAdmittedCapabilities(compiled: CompiledModelRequest, request: Pick<AssistantTurnRequest, 'snapshot'>): void {
+    this.lastAdmittedCapabilities = this.stageAdmittedCapabilities(compiled, request);
+    if (this.options.context) captureContextCapabilities(this.options.context, this.lastAdmittedCapabilities);
   }
 
   private async admitContextRequest(
@@ -3695,7 +3747,10 @@ export class AgentRuntime {
     await this.requestAdmission.admit(compiled, request.snapshot.profile);
     const context = this.options.context;
     if (!this.options.contextRenewal?.automatic || !context ||
-        !request.snapshot.tools.some((tool) => isContextActivationTool(tool))) return;
+        !request.snapshot.tools.some((tool) => isContextActivationTool(tool))) {
+      this.stageAdmittedCapabilities(compiled, request);
+      return;
+    }
     const cut = await context.history.capture();
     const identity = hashJson({
       cut, inputIdentity: compiled.inputIdentity, accounting: compiled.accounting,
@@ -3703,7 +3758,7 @@ export class AgentRuntime {
       profile: request.snapshot.profile,
       configuration: request.snapshot.configuration,
       tools: promptToolSpecs([...request.snapshot.tools], request.snapshot.profile, this.options.toolContext),
-      outputReservation: request.snapshot.requestWindow.maxOutputTokens,
+      outputReservation: compiled.accounting.outputReservation,
       protectedSources: await context.protectedSources(cut)
     });
     let reserve = this.contextControlReserve?.identity === identity ? this.contextControlReserve.tokens : undefined;
@@ -3715,10 +3770,11 @@ export class AgentRuntime {
       this.contextControlReserve = { identity, tokens: reserve };
     }
     const remaining = requestCapacity(compiled.accounting, reserve).remainingTokens;
-    if (remaining !== undefined && remaining < reserve)
+    if (remaining !== undefined && remaining < reserve && this.contextControlPolicy.reserveMode === 'required')
       throw new ContextAdmissionError(compiled,
         new Error(`Compiled request leaves ${String(remaining)} input tokens; the current bounded context-management request requires ${String(reserve)} tokens of continuity room.`),
         false, reserve);
+    this.stageAdmittedCapabilities(compiled, request);
     return reserve;
   }
 
@@ -3913,13 +3969,20 @@ export class AgentRuntime {
       const exchangeId = assistantResponseKey(runId, transition.toolInvocation);
       const toolSources = await this.options.context.history.toolSources(transition.toolInvocation, cut);
       const originCatalog = (await this.recordedTurnSnapshot(runId, transition.toolInvocation)).toolCatalog;
+      const originTools = this.catalogTools.get(originCatalog.revision) ?? this.tools;
       let toolCallId: string | undefined;
       let originInput: import('@agent-core/persistence').ProtectedArtifactRef | undefined;
       for (const source of toolSources) {
         retained.set(source.entryId, source);
         const entry = await this.options.context.history.resolve(source, cut, 1024 * 1024);
-        if (entry?.type === 'tool_call' && entry.callIndex === transition.toolInvocation.callIndex &&
-            isContextActivationTool(originCatalog.entries.find(tool => tool.name === decodeToolCall(entry.call).name))) toolCallId = entry.callId;
+        if (entry?.type === 'tool_call' && entry.callIndex === transition.toolInvocation.callIndex) {
+          const name = decodeToolCall(entry.call).name;
+          const definition = originTools.find(tool => tool.name === name);
+          const captured = originCatalog.entries.find(tool => tool.name === name);
+          const current = definition ? captureToolCatalog([definition]).entries[0] : undefined;
+          if (isContextActivationTool(definition) && current && captured && hashJson(current) === hashJson(captured))
+            toolCallId = entry.callId;
+        }
         if (entry?.type === 'assistant') originInput = entry.inferenceInput;
       }
       let acknowledged = false;
@@ -4237,7 +4300,7 @@ export class AgentRuntime {
         }
         const observationStore = new ObservationStore({
           ...(this.options.context && this.options.contextRenewal?.automatic
-            ? { maxPresentationBytes: CONTEXT_RECOVERY_LIMITS.resultBytes } : {}),
+            ? { maxPresentationBytes: this.contextControlPolicy.resultBytes } : {}),
           ...(this.options.repositories.artifacts
             ? { artifacts: this.options.repositories.artifacts }
             : {})
@@ -5164,7 +5227,8 @@ function findPendingApproval(
 }
 
 function requestCapacityConflict(
-  error: ContextAdmissionError
+  error: ContextAdmissionError,
+  reservationPolicy?: { readonly minimum: number; readonly maximum: number }
 ): import('./run/context-admission.js').ContextAdmissionConflict {
   const { inputIdentity, accounting } = error.compiled;
   return {
@@ -5180,7 +5244,8 @@ function requestCapacityConflict(
     ...(accounting.limits.maxInputTokens === undefined
       ? {}
       : { maxInputTokens: accounting.limits.maxInputTokens }),
-    actions: ['select_sources', 'reduce_reservation', 'change_model', 'cancel']
+    pressure: error.hardCapacityExceeded ? 'hard_capacity' : 'recovery_reserve',
+    actions: ['select_sources', ...(reservationPolicy && accounting.outputReservation > reservationPolicy.minimum ? ['reduce_reservation' as const] : []), 'change_model', 'cancel']
   };
 }
 
@@ -5217,17 +5282,12 @@ function snapshotRecoveryEmitter(snapshot: TurnSnapshot, emit: (event: AgentProg
     : emit;
 }
 
-function isContextActivationTool(tool: Pick<CompiledToolDefinition, 'implementationId'> | undefined): boolean {
-  return tool !== undefined && ['agent-core.context-transition.v2', 'agent-core.context-save-and-activate.v2'].includes(tool.implementationId);
+function isContextActivationTool(tool: CompiledToolDefinition | undefined): boolean {
+  return contextControlRole(tool) === 'activation';
 }
 function isContextMutationTool(tool: CompiledToolDefinition | undefined): boolean {
-  return isContextActivationTool(tool) || tool?.implementationId === 'agent-core.session-state-save.v1';
+  return contextControlRole(tool) === 'activation' || contextControlRole(tool) === 'state';
 }
-
 function isContextCheckpointTool(tool: CompiledToolDefinition): boolean {
-  return isContextMutationTool(tool) ||
-    (tool.implementationId === `agent-core.${tool.name}.v1` &&
-      tool.effectEnvelope.accesses.every(access => access.mode === 'read' &&
-        (['context', 'history', 'session_state'].includes(access.scope))) &&
-      ['_inspect', '_read', '_search', '_latest', '_list'].some(suffix => tool.name.endsWith(suffix)));
+  return contextControlRole(tool) !== undefined;
 }

@@ -474,3 +474,192 @@ test('atomic state and view publication is fenced when ownership changes during 
   assert.equal((await context.transition(request, { admit })).id, committed.id, 'lost receipt reconciliation precedes live ownership');
   assert.equal(guardedPublications, 2);
 });
+
+test('state retrieval schemas and repository share defaults and advertised bounds', async () => {
+  const f = await fixture();
+  await f.context.saveSessionState(f.batch('bounds', Array.from({ length: 128 }, (_, i) => ({ kind: 'create', text: `${i}: ${'😀'.repeat(80)}` }))));
+  const direct = await f.repository.listSessionState(f.session, { limit: 256 });
+  const service = await f.context.listSessionState({ limit: 256 });
+  assert.deepEqual(service, direct);
+  assert.ok(Buffer.byteLength(JSON.stringify(service)) <= 32768);
+  for (const name of ['context_state_list', 'context_state_search']) {
+    const tool = f.context.toolDefinitions().find(item => item.name === name);
+    const required = name.endsWith('search') ? { query: 'literal' } : {};
+    for (const maxBytes of [1, 511, 1048577]) assert.equal(tool.decodeInput({ kind: 'json', value: { ...required, maxBytes } }).ok, false);
+    for (const maxBytes of [512, 65536, 1048576]) assert.equal(tool.decodeInput({ kind: 'json', value: { ...required, maxBytes } }).ok, true);
+    assert.equal(tool.decodeInput({ kind: 'json', value: { ...required, cursor: 'x'.repeat(16385) } }).ok, false);
+    assert.equal(tool.decodeInput({ kind: 'json', value: required }).input.maxBytes, 32768);
+    if (required.query) assert.equal(tool.decodeInput({ kind: 'json', value: { query: '😀'.repeat(300) } }).ok, false);
+  }
+  for (const read of [r => f.context.listSessionState(r), r => f.context.listSelectedSessionState(r), r => f.context.searchSessionState({ query: 'literal', ...r })]) {
+    await assert.rejects(read({ maxBytes: 511 }));
+    await assert.rejects(read({ maxBytes: 1048577 }));
+    await assert.rejects(read({ cursor: 'x'.repeat(16385) }), /cursor/);
+  }
+});
+
+test('selected and searched pages shrink to the complete envelope and refuse zero progress', async () => {
+  const f = await fixture();
+  const refs = (await f.context.saveSessionState(f.batch('fit-envelope', Array.from({ length: 8 }, () => ({ kind: 'create', text: '"'.repeat(200) + 'needle' + '"'.repeat(200) }))))).revisions;
+  await activate(f, refs);
+  for (const read of [r => f.context.listSelectedSessionState(r), r => f.context.searchSessionState({ query: 'needle', ...r })]) {
+    const one = await read({ limit: 1 });
+    const maxBytes = Buffer.byteLength(JSON.stringify(one));
+    const many = await read({ limit: 8, maxBytes });
+    assert.equal((many.items ?? many.matches).length, 1);
+    assert.ok(Buffer.byteLength(JSON.stringify(many)) <= maxBytes);
+    assert.ok(many.cursor);
+    const next = await read({ cursor: many.cursor, maxBytes });
+    assert.notEqual((next.items ?? next.matches)[0].itemId, (many.items ?? many.matches)[0].itemId);
+  }
+  await assert.rejects(f.context.searchSessionState({ query: 'needle', maxBytes: 512 }), error => {
+    assert.equal(error.details.resource, 'state_result');
+    assert.ok(error.details.observedBytes > 512);
+    assert.match(error.message, /Retry/);
+    return true;
+  });
+  await assert.rejects(f.context.searchSessionState({ query: 'needle', maxScannedBytes: 1 }), error => {
+    assert.equal(error.details.resource, 'state_search_scan');
+    assert.equal(error.details.observedBytes, 406);
+    return true;
+  });
+});
+
+test('state previews are byte bounded metadata and exact Unicode search spans select original text', async () => {
+  const f = await fixture();
+  const text = '\uFEFF' + '😀'.repeat(90) + 'café😀needle' + '😀'.repeat(200) + 'needle';
+  const [ref] = (await f.context.saveSessionState(f.batch('unicode-spans', [{ kind: 'create', text }]))).revisions;
+  let reads = 0;
+  const read = f.artifacts.readVerified.bind(f.artifacts);
+  f.artifacts.readVerified = async value => { reads++; return read(value); };
+  const item = (await f.context.listSessionState()).items[0];
+  assert.ok(Buffer.byteLength(item.preview) <= 160);
+  assert.ok(text.startsWith(item.preview));
+  assert.equal(item.preview.isWellFormed(), true);
+  assert.equal(reads, 0);
+  const search = await f.context.searchSessionState({ query: 'needle' });
+  assert.equal(search.occurrence, 'first_per_item');
+  const [match] = search.matches;
+  assert.equal(match.excerpt.isWellFormed(), true);
+  assert.equal(match.range.offset, Buffer.byteLength(text.slice(0, text.indexOf('needle'))));
+  assert.equal((await f.context.readSessionState({ ...ref, range: match.range })).text, 'needle');
+  assert.equal((await f.context.readSessionState({ ...ref, range: match.excerptRange })).text, match.excerpt);
+  assert.equal((await f.context.readSessionState(ref)).text, text);
+});
+
+test('state search reuses bounded history gram machinery and re-verifies candidates', async () => {
+  const f = await fixture();
+  await f.context.saveSessionState(f.batch('index-work', Array.from({ length: 20 }, (_, i) => ({ kind: 'create', text: `ordinary narrative ${i}` }))));
+  let reads = 0;
+  const read = f.artifacts.readVerified.bind(f.artifacts);
+  f.artifacts.readVerified = async value => { reads++; return read(value); };
+  const first = await f.context.searchSessionState({ query: 'absent' });
+  assert.equal(first.coverage, 'complete');
+  assert.equal(first.indexed, 20);
+  assert.equal(reads, 20);
+  reads = 0;
+  const repeated = await f.context.searchSessionState({ query: 'absent' });
+  assert.equal(repeated.coverage, 'complete');
+  assert.equal(repeated.indexed, 0);
+  assert.equal(repeated.scannedBytes, 0);
+  assert.equal(reads, 0);
+  const matching = await f.context.searchSessionState({ query: 'ordinary', limit: 256 });
+  assert.equal(matching.matches.length, 20);
+  assert.equal(reads, 20, 'derived candidates are verified against original immutable bodies');
+  await f.context.saveSessionState(f.batch('index-append', [{ kind: 'create', text: 'new absent match' }]));
+  reads = 0;
+  const appended = await f.context.searchSessionState({ query: 'absent' });
+  assert.equal(appended.matches.length, 1);
+  assert.equal(appended.indexed, 1);
+  assert.equal(reads, 1, 'append indexes only the new revision');
+});
+
+
+test('incremental state search respects scan work and cached abandoned revisions never leak across forks', async () => {
+  const f = await fixture();
+  const seed = await f.context.saveSessionState(f.batch('incremental', Array.from({ length: 5 }, () => ({ kind: 'create', text: 'ordinary narrative' }))));
+  let cursor, indexed = 0;
+  do {
+    const page = await f.context.searchSessionState({ query: 'absent', maxScannedBytes: 18, ...(cursor ? { cursor } : {}) });
+    assert.ok(page.scannedBytes <= 18);
+    assert.ok(!cursor || page.cursor !== cursor);
+    indexed += page.indexed;
+    cursor = page.cursor;
+  } while (cursor);
+  assert.equal(indexed, 5);
+  const future = await f.context.saveSessionState(f.batch('future-cached', [{ kind: 'create', text: 'abandoned secret' }]));
+  assert.equal((await f.context.searchSessionState({ query: 'secret' })).matches[0].revisionId, future.revisions[0].revisionId);
+  await f.repository.branchFrom(f.session, seed.entryId, 'exclude-cached-future');
+  const result = await f.context.searchSessionState({ query: 'secret' });
+  assert.equal(result.coverage, 'complete');
+  assert.deepEqual(result.matches, []);
+  assert.equal(result.scannedBytes, 0);
+});
+
+
+test('stored previews are refreshed by replace and edit without activating content', async () => {
+  const f = await fixture();
+  const [original] = (await f.context.saveSessionState(f.batch('preview-original', [{ kind: 'create', text: 'first 😀' }]))).revisions;
+  const [replaced] = (await f.context.saveSessionState(f.batch('preview-replace', [{ kind: 'replace', itemId: original.itemId,
+    expectedRevisionId: original.revisionId, text: '\uFEFFupdated 😀' }]))).revisions;
+  assert.equal((await f.context.listSessionState()).items[0].preview, '\uFEFFupdated 😀');
+  await f.context.saveSessionState(f.batch('preview-edit', [{ kind: 'edit', itemId: replaced.itemId,
+    expectedRevisionId: replaced.revisionId, edits: [{ offset: 3, bytes: 7, text: 'edited' }] }]));
+  assert.equal((await f.context.listSessionState()).items[0].preview, '\uFEFFedited 😀');
+  assert.deepEqual((await f.context.sessionState()).items, []);
+});
+
+
+test('state text writes reject lone surrogates before staging or committing', async () => {
+  const f = await fixture();
+  const valid = '\uFEFFexact 😀 source';
+  const [ref] = (await f.context.saveSessionState(f.batch('unicode-valid-source', [{ kind: 'create', text: valid }]))).revisions;
+  const revision = await f.repository.revision(f.session);
+  let staged = 0;
+  const store = f.artifacts.storeProtected.bind(f.artifacts);
+  f.artifacts.storeProtected = async input => { staged++; return store(input); };
+  for (const [i, text] of ['\uD800', '\uDC00', 'long '.repeat(80) + '\uD800', 'x\uD800y'].entries()) {
+    for (const operation of [
+      { kind: 'create', text },
+      { kind: 'replace', itemId: ref.itemId, expectedRevisionId: ref.revisionId, text },
+      { kind: 'edit', itemId: ref.itemId, expectedRevisionId: ref.revisionId, edits: [{ offset: 0, bytes: 0, text }] }
+    ]) await assert.rejects(f.context.saveSessionState(f.batch(`invalid-unicode-${i}-${operation.kind}`, [operation])), /well-formed Unicode/);
+  }
+  assert.equal(staged, 0);
+  assert.equal(await f.repository.revision(f.session), revision);
+  assert.equal((await f.context.readSessionState(ref)).text, valid);
+  assert.equal((await f.context.listSessionState()).items.length, 1);
+});
+
+test('state read maxBytes is an operation budget for the exact complete JSON result', async () => {
+  const f = await fixture({ sessionStateReadBytes: 4096 });
+  const [ref] = (await f.context.saveSessionState(f.batch('bounded-read', [{ kind: 'create', text: '\uFEFF😀' + '"'.repeat(100) }]))).revisions;
+  const expected = await f.context.readSessionState(ref);
+  const required = Buffer.byteLength(JSON.stringify(expected));
+  assert.ok(required > Buffer.byteLength(expected.text));
+  const tool = f.context.toolDefinitions().find(value => value.name === 'context_state_read');
+  for (const maxBytes of [0, -1, 0.5, 1048577]) assert.equal(tool.decodeInput({ kind: 'json', value: { ...ref, maxBytes } }).ok, false);
+  assert.equal(tool.decodeInput({ kind: 'json', value: ref }).ok, true);
+  assert.equal(tool.decodeInput({ kind: 'json', value: { ...ref, maxBytes: required } }).ok, true);
+  const canonical = await tool.canonicalizeInput({ ...ref, maxBytes: required }, {});
+  assert.equal(canonical.value.maxBytes, required);
+  assert.deepEqual(canonical.value.ref, ref, 'output allowance is excluded from immutable reference identity');
+  const result = await invokeToolCall(jsonToolCall('context_state_read', { ...ref, maxBytes: required }, 'bounded-read-ok'),
+    f.context.toolDefinitions(), { policy: { allowedRisks: ['read'] } });
+  assert.equal(result.kind, 'result');
+  assert.deepEqual(result.output, expected);
+  assert.equal(Buffer.byteLength(JSON.stringify(result.output)), required);
+  const refused = await invokeToolCall(jsonToolCall('context_state_read', { ...ref, maxBytes: required - 1 }, 'bounded-read-refusal'),
+    f.context.toolDefinitions(), { policy: { allowedRisks: ['read'] } });
+  assert.equal(refused.kind, 'failure');
+  assert.equal(refused.output.details.resource, 'state_result');
+  assert.equal(refused.output.details.observedBytes, required);
+  await assert.rejects(f.context.readSessionState(ref, undefined, 1048577));
+  assert.deepEqual(await f.context.readSessionState(ref), expected, 'omitted budget preserves ordinary exact-read behavior');
+  const [full] = (await f.context.saveSessionState(f.batch('source-at-limit', [{ kind: 'create', text: 'x'.repeat(4096) }]))).revisions;
+  const fullResult = await f.context.readSessionState(full);
+  const envelopeBytes = Buffer.byteLength(JSON.stringify(fullResult));
+  assert.ok(envelopeBytes > 4096);
+  assert.deepEqual(await f.context.readSessionState(full, undefined, envelopeBytes), fullResult,
+    'delivery allowance can exceed the independent source-byte allowance to fit metadata');
+});

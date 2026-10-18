@@ -316,6 +316,7 @@ export interface InferenceOwnerState {
   /** Settled consumption plus outstanding reservations. */
   readonly committed: InferenceUsageTotals;
   readonly invocation?: InferenceInvocation;
+  readonly latestInvocation?: InferenceInvocation;
   readonly settledUsage: InferenceUsageTotals;
 }
 export interface InferenceRepository {
@@ -326,6 +327,7 @@ export interface InferenceRepository {
   append(ownerId: string, event: InferenceEvent, tail: EventLedgerTail): Promise<boolean>;
 }
 interface OwnerIndex {
+  latestInvocationId?: string;
   tail: EventLedgerTail;
   policyFingerprint?: string;
   committed: InferenceUsageTotals;
@@ -407,10 +409,12 @@ export class EventInferenceRepository implements InferenceRepository {
     }
     const invocation =
       query.invocationId === undefined ? undefined : index.invocations.get(query.invocationId);
+    const latestInvocation = index.latestInvocationId ? index.invocations.get(index.latestInvocationId) : undefined;
     return Object.freeze({
       tail,
       ...(index.policyFingerprint ? { policyFingerprint: index.policyFingerprint } : {}),
       committed: index.committed,
+      ...(latestInvocation ? { latestInvocation } : {}),
       ...(invocation ? { invocation } : {}),
       settledUsage:
         query.runId === undefined
@@ -432,6 +436,7 @@ export class EventInferenceRepository implements InferenceRepository {
         throw new Error('Contradictory inference admission or owner policy.');
       index.policyFingerprint = policy;
       next = Object.freeze({ start: event });
+      index.latestInvocationId = event.invocationId;
     } else {
       if (
         prior?.start.permit !== event.permit ||
@@ -448,6 +453,7 @@ export class EventInferenceRepository implements InferenceRepository {
         )
           throw new Error('Contradictory native inference input extension.');
         next = Object.freeze({ ...prior, extension: event });
+        index.latestInvocationId = event.invocationId;
       } else if (event.type === 'inference.rejected') {
         if (prior.uncertain)
           throw new Error('A context rejection cannot override an uncertain dispatch.');

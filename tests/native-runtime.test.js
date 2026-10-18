@@ -89,6 +89,28 @@ function tool(name, invoke) {
   });
 }
 
+async function assertRestartedNativeInspection(provider, repository, artifacts, events, ownerId) {
+  const owner = await repository.load(ownerId);
+  const latest = owner.latestInvocation;
+  const record = JSON.parse(new TextDecoder().decode(await artifacts.readVerified(latest.extension?.requestRef ?? latest.start.requestRef)));
+  assert.ok(record.capabilities, 'Exact native successor/extension catalog must precede durable request publication.');
+  const restarted = new AgentRuntime({ provider, model: 'gpt-6-astra', modelBindingId: 'reopened-configured-binding',
+    inferenceOwnerId: ownerId, maxOutputTokens: 128, tools: [], repositories: { events, artifacts },
+    toolBoundary: { authorizationPolicyId: 'tests/native', executionTargetId: 'tests/native' },
+    inferenceService: new InferenceService({ provider, repository, artifacts }) });
+  try {
+    const inspected = await restarted.inspectOperational({ target: 'last_admitted' });
+    assert.equal(inspected.admissionEvidence, 'durable_invocation');
+    assert.equal(inspected.lastAdmittedCoverage, 'available');
+    assert.equal(inspected.lastAdmittedRequest.inputIdentity, record.inputIdentity);
+    assert.equal(inspected.lastAdmittedRequest.invocation.invocationId, latest.start.invocationId);
+    assert.equal(inspected.lastAdmittedRequest.invocation.status, 'settled');
+    assert.equal(inspected.capabilities.revision, record.capabilities.revision);
+    assert.deepEqual(inspected.capabilities.items.map(item => item.name).sort(),
+      (record.logical.tools ?? []).map(item => item.type === 'function' ? item.function.name : item.name).sort());
+  } finally { await restarted.close(); }
+}
+
 test(
   'native runtime starts a successor before a late async result and settles original work exactly once',
   { timeout: 10000 },
@@ -212,6 +234,7 @@ test(
       .state;
     assert.deepEqual(state.providerRequests, []);
     assert.deepEqual(state.toolBatches, []);
+    await assertRestartedNativeInspection(provider, inference, artifacts, events, 'native-independent');
     const ledger = await inference.load('native-independent');
     assert.equal(ledger.committed.invocations, 3);
     assert.equal(ledger.settledUsage.invocations, 3);
@@ -445,6 +468,7 @@ for (const [requiresResult, reportsUsage] of [
       assert.equal(result.terminal.budget.completionTokens, 4);
     }
     assert.equal(socket.sent.length, requiresResult ? 3 : 2);
+    await assertRestartedNativeInspection(provider, inference, artifacts, events, 'steered-runtime');
     const owner = await inference.load('steered-runtime');
     assert.equal(owner.committed.invocations, 2);
     assert.equal(

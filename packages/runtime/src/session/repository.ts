@@ -123,7 +123,7 @@ export class InMemorySessionRepository implements SessionRepository {
       const header: SessionHeader = Object.freeze({
         type: 'session',
         version: 1,
-        format: 'agent-core.session/5',
+        format: 'agent-core.session/6',
         sessionStateStorage: 'session',
         id,
         timestamp: new Date().toISOString(),
@@ -269,7 +269,7 @@ export class InMemorySessionRepository implements SessionRepository {
         if (!value) break;
         const metadata = stateItemMetadata(value);
         if (items.length >= limit) {partial = true; break;}
-        try {statePageResult(session.id,leaf,[...items,metadata],index + 1 < values.length,value.itemId,maxBytes);}
+        try {if (statePageResult(session.id,leaf,[...items,metadata],index + 1 < values.length,value.itemId,maxBytes).items.length <= items.length) {partial = true;break;}}
         catch (error) {if (items.length === 0) throw error;partial = true;break;}
         items.push(metadata); after = value.itemId;
       }

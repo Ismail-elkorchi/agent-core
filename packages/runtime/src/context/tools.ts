@@ -1,3 +1,5 @@
+import { contextOperationalInspectionPageSchema } from '../session/operational.js';
+import { grantContextControlTool } from './recovery.js';
 import { ContextInspectionSizeError, MAX_MANIFEST_BYTES, contextInspectionStartCursor, contextInspectionCursor, contextInspectionSchema } from './inspection.js';
 import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import {
@@ -16,7 +18,7 @@ import { historyCutSchema, sourceSchema, sourceExcerptSchema } from '../history/
 import { scopedTool, scopePath, invocationIdentity } from '../history/tool-support.js';
 import { contextTransitionRequestSchema } from './schema.js';
 import { hashJson, decodeOwnedArtifactRef, PersistenceConflictError, type ArtifactRepository } from '@agent-core/persistence';
-import { SESSION_STATE_GUIDANCE, sessionStateOperationSchema, sessionStateItemRefSchema, plannedSessionStateRefs } from '../session/session-state.js';
+import { SESSION_STATE_GUIDANCE, sessionStatePageSchema, sessionStateReadSchema, sessionStateSearchSchema, sessionStateOperationSchema, sessionStateItemRefSchema, plannedSessionStateRefs } from '../session/session-state.js';
 import type { HistorySourceExcerpt } from '../history/contracts.js';
 import type { ContextService } from './service.js';
 /** Internal construction receives explicit owned storage, never a public staging capability. */
@@ -29,7 +31,7 @@ export function contextToolDefinitions(options: {
   const prefix = options.prefix ?? 'context';
   const sources = z.array(sourceSchema).max(10000).readonly();
   const selectionShape = {
-    reason: z.string().min(1), renewal: z.boolean().optional(), retain: sources.optional(),
+    reason: z.string().min(1), renewal: z.boolean().optional(), outputReservation: z.int().positive().optional(), retain: sources.optional(),
     add: sources.optional(), release: sources.optional(), recentFrom: sourceSchema.optional(),
     excerpts: z.array(sourceExcerptSchema).max(10000).readonly().optional(),
     sessionState: z.array(sessionStateItemRefSchema).max(10000).readonly().optional(),
@@ -84,7 +86,8 @@ export function contextToolDefinitions(options: {
       toolInvocation: { runId, turnId, requestAttempt, toolBatchId, callIndex, toolAttempt },
       expectedCut: value.cut, expectedWindowId: value.expectedWindowId, expectedSourceRevision: value.cut.sourceRevision,
       ...(staged ? { sessionState: staged } : {}), idempotencyKey: value.identity,
-      reason: value.reason, ...(value.renewal === undefined ? {} : { renewal: value.renewal }), selection: value.selection
+      reason: value.reason, ...(value.renewal === undefined ? {} : { renewal: value.renewal }),
+      ...(value.outputReservation === undefined ? {} : { outputReservation: value.outputReservation }), selection: value.selection
     }));
     return { kind: 'result', execution: { state: 'settled' },
       scope: { resources: [scopePath('context', value.cut.sessionId, value.cut.branchId)], coverage: 'complete' },
@@ -96,7 +99,7 @@ export function contextToolDefinitions(options: {
     implementationId: `agent-core.context-${atomic ? 'save-and-activate' : 'transition'}.v2`,
     description: `${SESSION_STATE_GUIDANCE} ${atomic
       ? 'Atomically save conditional narrative item changes and activate the selected view, or publish neither if admission fails. activateSaved replaces selected references for touched items with their new revisions and removes deleted items from the view. Set activateSaved=false to use the explicitly supplied view unchanged.'
-      : 'Activate exact existing item revisions and historical sources without saving state.'} retain replaces optional original sources; add/release edits complete exchanges. Active accepted inputs remain protected. renewal deliberately starts a new provider continuation. A scheduled result is pending until the exact next request is admitted.`,
+      : 'Activate exact existing item revisions and historical sources without saving state.'} retain replaces optional original sources; add/release edits complete exchanges. Active accepted inputs remain protected. renewal deliberately starts a new provider continuation. outputReservation proposes an ordinary output-token allowance for this window, only within explicit host policy; omission retains the current choice. It changes neither continuing-work budgets nor host ceilings. A scheduled result is pending until the exact next request is admitted.`,
     schema: atomic ? combined : transition,
     outputSchema: z.json().transform(value => parseJsonValue(value)),
     effectEnvelope: { accesses: [{ mode: 'read', scope: 'session_state' }, { mode: 'read', scope: 'artifacts' }, { mode: 'write', scope: 'context' }, ...(atomic ? [{ mode: 'write' as const, scope: 'session_state' }] : [])],
@@ -115,11 +118,11 @@ export function contextToolDefinitions(options: {
     invoke: observe,
     async recover(value, _effect, execution) { return { status: 'settled', observation: await observe(value, execution) }; }
   });
-  return Object.freeze([
+  const readTools = [
     scopedTool({
       name: `${prefix}_inspect`,
       description:
-        'Inspect the live selected sources at a captured boundary, including recent exchanges, protected input and native prefix dependencies. Source references can be passed unchanged to context_transition add/release. maxBytes bounds successful delivered JSON, including bookkeeping and cursor. Size errors provide measured bounds and cut-pinned retry arguments when supported. Continue with cursor for more sources. Capacity describes the last admitted request, not later tool results. No periodic inspection is required.',
+        'Inspect the live selected sources at a captured boundary, including recent exchanges, protected input and native prefix dependencies. Source references can be passed unchanged to context_transition add/release. maxBytes bounds successful delivered JSON, including bookkeeping and cursor. Size errors provide measured bounds and cut-pinned retry arguments when supported. Continue with cursor for more sources. Capacity describes the last admitted request, not later tool results. Operational capability and owner-budget details are not included in this source page. No periodic inspection is required.',
       schema: contextInspectionSchema,
       mode: 'read',
       root: 'context',
@@ -205,22 +208,16 @@ export function contextToolDefinitions(options: {
     }),
     scopedTool({
       name: `${prefix}_runtime_inspect`, description: 'Inspect effective capabilities, continuing-work allowance and active operations. Page capabilities with offset, limit and expectedRevision from the previous page. This is read-only; state storage and source-selection limits are separate from runtime budgets.',
-      schema: z.strictObject({ target: z.enum(['configured', 'last_admitted']).optional(), offset: z.int().nonnegative().optional(), limit: z.int().min(1).max(256).optional(),
-        expectedRevision: z.string().min(1).max(512).optional(), maxBytes: z.int().positive().max(262144).default(32768) }),
+      schema: contextOperationalInspectionPageSchema,
       mode: 'read', root: 'context',
       async canonicalize(value) { const cut = await options.context.history.capture(); return { value: parseJsonObject(value), scope: scopePath('context', cut.sessionId, cut.branchId) }; },
       async invoke(value) {
-        const result = await options.context.inspectOperational({ ...(value.target === 'configured' || value.target === 'last_admitted' ? { target: value.target } : {}), ...(typeof value.offset === 'number' ? { offset: value.offset } : {}),
-          ...(typeof value.limit === 'number' ? { limit: value.limit } : {}), ...(typeof value.expectedRevision === 'string' ? { expectedRevision: value.expectedRevision } : {}) });
-        const bytes = Buffer.byteLength(JSON.stringify(result));
-        if (typeof value.maxBytes !== 'number' || bytes > value.maxBytes) throw new ToolInputError('Runtime inspection exceeds maxBytes; reduce the capability page or raise the bound.',
-          { code: 'runtime_inspection_max_bytes', requiredBytes: bytes, requestedMaxBytes: value.maxBytes ?? 0 });
-        return result;
+        return options.context.inspectOperational(contextOperationalInspectionPageSchema.parse(value));
       }
     }),
     scopedTool({
-      name: `${prefix}_state_list`, description: 'List stored narrative item metadata or exact currently selected revision references without loading bodies. Set view=selected for the active view; default stored lists current item heads. Continue with the returned cut-pinned cursor.',
-      schema: z.strictObject({ view: z.enum(['stored', 'selected']).default('stored'), cursor: z.string().max(65536).optional(), limit: z.int().min(1).max(256).optional(), maxBytes: z.int().positive().max(65536).optional() }),
+      name: `${prefix}_state_list`, description: 'List stored narrative item metadata with bounded leading-text previews, or exact currently selected revision references, without loading bodies. Set view=selected for the active view; default stored lists current item heads. Continue with the returned cut-pinned cursor.',
+      schema: sessionStatePageSchema.extend({ view: z.enum(['stored', 'selected']).default('stored') }),
       mode: 'read', root: 'session_state',
       async canonicalize(value) { const cut = await options.context.history.capture(); return { value: parseJsonObject({ ...value, cut }), scope: scopePath('session_state', cut.sessionId, cut.branchId) }; },
       async invoke(value) { const cut = historyCutSchema.parse(value.cut); await options.context.history.validateCut(cut);
@@ -230,9 +227,8 @@ export function contextToolDefinitions(options: {
           ...(typeof value.maxBytes === 'number' ? { maxBytes: value.maxBytes } : {}) })); }
     }),
     scopedTool({
-      name: `${prefix}_state_search`, description: 'Search current stored narrative text literally with bounded scanning and output. Partial results carry a query-pinned cursor. An unsearched oversized item needs a larger scan allowance; absence of a match is not complete coverage.',
-      schema: z.strictObject({ query: z.string().min(1).max(1024), cursor: z.string().max(65536).optional(), limit: z.int().min(1).max(256).optional(),
-        maxBytes: z.int().positive().max(1048576).optional(), maxScannedBytes: z.int().positive().max(16777216).optional() }),
+      name: `${prefix}_state_search`, description: 'Search current stored narrative text literally with bounded scanning and output. Returns only the first occurrence per item, with exact UTF-8 match and excerpt ranges directly usable for reads and selection. Partial results carry a query-pinned cursor. An unsearched oversized item needs a larger scan allowance; absence of a match is not complete coverage.',
+      schema: sessionStateSearchSchema,
       mode: 'read', root: 'session_state',
       async canonicalize(value) { const cut = await options.context.history.capture(); return { value: parseJsonObject({ ...value, authorizedCut: cut }), scope: scopePath('session_state', cut.sessionId, cut.branchId) }; },
       async invoke(value) {
@@ -242,12 +238,18 @@ export function contextToolDefinitions(options: {
         ...(typeof value.maxBytes === 'number' ? { maxBytes: value.maxBytes } : {}), ...(typeof value.maxScannedBytes === 'number' ? { maxScannedBytes: value.maxScannedBytes } : {}) })); }
     }),
     scopedTool({
-      name: `${prefix}_state_read`, description: 'Read one exact narrative item revision, optionally an exact bounded UTF-8 byte range. Does not activate it.',
-      schema: sessionStateItemRefSchema, mode: 'read', root: 'session_state',
-      async canonicalize(value) { const cut = await options.context.history.capture(); return { value: parseJsonObject({ ref: value, cut }), scope: scopePath('session_state', cut.sessionId, cut.branchId) }; },
-      async invoke(value) { return parseJsonValue(await options.context.readSessionState(sessionStateItemRefSchema.parse(value.ref), historyCutSchema.parse(value.cut))); }
+      name: `${prefix}_state_read`, description: 'Read one exact narrative item revision, optionally an exact UTF-8 byte range. Optional maxBytes bounds the complete JSON result including text, references and citations; an oversized exact result is refused, never truncated. Does not activate it.',
+      schema: sessionStateReadSchema, mode: 'read', root: 'session_state',
+      async canonicalize(value) {
+        const { maxBytes, ...ref } = value;
+        const cut = await options.context.history.capture();
+        return { value: parseJsonObject({ ref, cut, ...(maxBytes === undefined ? {} : { maxBytes }) }), scope: scopePath('session_state', cut.sessionId, cut.branchId) };
+      },
+      async invoke(value) { return parseJsonValue(await options.context.readSessionState(sessionStateItemRefSchema.parse(value.ref),
+        historyCutSchema.parse(value.cut), typeof value.maxBytes === 'number' ? value.maxBytes : undefined)); }
     }),
-    defineTool({
+  ];
+  const stateTool = defineTool({
       name: `${prefix}_state_save`, implementationId: 'agent-core.session-state-save.v1',
       description: `${SESSION_STATE_GUIDANCE} Durably save a conditional atomic batch of create, replace, UTF-8 range edit, or remove operations. Does not compile or activate any model request. Runtime assigns item and revision identities and returns them in the durable receipt.`,
       schema: save,
@@ -267,9 +269,12 @@ export function contextToolDefinitions(options: {
         execution: { state: 'settled' as const }, scope: { resources: [scopePath('session_state', value.capturedHistoryCut.sessionId, value.branchId)], coverage: 'complete' as const }, summary: 'Narrative changes durably saved; the active view is unchanged.', output: parseJsonValue(receipt) }; },
       async recover(value) { const receipt = await options.context.saveSessionState(value).catch(stateToolFailure); return { status: 'settled' as const,
         observation: { kind: 'result' as const, execution: { state: 'settled' as const }, scope: { resources: [scopePath('session_state', value.capturedHistoryCut.sessionId, value.branchId)], coverage: 'complete' as const }, summary: 'Narrative changes durably saved.', output: parseJsonValue(receipt) } }; }
-    }),
-    viewTool(false),
-    viewTool(true)
+    });
+  return Object.freeze([
+    ...readTools.map(tool => grantContextControlTool(tool, 'read')),
+    grantContextControlTool(stateTool, 'state'),
+    grantContextControlTool(viewTool(false), 'activation'),
+    grantContextControlTool(viewTool(true), 'activation')
   ]);
 }
 
@@ -316,6 +321,7 @@ function inspectionPresentation(result: JsonObject): string {
       }
     } : {}),
     operational: result.operational,
+    operationalCoverage: result.operationalCoverage,
     selection: result.activeSelection,
     excerpts: result.excerpts,
     committedWindow: result.window,

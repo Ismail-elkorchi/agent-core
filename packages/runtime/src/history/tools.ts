@@ -1,3 +1,4 @@
+import { grantContextControlTool } from '../context/recovery.js';
 import * as z from 'zod';
 import { parseJsonObject } from '@agent-core/json';
 import { defaultToolModelContent, type CompiledToolDefinition } from '@agent-core/tools';
@@ -151,5 +152,5 @@ export function createHistoryTools(options: {
         });
       }
     })
-  ]);
+  ].map(tool => grantContextControlTool(tool, 'read')));
 }

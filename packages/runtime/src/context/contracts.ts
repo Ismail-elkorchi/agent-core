@@ -28,6 +28,8 @@ export interface ContextSelection extends ContextSourceSelection {
     | undefined;
 }
 export interface ContextWindowRecord {
+  /** Host-authorized ordinary output reservation for requests using this window. */
+  readonly outputReservation?: number | undefined;
   readonly windowId: string;
   readonly parentWindowId: string | null;
   readonly historyPosition: HistorySourceCut;
@@ -37,10 +39,11 @@ export interface ContextWindowRecord {
 }
 export interface ContextTransitionRecord {
   readonly strategy: 'append' | 'fresh';
-  readonly cause: 'state_update' | 'selection_change' | 'explicit_renewal' | 'capacity' | 'prefix_incompatibility';
+  readonly cause: 'state_update' | 'resource_change' | 'selection_change' | 'explicit_renewal' | 'capacity' | 'prefix_incompatibility';
   readonly requestedRenewal?: boolean | undefined;
+  readonly requestedOutputReservation?: number | undefined;
   readonly admission:
-    { readonly status: 'admitted'; readonly compiledInputIdentity: string; readonly capabilityRevision: string };
+    { readonly status: 'admitted'; readonly compiledInputIdentity: string; readonly capabilityRevision: string; readonly outputReservation?: number | undefined };
   readonly transitionId: string;
   readonly idempotencyKey: string;
   readonly previousWindowId: string | null;
@@ -60,6 +63,8 @@ export interface ContextTransitionCommit {
   readonly transition: ContextTransitionRecord;
 }
 export interface ContextTransitionRequest {
+  /** Proposed window-scoped reservation; omission retains the current window choice. */
+  readonly outputReservation?: number | undefined;
   /** Deliberately replace the provider continuation even when content is unchanged. */
   readonly renewal?: boolean | undefined;
   readonly expectedCut?: HistorySourceCut | undefined;

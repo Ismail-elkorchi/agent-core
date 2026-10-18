@@ -93,10 +93,27 @@ Use the returned `itemId` and `revisionId` in `context_state_read` or in a
 `context_transition` selection. A reference is `{ itemId, revisionId }`, optionally
 with `range: { offset, bytes }`. Byte ranges and edits must use exact UTF-8
 boundaries; they are not JavaScript character offsets and are never silently
-truncated. `context_state_list` defaults to current stored heads; `view: "selected"`
-lists the exact active references. Both expose bounded, cut-pinned pages.
+truncated. `context_state_read` optionally accepts `maxBytes` for the complete JSON
+result, including text, identity and citations, up to 1 MiB. This delivery budget
+is independent of the configured source-byte read allowance; insufficient output
+space refuses with the measured size and never shortens the exact selection. Omission preserves the normal read API.
+`context_state_list` defaults to current stored heads; `view: "selected"`
+lists the exact active references. Stored metadata includes an optional leading-text
+preview of at most 160 UTF-8 bytes, derived during saving; listing never loads bodies.
+Both expose bounded, cut-pinned pages. Tool and host page contracts use the same
+32 KiB default, 512-byte minimum, 1 MiB maximum, and 16 KiB cursor limit. The full
+serialized result, including its continuation cursor, must fit; pages shrink when
+possible and otherwise refuse with a measured retry size rather than returning an
+empty page at the same cursor.
 `context_state_search` performs literal search with separate scan and output
-bounds; partial coverage and oversized unread items are explicit.
+bounds. It returns the first occurrence per item: `range` selects the exact match,
+and `excerptRange` selects the returned excerpt, both as UTF-8 `{ offset, bytes }`.
+A bounded, disposable index reuses history's substring candidate machinery to skip
+known non-candidates; candidate matches are verified against original revision
+bytes. Index construction is incremental within each call's scan allowance, retains
+no bodies, and is capped at 16 MiB of source bytes and 16,384 revisions. Short queries
+may require scanning every body. Partial coverage and oversized unread items are
+explicit; a first item larger than the scan allowance refuses with the required size.
 
 `ContextService.saveSessionState(batch)` is the corresponding host save API.
 Supply the branch, idempotency key, recorded originating inference, captured
@@ -114,7 +131,7 @@ branch point. Independent saves survive a later failed activation.
 Storage, materialization and request capacity are distinct bounds in
 `ContextPolicy`:
 
-- `sessionStateStorageBytes` defaults to 64 MiB and counts committed retained
+- `committedRetainedStateBytes` defaults to 64 MiB and counts committed retained
   revision metadata and bodies, including superseded and abandoned-fork revisions
 - `sessionStateMutationBytes` defaults to 1 MiB per staging attempt
 - `sessionStateReadBytes` defaults to 64 KiB per item read
@@ -251,7 +268,7 @@ or acknowledged delivery cannot be resent without evidence that it failed.
 ## Compatibility and evidence
 
 Execution and session formats are versioned. The item-state contract uses
-`agent-core.session/5`. This build cannot open, resume, or read historical content
+`agent-core.session/6`. This build cannot open, resume, or read historical content
 from earlier session formats. It rejects unsupported execution records and
 incompatible session headers without rewriting original journals. Reading those
 originals requires the matching earlier build; this build performs no conversion. It has no aliases, old-format readers, migrations, or
@@ -260,3 +277,67 @@ source attribution, admission, and protocol boundaries. Continuation strategy,
 provider cache usage, and retained information are separate measurements. They do not establish a
 model-quality improvement; empirical claims require identified models, workloads,
 resource limits, and comparable live trials.
+
+## Host control and output-reservation policy
+
+`AgentRuntimeOptions.contextControlPolicy` overrides the finite defaults in
+`DEFAULT_CONTEXT_CONTROL_POLICY`. `parseContextControlPolicy` captures and validates
+all attempt, tool-call, inventory, history-read and presentation bounds. The effective
+policy is inspectable. `reserveMode: 'required'` preserves recovery headroom as an
+admission requirement; `'advisory'` reports measured pressure without rejecting a
+request solely for that reserve. Hard compiled capacity remains mandatory in either
+mode. Durable attempt accounting is scoped to an unchanged recovery boundary and
+survives restart; changing this policy does not reset consumed owner/run budgets.
+
+Control eligibility is an explicit trusted-host grant:
+`grantContextControlTool(definition, 'read' | 'state' | 'activation')`. It binds the
+exact compiled definition, not its name, implementation identifier or description.
+The built-in context/history factories grant their own definitions. Read grants
+require a read-only context/history/session-state effect envelope. All granted calls
+still pass normal canonicalization, call-specific effect authorization, execution,
+and durable reconciliation. Recovery cannot execute domain work or turn arbitrary
+model text into a final task answer.
+
+An optional `outputReservationPolicy: { minimum, maximum }` authorizes model-selected
+output reservations within that host range, with `maximum <= maxOutputTokens`.
+When the host opts into a range and no window choice exists, its maximum is the initial reservation; `maxOutputTokens` remains the configured ceiling. Without a range, the configured output allowance is fixed. A context transition can
+propose `outputReservation`; omitted values inherit the current window's choice.
+This is a window-scoped allowance for ordinary requests, not a one-shot hint and not
+a change to the continuing owner's token budget. Core compiles and admits the exact
+proposed reservation before publishing it with the window. Rejection leaves the
+prior window unchanged. Current host bounds are checked again on use and restart.
+`reduce_reservation` is advertised only when a legal lower choice is authorized.
+
+### Operational inspection
+
+`ContextService.inspect()` exposes one `operational` view shared by active runtimes
+and idle application sessions. `configured` pages describe prospective eligibility;
+`last_admitted` pages describe the exact captured catalog of the admitted request.
+Pagination is revision-bound, defaults to 32 items, and permits at most 128 items.
+`maxBytes` bounds the complete operational projection (32 KiB by default, at most
+256 KiB), including fixed metadata. The page shrinks without skipping capabilities;
+an indivisible minimum page reports measured required bytes and an actionable retry.
+The same operational-page parameters are accepted by RPC `context.read`; its other
+context fields are outside this operational projection bound.
+Applications do not publish a second capability or generation projection.
+
+Context admission and invocation lifecycle are separate evidence. A live context
+admission can have no invocation yet. Restart inspection reads the latest durable
+invocation and protected request artifact through the existing inference owner
+index; it does not invent a separate admission journal. `admissionEvidence` labels
+these boundaries. Invocation status and dispatch evidence do not claim dispatch
+merely because the durable invocation-start boundary was crossed. Generic inference
+without a captured runtime catalog reports `catalog_not_recorded` explicitly.
+
+The continuing inference owner allowance survives runs and reopening. Omitting its
+configuration reuses the recorded owner limits; supplying different limits fails
+explicitly. This allowance is independent of run limits, per-request generation
+reservation, and the bounded context-control policy. Inspection distinguishes the
+configured generation reservation, the active window reservation, and host-authorized
+reservation range (or fixed reservation).
+
+Context byte policy resolves defaults once. Inspection reports source, mutation,
+read, and committed-retained limits plus retained bytes used and remaining. Retained
+usage includes committed historical revisions, forked revisions, and their metadata;
+it is not physical artifact-store disk use. Deleted live items do not erase retained
+history accounting.

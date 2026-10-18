@@ -1,6 +1,6 @@
-import { hashJson, hashArtifactBytes, type ArtifactRepository } from '@agent-core/persistence';
+import { decodeUtf8, hashJson, hashArtifactBytes, type ArtifactRepository } from '@agent-core/persistence';
 import {
-  applySessionStateEdits, assertSessionStateItemRevision, sessionStateBatchSchema, sessionStateBatchStorageBytes, sessionStateLimitError, sessionStateRevisionIdentity, sessionStateItemIdentity,
+  SESSION_STATE_PREVIEW_BYTES, applySessionStateEdits, assertSessionStateItemRevision, sessionStateBatchSchema, sessionStateBatchStorageBytes, sessionStateLimitError, sessionStateRevisionIdentity, sessionStateItemIdentity,
   type SessionStateBatch, type SessionStateBatchCommit, type SessionStateItemRevision
 } from '../session/session-state.js';
 import type { HistoryReader } from '../history/reader.js';
@@ -40,7 +40,7 @@ export async function stageSessionStateBatch(input: {
       if (current.contentBytes > input.maxMutationBytes - materializedBytes)
         throw sessionStateLimitError('mutation_preparation', input.maxMutationBytes, materializedBytes + current.contentBytes, 'Session-state edit exceeds the mutation preparation byte limit.');
       materializedBytes += current.contentBytes;
-      const prior = new TextDecoder('utf-8', { fatal: true }).decode(await input.artifacts.readVerified(current.contentRef));
+      const prior = decodeUtf8(await input.artifacts.readVerified(current.contentRef));
       text = applySessionStateEdits(prior, operation.edits);
       sources = current.sources;
     }
@@ -53,7 +53,7 @@ export async function stageSessionStateBatch(input: {
     drafts.push(Object.freeze({
       itemId, revisionId: sessionStateRevisionIdentity(fingerprint, index),
       previousRevisionId: operation.kind === 'create' ? null : operation.expectedRevisionId,
-      text, contentSha256: hashArtifactBytes(Buffer.from(text)), contentBytes: Buffer.byteLength(text),
+      text, ...(text ? { preview: statePreview(text) } : {}), contentSha256: hashArtifactBytes(Buffer.from(text)), contentBytes: Buffer.byteLength(text),
       deleted: operation.kind === 'remove', ...(sources ? { sources } : {}),
       inference: batch.inference, capturedHistoryCut: batch.capturedHistoryCut
     }));
@@ -76,4 +76,14 @@ export async function stageSessionStateBatch(input: {
   if (input.committedRetainedBytes + sessionStateBatchStorageBytes(staged) > input.maxStorageBytes)
     throw sessionStateLimitError('committed_retained_state', input.maxStorageBytes, input.committedRetainedBytes + sessionStateBatchStorageBytes(staged), 'Session-state retained revision storage quota exceeded; no items were saved.');
   return staged;
+}
+
+function statePreview(text: string): string {
+  let preview = '', bytes = 0;
+  for (const character of text) {
+    const size = Buffer.byteLength(character);
+    if (bytes + size > SESSION_STATE_PREVIEW_BYTES) break;
+    preview += character; bytes += size;
+  }
+  return preview;
 }

@@ -31,6 +31,14 @@ export class HistorySearchIndex<T extends { readonly position: HistorySearchPosi
     }
   }
 
+  /** Derived negative filter only; every candidate must still be verified against original bytes. */
+  mayMatch(source: T, query: string): boolean {
+    const indexed = this.sourceKeys.get(source);
+    if (!indexed) return true;
+    for (const key of grams(query)) if (!indexed.keys.has(key)) return false;
+    return true;
+  }
+
   /** New output in a formerly open run replaces only its indexed tail. */
   truncate(at: number, maxEntries: number, maxBytes: number) {
     let entries = 0, bytes = 0;

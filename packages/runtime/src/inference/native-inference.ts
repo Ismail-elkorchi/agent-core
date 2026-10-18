@@ -1,3 +1,4 @@
+import type { EffectiveCapabilitySnapshot } from '../run/capabilities.js';
 import type { HistorySourceCut } from '../history/contracts.js';
 import { hashJson } from '@agent-core/persistence';
 import {
@@ -34,6 +35,8 @@ export interface NativeInferenceInput extends InferenceIdentity {
   readonly profile: ModelProfile;
   readonly session: ModelProviderSession;
   readonly signal?: AbortSignal;
+  /** Capture the exact catalog before durable admission; must not perform lifecycle effects. */
+  readonly capabilities?: (context: NativeGenerationContext) => EffectiveCapabilitySnapshot;
   /** Fenced run authority is committed after the shared reservation and before transport submission. */
   readonly start: (context: NativeGenerationContext) => Promise<void>;
   readonly settled: (settlement: NativeGenerationSettlement) => Promise<void>;

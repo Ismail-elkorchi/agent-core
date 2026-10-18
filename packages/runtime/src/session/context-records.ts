@@ -122,6 +122,7 @@ export function contextCommitRetry(
     existing &&
     (existing.transition.requestFingerprint !== input.transition.requestFingerprint ||
       hashJson(existing.window.selection) !== hashJson(input.window.selection) ||
+      existing.window.outputReservation !== input.window.outputReservation ||
       existing.window.reason !== input.window.reason ||
       hashJson(existing.sessionState ?? null) !==
         hashJson(input.sessionState ?? null))
@@ -141,8 +142,12 @@ export function decodeContextTransitionEntry(value: unknown): SessionContextTran
   ) {
     throw new Error('Context transition record identities disagree.');
   }
+  if (entry.transition.admission.outputReservation !== entry.window.outputReservation ||
+      (entry.transition.requestedOutputReservation !== undefined && entry.transition.requestedOutputReservation !== entry.window.outputReservation))
+    throw new Error('Context output reservation differs from its admitted window.');
   const fingerprint = hashJson({
     ...(entry.transition.requestedRenewal === undefined ? {} : { renewal: entry.transition.requestedRenewal }),
+    ...(entry.transition.requestedOutputReservation === undefined ? {} : { outputReservation: entry.transition.requestedOutputReservation }),
     ...(entry.sessionState ? { sessionState: entry.sessionState } : {}),
     expectedWindowId: entry.transition.previousWindowId,
     idempotencyKey: entry.transition.idempotencyKey,

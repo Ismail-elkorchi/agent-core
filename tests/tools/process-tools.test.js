@@ -1216,14 +1216,14 @@ test('authenticated process settlement is independent of incompatible output met
     }
     second = new LocalCommandExecution(options);
     assert.deepEqual((await second.reconcile()).unresolved, []);
-    const [report] = second.recoveredTerminalReports();
-    assert.equal(report.result.status, 'exited');
-    assert.equal(report.result.originalOutput.kind, 'unavailable');
-    assert.match(report.result.originalOutput.diagnostic, /output/);
+    const [report] = (await second.readPendingTerminalReports({ ownerId: invocation.ownerId })).reports;
+    assert.equal(report.status, 'exited');
+    assert.equal(report.details.originalOutput.kind, 'unavailable');
+    assert.match(report.details.originalOutput.diagnostic, /output/);
     assert.equal(second.resourceLeases.activeCount(), 0);
     const next = await startSettledCommand(second, { ...request, command: 'printf next' });
     assert.equal(next.combined.segments.join(''), 'next');
-    await second.acknowledgeTerminalReport(report.result.processId);
+    await second.acknowledgeTerminalReport(report.processId);
     await second.acknowledgeTerminalReport(next.processId);
   });
 });
@@ -1272,7 +1272,7 @@ test('terminal handoff retries use stable evidence and retain it until durable a
   accepted = true;
   await second.retryReconciliation();
   assert((await readdir(ledgerDirectory)).every(name => name.endsWith('.terminal.json')));
-  assert.deepEqual(second.recoveredTerminalReports(), []);
+  assert.deepEqual((await second.readPendingTerminalReports({ ownerId: invocation.ownerId })).reports, []);
 });
 
 test('an output receipt write failure cannot erase a known terminal outcome', async (t) => {
@@ -1765,4 +1765,87 @@ test('a process ledger location cannot implicitly grant local command authority'
     processLedgerDirectory: '/tmp/does-not-grant-command-authority',
     enabledTools: ['exec_command']
   }), /explicitly supplied command authority/);
+});
+
+test('pending report pagination is owner-scoped, public, read-only and clears on acknowledgement', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'pending-reports-'));
+  const files = testRootedFileAuthority(root);
+  let stores = 0;
+  const artifacts = new InMemoryArtifactRepository();
+  const store = artifacts.store.bind(artifacts);
+  artifacts.store = async (...args) => { stores++; return store(...args); };
+  const manager = new LocalCommandExecution({ artifactRepository: artifacts, rootedFileAuthority: files,
+    ledgerDirectory: path.join(root, 'processes'), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  t.after(async () => { await manager.close(); files.close(); await rm(root, { recursive: true, force: true }); });
+  const ids = [];
+  for (let index = 0; index < 4; index++) {
+    const result = await startSettledCommand(manager, { command: `printf '${index}'`, rootedDirectory: '.', pty: false,
+      timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner: invocation });
+    ids.push(result.processId);
+  }
+  const before = stores;
+  const found = [];
+  let after;
+  for (;;) {
+    const page = await manager.readPendingTerminalReports({ ownerId: invocation.ownerId, after, limit: 1, maxBytes: 4096 });
+    assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 4096);
+    assert.equal(JSON.stringify(page).includes('protectedArtifact'), false);
+    found.push(...page.reports.map(item => item.processId));
+    if (page.complete) break;
+    after = page.next;
+  }
+  assert.deepEqual(found, ids);
+  assert.equal(stores, before);
+  assert.deepEqual((await manager.readPendingTerminalReports({ ownerId: 'other-owner' })).reports, []);
+  const firstPage = await manager.readPendingTerminalReports({ ownerId: invocation.ownerId, limit: 1 });
+  const ledgerPath = path.join(root, 'processes', `${ids[0]}.json`);
+  const ledger = await readFile(ledgerPath, 'utf8');
+  await writeFile(ledgerPath, '{');
+  await assert.rejects(manager.acknowledgeTerminalReport(ids[0]));
+  assert.equal((await manager.readPendingTerminalReports({ ownerId: invocation.ownerId, limit: 1 })).reports[0].processId, ids[0]);
+  await writeFile(ledgerPath, ledger);
+  await manager.acknowledgeTerminalReport(ids[0]);
+  const afterAck = await manager.readPendingTerminalReports({ ownerId: invocation.ownerId, after: firstPage.next });
+  assert.deepEqual(afterAck.reports.map(item => item.processId), ids.slice(1));
+  assert.equal(afterAck.scanned, 3);
+
+  for (const id of ids) await manager.acknowledgeTerminalReport(id);
+  const empty = await manager.readPendingTerminalReports({ ownerId: invocation.ownerId });
+  assert.deepEqual(empty.reports, []);
+  assert.equal(empty.scanned, 0);
+  assert.equal(empty.complete, true);
+  await assert.rejects(manager.readPendingTerminalReports({ ownerId: 'other-owner', after: firstPage.next }), /another owner/);
+  const restarted = new LocalCommandExecution({ artifactRepository: artifacts, rootedFileAuthority: files,
+    ledgerDirectory: path.join(root, 'processes'), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  t.after(() => restarted.close());
+  await assert.rejects(restarted.readPendingTerminalReports({ ownerId: invocation.ownerId, after: firstPage.next }), /generation/);
+});
+
+test('released owners leave empty pending inventories and old cursors survive owner reuse', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'pending-report-owners-'));
+  const files = testRootedFileAuthority(root);
+  const manager = new LocalCommandExecution({ artifactRepository: new InMemoryArtifactRepository(), rootedFileAuthority: files,
+    ledgerDirectory: path.join(root, 'processes'), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  t.after(async () => { await manager.close(); files.close(); await rm(root, { recursive: true, force: true }); });
+  let firstOwnerCursor;
+  for (let index = 0; index < 32; index++) {
+    const owner = { ...invocation, ownerId: `transient-owner-${index}` };
+    const result = await startSettledCommand(manager, { command: 'true', rootedDirectory: '.', pty: false,
+      timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner });
+    const page = await manager.readPendingTerminalReports({ ownerId: owner.ownerId });
+    assert.deepEqual(page.reports.map(item => item.processId), [result.processId]);
+    if (index === 0) firstOwnerCursor = page.next;
+    await manager.acknowledgeTerminalReport(result.processId);
+    const empty = await manager.readPendingTerminalReports({ ownerId: owner.ownerId, after: page.next });
+    assert.equal(empty.scanned, 0);
+    assert.equal(empty.complete, true);
+    assert.deepEqual(empty.reports, []);
+  }
+  const owner = { ...invocation, ownerId: 'transient-owner-0' };
+  const result = await startSettledCommand(manager, { command: 'true', rootedDirectory: '.', pty: false,
+    timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner });
+  const resumed = await manager.readPendingTerminalReports({ ownerId: owner.ownerId, after: firstOwnerCursor });
+  assert.deepEqual(resumed.reports.map(item => item.processId), [result.processId]);
+  assert.equal(resumed.scanned, 1);
+  await manager.acknowledgeTerminalReport(result.processId);
 });

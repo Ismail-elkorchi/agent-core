@@ -25,7 +25,7 @@ import type { SessionBinding, SessionBindingInput } from './binding.js';
 export type SessionHeader = Readonly<{
   readonly type: 'session';
   readonly version: 1;
-  readonly format: 'agent-core.session/5';
+  readonly format: 'agent-core.session/6';
   readonly sessionStateStorage: 'session';
   readonly id: string;
   readonly timestamp: string;

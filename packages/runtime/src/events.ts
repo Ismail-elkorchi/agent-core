@@ -543,13 +543,20 @@ export type AgentProgressEvent =
 export const agentEventCodec: EventCodec<AgentEvent> = {
   metadataIndexes: [
     { field: 'exchangeId' },
-    { type: 'turn.snapshot.created', field: 'recoveryBoundary' }
+    { type: 'turn.snapshot.created', field: 'recoveryBoundary' },
+    { type: 'resource.released', field: 'resourceOwnerId' }
   ],
   metadata: (event) => {
     const exchange = 'turnId' in event && 'requestAttempt' in event
       ? { exchangeId: `assistant:${event.turnId}:${String(event.requestAttempt)}:ended` }
       : {};
     switch (event.type) {
+      case 'resource.released': {
+        const owner = event.details.owner;
+        return owner && typeof owner === 'object' && 'ownerId' in owner && 'runId' in owner &&
+          typeof owner.ownerId === 'string' && owner.runId === event.runId
+          ? { resourceOwnerId: owner.ownerId } : {};
+      }
       case 'assistant.ended':
       case 'assistant.interrupted': return {
         ...exchange, ...('nativePrefixBound' in event ? { prefixBound: 'true' } : {}), ...('contextRecovery' in event ? { contextRecovery: 'true' } : {}), sourceType: 'assistant', expectedCalls: String('toolCalls' in event ? event.toolCalls.length : 0), description: event.content.slice(0, 200),

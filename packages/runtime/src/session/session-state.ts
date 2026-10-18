@@ -1,9 +1,30 @@
 import { ToolInputError } from '@agent-core/tools';
 import { parseJsonObject } from '@agent-core/json';
-import { decodeOwnedArtifactRef, hashJson, PersistenceConflictError, type ProtectedArtifactRef } from '@agent-core/persistence';
+import { decodeUtf8, decodeOwnedArtifactRef, hashJson, PersistenceConflictError, type ProtectedArtifactRef } from '@agent-core/persistence';
 import * as z from 'zod';
 import type { HistorySourceCut, HistorySourceRef } from '../history/contracts.js';
 import { historyCutSchema, sourceSchema } from '../history/schema.js';
+
+// In Unicode mode paired surrogates are one astral code point; only lone halves match.
+const wellFormedStateTextSchema = z.string().refine(value => !/[\uD800-\uDFFF]/u.test(value),
+  'Session-state text must be well-formed Unicode; lone surrogates cannot be encoded exactly as UTF-8.');
+export const SESSION_STATE_PREVIEW_BYTES = 160;
+export const sessionStatePreviewSchema = wellFormedStateTextSchema.refine(value => Buffer.byteLength(value) <= SESSION_STATE_PREVIEW_BYTES, 'Preview must be well-formed UTF-8 text within its byte bound.');
+
+/** One contract for service, tool schema and both repositories. */
+export const SESSION_STATE_RETRIEVAL_LIMITS = Object.freeze({ minBytes: 512, maxBytes: 1024 * 1024,
+  defaultBytes: 32 * 1024, maxCursorBytes: 16384, defaultLimit: 32, maxLimit: 256,
+  maxQueryBytes: 1024, defaultScannedBytes: 1024 * 1024, maxScannedBytes: 16 * 1024 * 1024 });
+export const sessionStatePageSchema = z.strictObject({
+  cursor: z.string().max(SESSION_STATE_RETRIEVAL_LIMITS.maxCursorBytes).refine(value => Buffer.byteLength(value) <= SESSION_STATE_RETRIEVAL_LIMITS.maxCursorBytes, 'State cursor exceeds its UTF-8 byte bound.').optional(),
+  limit: z.int().min(1).max(SESSION_STATE_RETRIEVAL_LIMITS.maxLimit).default(SESSION_STATE_RETRIEVAL_LIMITS.defaultLimit),
+  maxBytes: z.int().min(SESSION_STATE_RETRIEVAL_LIMITS.minBytes).max(SESSION_STATE_RETRIEVAL_LIMITS.maxBytes).default(SESSION_STATE_RETRIEVAL_LIMITS.defaultBytes)
+});
+export const sessionStateSearchSchema = sessionStatePageSchema.extend({
+  query: wellFormedStateTextSchema.min(1).max(SESSION_STATE_RETRIEVAL_LIMITS.maxQueryBytes)
+    .refine(value => Buffer.byteLength(value) <= SESSION_STATE_RETRIEVAL_LIMITS.maxQueryBytes, 'State search query exceeds its UTF-8 byte bound.'),
+  maxScannedBytes: z.int().min(1).max(SESSION_STATE_RETRIEVAL_LIMITS.maxScannedBytes).default(SESSION_STATE_RETRIEVAL_LIMITS.defaultScannedBytes)
+});
 
 /** Exact recorded inference attribution, never user authority. */
 export interface SessionStateInference {
@@ -28,6 +49,8 @@ export interface SessionStateItemRevision {
   readonly previousRevisionId: string | null;
   readonly deleted: boolean;
   readonly contentSha256: string;
+  /** Bounded leading text, derived when the revision is materialized. */
+  readonly preview?: string | undefined;
   readonly contentBytes: number;
   readonly inference: SessionStateInference;
   readonly capturedHistoryCut: HistorySourceCut;
@@ -74,6 +97,8 @@ export interface SessionStateItemMetadata {
   readonly revisionId: string;
   readonly contentBytes: number;
   readonly contentSha256: string;
+  /** Bounded leading text, derived when the revision is materialized. */
+  readonly preview?: string | undefined;
 }
 export interface SessionStatePage {
   readonly items: readonly SessionStateItemMetadata[];
@@ -85,15 +110,19 @@ export const sessionStateItemRefSchema = z.strictObject({
   itemId: id, revisionId: id,
   range: z.strictObject({ offset: z.int().nonnegative(), bytes: z.int().positive() }).readonly().optional()
 }).readonly();
+/** Result budget belongs to this read operation, never to immutable item identity. */
+export const sessionStateReadSchema = sessionStateItemRefSchema.unwrap().extend({
+  maxBytes: z.int().min(1).max(SESSION_STATE_RETRIEVAL_LIMITS.maxBytes).optional()
+}).readonly();
 export const sessionStateItemContentSchema = z.strictObject({
-  text: z.string().min(1), sources: z.array(sourceSchema).max(256).readonly().optional()
+  text: wellFormedStateTextSchema.min(1), sources: z.array(sourceSchema).max(256).readonly().optional()
 }).readonly();
 const expected = { itemId: id, expectedRevisionId: id };
 export const sessionStateOperationSchema = z.discriminatedUnion('kind', [
   sessionStateItemContentSchema.unwrap().extend({ kind: z.literal('create') }),
   sessionStateItemContentSchema.unwrap().extend({ kind: z.literal('replace'), ...expected }),
   z.strictObject({ kind: z.literal('edit'), ...expected, edits: z.array(z.strictObject({
-    offset: z.int().nonnegative(), bytes: z.int().nonnegative(), text: z.string()
+    offset: z.int().nonnegative(), bytes: z.int().nonnegative(), text: wellFormedStateTextSchema
   }).readonly()).min(1).max(256).readonly() }).readonly(),
   z.strictObject({ kind: z.literal('remove'), ...expected }).readonly()
 ]);
@@ -110,6 +139,7 @@ export const sessionStateBatchSchema = z.strictObject({
 export const sessionStateItemRevisionSchema = z.strictObject({
   itemId: id, revisionId: id, previousRevisionId: id.nullable(), deleted: z.boolean(), contentRef: protectedRef,
   sources: z.array(sourceSchema).max(256).readonly().optional(), contentSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  preview: sessionStatePreviewSchema.optional(),
   contentBytes: z.int().nonnegative(), inference: sessionStateInferenceSchema, capturedHistoryCut: historyCutSchema
 }).readonly();
 export const sessionStateBatchCommitSchema = sessionStateBatchSchema.unwrap().omit({ operations: true }).extend({
@@ -127,8 +157,9 @@ export function sessionStateView(items: readonly SessionStateSelectedItem[]): Se
 /** UTF-8 ranges are exact; never silently split a code point or truncate a mutation. */
 export function sessionStateTextRange(text: string, offset: number, bytes: number): string {
   const value = Buffer.from(text);
-  if (offset < 0 || bytes < 0 || offset + bytes > value.length) throw new Error('Session-state range is outside its revision.');
-  const result = new TextDecoder('utf-8', { fatal: true }).decode(value.subarray(offset, offset + bytes));
+  if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(bytes) || offset < 0 || bytes < 0 || offset + bytes > value.length) throw new Error('Session-state range is outside its revision.');
+  if ((offset < value.length && ((value[offset] ?? 0) & 0xc0) === 0x80) || (offset + bytes < value.length && ((value[offset + bytes] ?? 0) & 0xc0) === 0x80)) throw new Error('Session-state range must use UTF-8 boundaries.');
+  const result = decodeUtf8(value.subarray(offset, offset + bytes));
   if (Buffer.byteLength(result) !== bytes) throw new Error('Session-state range must use UTF-8 boundaries.');
   return result;
 }
@@ -176,7 +207,8 @@ export async function validateSessionStateCommit(
       if (revision.itemId !== sessionStateItemIdentity(owned.branchId, owned.fingerprint, index))
         throw new Error('Session-state item identity was not generated by this batch.');
     } else assertSessionStateItemRevision(previous, revision.previousRevisionId, revision.itemId);
-    if (revision.contentBytes !== revision.contentRef.size || revision.contentSha256 !== revision.contentRef.sha256 ||
+    if ((revision.preview !== undefined && (revision.deleted || Buffer.byteLength(revision.preview) > revision.contentBytes)) ||
+        revision.contentBytes !== revision.contentRef.size || revision.contentSha256 !== revision.contentRef.sha256 ||
         hashJson(revision.inference) !== hashJson(owned.inference) ||
         hashJson(revision.capturedHistoryCut) !== hashJson(owned.capturedHistoryCut))
       throw new Error('Session-state revision metadata disagrees with its immutable content or attribution.');

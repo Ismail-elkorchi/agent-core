@@ -1,6 +1,7 @@
+import { fitBoundedJsonPage } from './bounded-result.js';
 import * as z from 'zod';
 import { PersistenceConflictError, hashJson } from '@agent-core/persistence';
-import { sessionStateBatchCommitSchema, type SessionStateBatchCommit, type SessionStateBatchReceipt, type SessionStateItemRevision, type SessionStatePageRequest, type SessionStateItemMetadata } from './session-state.js';
+import { sessionStateBatchCommitSchema, sessionStateLimitError, sessionStatePageSchema, SESSION_STATE_RETRIEVAL_LIMITS, type SessionStateBatchCommit, type SessionStateBatchReceipt, type SessionStateItemRevision, type SessionStatePageRequest, type SessionStateItemMetadata } from './session-state.js';
 import type { SessionBranchEntry, SessionStateBatchEntry } from './contracts.js';
 
 export const sessionStateBatchEntrySchema = z.strictObject({
@@ -22,13 +23,12 @@ export function assertStateRetry(entry: SessionBranchEntry, batch: SessionStateB
   return stateReceipt(entry);
 }
 export function stateItemMetadata(item: SessionStateItemRevision): SessionStateItemMetadata {
-  return Object.freeze({itemId: item.itemId, revisionId: item.revisionId, contentBytes: item.contentBytes, contentSha256: item.contentSha256});
+  return Object.freeze({itemId: item.itemId, revisionId: item.revisionId, contentBytes: item.contentBytes, contentSha256: item.contentSha256, ...(item.preview === undefined ? {} : {preview:item.preview})});
 }
 export function statePageLimits(request: SessionStatePageRequest) {
-  const limit = request.limit ?? 64, maxBytes = request.maxBytes ?? 64 * 1024;
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256 || !Number.isSafeInteger(maxBytes) || maxBytes < 512 || maxBytes > 1024 * 1024)
-    throw new RangeError('Session-state page limits exceed supported bounds.');
-  return {limit, maxBytes};
+  const parsed = sessionStatePageSchema.safeParse({ cursor: request.cursor, limit: request.limit, maxBytes: request.maxBytes });
+  if (!parsed.success) throw new RangeError('Session-state page limits exceed supported bounds.');
+  return parsed.data;
 }
 const cursorSchema = z.strictObject({sessionId: z.string(), leafId: z.string().nullable(), after: z.string(), query: z.string().optional()});
 export function statePageCursor(sessionId: string, leafId: string | null, after: string, query?: string): string {
@@ -36,7 +36,7 @@ export function statePageCursor(sessionId: string, leafId: string | null, after:
 }
 export function decodeStatePageCursor(sessionId: string, request: SessionStatePageRequest, query?: string) {
   if (!request.cursor) return undefined;
-  if (request.cursor.length > 16384) throw new Error('Session-state cursor exceeds its limit.');
+  if (Buffer.byteLength(request.cursor) > SESSION_STATE_RETRIEVAL_LIMITS.maxCursorBytes) throw new Error('Session-state cursor exceeds its limit.');
   const cursor = cursorSchema.parse(JSON.parse(Buffer.from(request.cursor,'base64url').toString('utf8')));
   if (cursor.sessionId !== sessionId || (request.leafId !== undefined && request.leafId !== cursor.leafId) || cursor.query !== query)
     throw new Error('Session-state cursor belongs to a different query or boundary.');
@@ -77,8 +77,26 @@ export function assertStateSelection(ref: import('./session-state.js').SessionSt
 }
 
 export function statePageResult(sessionId: string, leafId: string | null, items: readonly SessionStateItemMetadata[], partial: boolean, after: string | undefined, maxBytes: number): import('./session-state.js').SessionStatePage {
-  const page = {items:Object.freeze([...items]),coverage:partial ? 'partial' as const : 'complete' as const,
-    ...(partial && after ? {cursor:statePageCursor(sessionId,leafId,after)} : {})};
-  if (Buffer.byteLength(JSON.stringify(page)) > maxBytes) throw new RangeError('Session-state page byte limit cannot contain the bounded result and cursor.');
-  return Object.freeze(page);
+  return fitStatePage(items, selected => {
+    const incomplete = partial || selected.length < items.length;
+    const last = selected.length < items.length ? selected.at(-1)?.itemId : after;
+    return Object.freeze({items:Object.freeze([...selected]),coverage:incomplete ? 'partial' as const : 'complete' as const,
+      ...(incomplete && last ? {cursor:statePageCursor(sessionId,leafId,last)} : {})});
+  }, maxBytes);
+}
+
+/** Fit whole inventory entries and their actual continuation envelope; never claim zero progress. */
+export function fitStatePage<T, P>(items: readonly T[], present: (items: readonly T[]) => P, maxBytes: number): P {
+  return fitBoundedJsonPage(items, present, maxBytes, requiredBytes => {
+    throw sessionStateLimitError('state_result', maxBytes, requiredBytes,
+      `State result requires ${String(requiredBytes)} bytes including its cursor; maxBytes is ${String(maxBytes)}. Retry with maxBytes at least ${String(requiredBytes)} or a smaller selection.`);
+  });
+}
+
+/** Measure the complete serialized result, including continuation and coverage. */
+export function boundedStateResult<T>(result: T, maxBytes: number): T {
+  const requiredBytes = Buffer.byteLength(JSON.stringify(result));
+  if (requiredBytes > maxBytes) throw sessionStateLimitError('state_result', maxBytes, requiredBytes,
+    `State result requires ${String(requiredBytes)} bytes including its cursor; maxBytes is ${String(maxBytes)}. Retry with maxBytes at least ${String(requiredBytes)} or a smaller selection.`);
+  return result;
 }

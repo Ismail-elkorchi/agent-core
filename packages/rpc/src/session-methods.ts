@@ -1,5 +1,7 @@
 import {
   historyReadRequestSchema,
+  contextOperationalInspectionPageSchema,
+  type ContextOperationalInspectionPage,
   contextTransitionRequestSchema,
   type ContextTransitionRequest
 } from '@agent-core/runtime';
@@ -62,14 +64,13 @@ export function sessionRpcMethods(operations: SessionRpcOperations) {
 }
 
 export interface ContextRpcOperations {
-  inspectContext(): Promise<unknown>;
+  inspectContext(page?: ContextOperationalInspectionPage): Promise<unknown>;
   transitionContext(request: ContextTransitionRequest): Promise<unknown>;
 }
 
 export function contextRpcMethods(operations: ContextRpcOperations) {
-  const empty = z.strictObject({});
   return {
-    'context.read': rpcMethod(empty, () => operations.inspectContext()),
+    'context.read': rpcMethod(contextOperationalInspectionPageSchema, (page) => operations.inspectContext(page)),
     'context.transition': rpcMethod(
       contextTransitionRequestSchema.unwrap().omit({ toolInvocation: true, expectedCut: true }).extend({ expectedSourceRevision: z.int().nonnegative() }),
       (request) => operations.transitionContext(request)

@@ -1,14 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { canonicalJsonString } from '@agent-core/json';
+import { canonicalJsonString, parseJsonObject } from '@agent-core/json';
 import {
   ArtifactIntegrityError,
-  artifactExtension,
+  artifactIdentity,
+  decodeOwnedArtifactRef,
+  sameArtifactIdentity,
   freezeArtifactRef,
   hashArtifactBytes,
   safeArtifactLabel,
-  mediaTypeFromArtifactId,
   validateArtifactRef,
   type ArtifactRef,
   type ArtifactRepository,
@@ -22,7 +23,6 @@ export interface LocalArtifactRepositoryOptions { readonly rootDir: string; read
 export class LocalArtifactRepository implements ArtifactRepository {
   private readonly rootDir: string;
   private readonly onVerificationScan: ((artifactId: string) => void) | undefined;
-  private readonly references = new Map<string, ArtifactRef>();
   private readonly verifiedFiles = new Map<string, { readonly identity: string; readonly sha256: string }>();
 
   constructor(options: LocalArtifactRepositoryOptions | string) {
@@ -44,7 +44,7 @@ export class LocalArtifactRepository implements ArtifactRepository {
     const bytes = new Uint8Array(input.content);
     const mediaType = input.mediaType ?? 'application/octet-stream';
     const sha256 = hashArtifactBytes(bytes);
-    const artifactId = `${protectedPath ? 'protected-' : ''}${sha256}${artifactExtension(mediaType)}`;
+    const artifactId = artifactIdentity(sha256, mediaType, protectedPath ? 'protected' : 'public');
     const target = this.confinedPath(artifactId);
     await fs.mkdir(path.dirname(target), { recursive: true, ...(protectedPath ? { mode: 0o700 } : {}) });
     if (protectedPath) await fs.chmod(path.dirname(target), 0o700);
@@ -72,7 +72,22 @@ export class LocalArtifactRepository implements ArtifactRepository {
       ...(input.description ? { description: input.description } : {})
     });
     if (protectedPath) await fs.chmod(target, 0o600);
-    this.references.set(artifactId, ref);
+    const metadataPath = `${target}.ref.json`;
+    const metadataTemporary = `${metadataPath}.${randomUUID()}.tmp`;
+    try {
+      const metadata = await fs.open(metadataTemporary, 'wx', protectedPath ? 0o600 : 0o644);
+      try {
+        await metadata.writeFile(canonicalJsonString({ format: 'agent-core-artifact-v1', ref }));
+        await metadata.sync();
+      } finally { await metadata.close(); }
+      try { await fs.link(metadataTemporary, metadataPath); }
+      catch (error) { if (nodeCode(error) !== 'EEXIST') throw error; }
+      await this.assertStoredIdentity(ref);
+      if (process.platform !== 'win32') {
+        const directory = await fs.open(path.dirname(target), 'r');
+        try { await directory.sync(); } finally { await directory.close(); }
+      }
+    } finally { await fs.rm(metadataTemporary, { force: true }); }
     return ref;
   }
 
@@ -94,18 +109,22 @@ export class LocalArtifactRepository implements ArtifactRepository {
   }
 
   async readVerified(ref: ArtifactRef): Promise<Uint8Array> {
-    validateArtifactRef(ref);
+    await this.assertStoredIdentity(ref);
     const filePath = this.confinedPath(ref.artifactId);
-    const bytes = new Uint8Array(await fs.readFile(filePath));
-    if (bytes.byteLength !== ref.size) throw new ArtifactIntegrityError(ref.artifactId, `Artifact size mismatch for ${ref.artifactId}.`);
-    if (hashArtifactBytes(bytes) !== ref.sha256) throw new ArtifactIntegrityError(ref.artifactId, `Artifact SHA-256 mismatch for ${ref.artifactId}.`);
-    const stat = await fs.stat(filePath);
-    this.verifiedFiles.set(filePath, { identity: fileIdentity(stat), sha256: ref.sha256 });
-    return bytes;
+    const handle = await fs.open(filePath, 'r');
+    try {
+      const identity = fileIdentity(await handle.stat());
+      const bytes = new Uint8Array(await handle.readFile());
+      if (bytes.byteLength !== ref.size) throw new ArtifactIntegrityError(ref.artifactId, `Artifact size mismatch for ${ref.artifactId}.`);
+      if (hashArtifactBytes(bytes) !== ref.sha256) throw new ArtifactIntegrityError(ref.artifactId, `Artifact SHA-256 mismatch for ${ref.artifactId}.`);
+      if (fileIdentity(await handle.stat()) !== identity) throw new ArtifactIntegrityError(ref.artifactId, `Artifact changed while verifying ${ref.artifactId}.`);
+      this.verifiedFiles.set(filePath, { identity, sha256: ref.sha256 });
+      return bytes;
+    } finally { await handle.close(); }
   }
 
   async readVerifiedRange(ref: ArtifactRef, input: { readonly offset: number; readonly length: number }): Promise<import('./artifact-repository.js').ArtifactRange> {
-    validateArtifactRef(ref);
+    await this.assertStoredIdentity(ref);
     if (!Number.isSafeInteger(input.offset) || input.offset < 0 || !Number.isSafeInteger(input.length) || input.length < 1 || input.offset > ref.size) throw new Error('Invalid artifact range.');
     const filePath = this.confinedPath(ref.artifactId);
     const handle = await fs.open(filePath, 'r');
@@ -134,7 +153,12 @@ export class LocalArtifactRepository implements ArtifactRepository {
       const windowStart = Math.max(0, input.offset - 3);
       const windowEnd = Math.min(stat.size, input.offset + input.length + 3);
       const window = Buffer.alloc(windowEnd - windowStart);
-      if (window.length > 0) await handle.read(window, 0, window.length, windowStart);
+      let filled = 0;
+      while (filled < window.length) {
+        const read = await handle.read(window, filled, window.length - filled, windowStart + filled);
+        if (read.bytesRead === 0) throw new ArtifactIntegrityError(ref.artifactId, `Artifact ended while reading ${ref.artifactId}.`);
+        filled += read.bytesRead;
+      }
       if (fileIdentity(await handle.stat()) !== identity) {
         this.verifiedFiles.delete(filePath);
         throw new ArtifactIntegrityError(ref.artifactId, `Artifact changed while reading ${ref.artifactId}.`);
@@ -155,22 +179,31 @@ export class LocalArtifactRepository implements ArtifactRepository {
 
   async resolve(artifactId: string): Promise<PublicArtifactRef | undefined> {
     if (artifactId.startsWith('protected-')) return undefined;
-    const known = this.references.get(artifactId);
-    if (known?.visibility === 'public') return known;
-    if (!/^(?:protected-)?[a-f0-9]{64}\.[a-z0-9]+$/u.test(artifactId)) return undefined;
+    const ref = await this.readReference(artifactId);
+    if (ref?.visibility !== 'public') return undefined;
     let stat;
-    try { stat = await fs.stat(this.confinedPath(artifactId)); } catch { return undefined; }
-    if (!stat.isFile()) return undefined;
-    const ref = freezeArtifactRef({
-      artifactId,
-      sha256: artifactId.replace(/^protected-/u, '').slice(0, 64),
-      size: stat.size,
-      mediaType: mediaTypeFromArtifactId(artifactId),
-      visibility: 'public',
-      label: artifactId
-    });
-    this.references.set(artifactId, ref);
+    try { stat = await fs.stat(this.confinedPath(artifactId)); }
+    catch (error) { if (nodeCode(error) === 'ENOENT') return undefined; throw error; }
+    if (!stat.isFile() || stat.size !== ref.size) throw new ArtifactIntegrityError(artifactId, 'Persisted artifact body size mismatch.');
     return ref;
+  }
+
+  private async readReference(artifactId: string): Promise<ArtifactRef | undefined> {
+    if (!/^(?:protected-)?[a-f0-9]{64}-[a-f0-9]{64}\.[a-z0-9]+$/u.test(artifactId)) throw new Error('Invalid artifact representation identifier.');
+    let raw: string;
+    try { raw = await fs.readFile(`${this.confinedPath(artifactId)}.ref.json`, 'utf8'); }
+    catch (error) { if (nodeCode(error) === 'ENOENT') return undefined; throw error; }
+    const record = parseJsonObject(JSON.parse(raw));
+    if (record.format !== 'agent-core-artifact-v1' || Object.keys(record).length !== 2) throw new ArtifactIntegrityError(artifactId, 'Invalid persisted artifact format.');
+    const ref = freezeArtifactRef(decodeOwnedArtifactRef(parseJsonObject(record.ref)));
+    if (ref.artifactId !== artifactId || artifactId !== artifactIdentity(ref.sha256, ref.mediaType, ref.visibility)) throw new ArtifactIntegrityError(artifactId, 'Persisted artifact identity mismatch.');
+    return ref;
+  }
+
+  private async assertStoredIdentity(ref: ArtifactRef): Promise<void> {
+    validateArtifactRef(ref);
+    const stored = await this.readReference(ref.artifactId);
+    if (!stored || !sameArtifactIdentity(stored, ref)) throw new ArtifactIntegrityError(ref.artifactId, 'Persisted artifact representation is unavailable or changed.');
   }
 
   private confinedPath(artifactId: string): string {

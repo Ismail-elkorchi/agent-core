@@ -4,20 +4,20 @@ import assert from 'node:assert/strict';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import { InMemorySessionRepository, HistoryReader, ContextService, agentEventCodec } from '@agent-core/runtime';
 
-async function fixture() {
+async function fixture({ maxSourceBytes = 1024 * 1024 } = {}) {
   const sessions = new InMemorySessionRepository();
   const session = await sessions.create({ binding: { schemaId: 'metadata-delta', schemaVersion: 1, subject: {} } });
   const events = new InMemoryEventRepository(agentEventCodec);
   const artifacts = new InMemoryArtifactRepository();
   const history = new HistoryReader({ repository: sessions, session, events, artifacts });
-  const policy = { maxSourceBytes: 1024 * 1024, historyRead: { history, isAvailable: () => true } };
+  const policy = { maxSourceBytes, historyRead: { history, isAvailable: () => true } };
   const context = new ContextService({ repository: sessions, session, artifacts, history, policy });
   await sessions.appendInput(session, { runId: 'run', task: 'Original' });
-  const answer = async (i, mirror = true) => {
+  const answer = async (i, mirror = true, content = `Answer ${i}`) => {
     const identity = { turnId: `turn-${i}`, turnIndex: i + 1, requestAttempt: 1 };
-    const receipt = await events.append('run', { type: 'assistant.ended', ...identity, content: `Answer ${i}`,
-      modelOutput: { status: 'complete', message: `Answer ${i}`, source: 'content', turnIndex: i + 1 } });
-    if (mirror) await sessions.appendAssistant(session, { runId: 'run', identity, content: `Answer ${i}`,
+    const receipt = await events.append('run', { type: 'assistant.ended', ...identity, content,
+      modelOutput: { status: 'complete', message: content, source: 'content', turnIndex: i + 1 } });
+    if (mirror) await sessions.appendAssistant(session, { runId: 'run', identity, content,
       source: { runId: 'run', eventId: receipt.eventId, sequence: receipt.sequence, hash: receipt.hash } });
     return { identity, receipt };
   };
@@ -51,8 +51,8 @@ test('metadata deltas skip the old run mirror prefix and preserve bounded contin
   assert.ok(visits < 20, `Visited ${visits} old metadata positions`);
 });
 
-test('selected metadata extends with only new metadata and still enforces updated capacity', async () => {
-  const f = await fixture();
+test('selected metadata extends incrementally and rejects growth beyond fixed capacity', async () => {
+  const f = await fixture({ maxSourceBytes: 64000 });
   for (let i = 0; i < 30; i++) await f.answer(i);
   await f.context.assertSourceCapacity();
   const read = f.events.readMetadataRange.bind(f.events);
@@ -60,8 +60,15 @@ test('selected metadata extends with only new metadata and still enforces update
   f.events.readMetadataRange = async (...args) => { const page = await read(...args); records += page.records.length; return page; };
   for (let i = 30; i < 35; i++) { await f.answer(i); await f.context.assertSourceCapacity(); }
   assert.ok(records <= 10, `Re-read ${records} historical records`);
-  f.policy.maxSourceBytes = 1;
-  await assert.rejects(f.context.assertSourceCapacity(), /capacity|source/i);
+  // New authoritative history, rather than a mutable policy object, crosses the bound.
+  await f.answer(35, true, 'x'.repeat(f.policy.maxSourceBytes + 1));
+  await assert.rejects(f.context.assertSourceCapacity(), error => {
+    assert.equal(error.conflict.kind, 'source_capacity');
+    assert.equal(error.conflict.bound.limit, 64000);
+    assert.ok(error.conflict.bound.observedAtLeast > error.conflict.bound.limit);
+    return true;
+  });
+  assert.ok(records <= 12, `Re-read ${records} historical records after crossing capacity`);
 });
 
 test('late assistant mirrors refresh cached facts even without a receipt', async () => {

@@ -1,7 +1,18 @@
+import { contextControlRole } from '../context/recovery.js';
+import * as z from 'zod';
 import type { ModelProfile } from '@agent-core/model';
 import { hashJson } from '@agent-core/persistence';
 import { isToolAvailable, missingToolRequirements, type CompiledToolDefinition, type ToolHostRequirements, type ToolPolicy } from '@agent-core/tools';
 
+export const CAPABILITY_INSPECTION_LIMITS = Object.freeze({ defaultLimit: 32, maxLimit: 128 });
+export const effectiveCapabilitySnapshotSchema = z.strictObject({
+  revision: z.string().min(1), bindingId: z.string().min(1), policyRevision: z.string().min(1),
+  tools: z.array(z.strictObject({ name: z.string().min(1), implementationId: z.string().min(1),
+    available: z.boolean(), controlRole: z.enum(['read', 'state', 'activation']).optional(), reasons: z.array(z.strictObject({
+      kind: z.enum(['policy', 'service', 'model_input_modality', 'host_capability']), name: z.string().optional()
+    }).readonly()).readonly()
+  }).readonly()).readonly()
+}).readonly();
 export interface EffectiveCapabilitySnapshot {
   readonly revision: string;
   readonly bindingId: string;
@@ -10,7 +21,8 @@ export interface EffectiveCapabilitySnapshot {
     readonly name: string;
     readonly implementationId: string;
     readonly available: boolean;
-    readonly reasons: readonly { readonly kind: 'policy' | 'service' | 'model_input_modality' | 'host_capability'; readonly name?: string }[];
+    readonly controlRole?: 'read' | 'state' | 'activation' | undefined;
+    readonly reasons: readonly { readonly kind: 'policy' | 'service' | 'model_input_modality' | 'host_capability'; readonly name?: string | undefined }[];
   }[];
 }
 
@@ -23,25 +35,27 @@ export function resolveEffectiveToolCatalog(input: {
 }): { readonly tools: readonly CompiledToolDefinition[]; readonly snapshot: EffectiveCapabilitySnapshot } {
   const available: CompiledToolDefinition[] = [];
   const entries = input.tools.map(tool => {
+    const controlRole = contextControlRole(tool);
     const reasons = Object.freeze([
       ...(!isToolAvailable(tool, input.policy) ? [Object.freeze({ kind: 'policy' as const })] : []),
       ...missingToolRequirements(tool, input.host)
     ]);
     if (reasons.length === 0) available.push(tool);
     return Object.freeze({ name: tool.name, implementationId: tool.implementationId,
-      available: reasons.length === 0, reasons });
+      available: reasons.length === 0, reasons,
+      ...(controlRole ? { controlRole } : {}) });
   });
   const material = { bindingId: input.bindingId, policyRevision: hashJson(input.policy), tools: Object.freeze(entries) };
   return Object.freeze({ tools: Object.freeze(available), snapshot: Object.freeze({ ...material, revision: hashJson(material) }) });
 }
 
 export function inspectCapabilitySnapshot(snapshot: EffectiveCapabilitySnapshot, input: {
-  readonly offset?: number; readonly limit?: number; readonly expectedRevision?: string;
+  readonly offset?: number | undefined; readonly limit?: number | undefined; readonly expectedRevision?: string | undefined;
 } = {}) {
   const offset = input.offset ?? 0;
-  const limit = input.limit ?? 32;
+  const limit = input.limit ?? CAPABILITY_INSPECTION_LIMITS.defaultLimit;
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > snapshot.tools.length ||
-      !Number.isSafeInteger(limit) || limit < 1 || limit > 128)
+      !Number.isSafeInteger(limit) || limit < 1 || limit > CAPABILITY_INSPECTION_LIMITS.maxLimit)
     throw new RangeError('Capability inspection requires a valid offset and a limit between 1 and 128.');
   if (input.expectedRevision !== undefined && input.expectedRevision !== snapshot.revision)
     throw new Error('Capability inspection revision changed; restart from the current snapshot.');

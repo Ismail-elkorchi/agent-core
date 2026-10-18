@@ -5,7 +5,7 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { hashJson, InMemoryArtifactRepository, InMemoryEventRepository, typedEventCodec } from '@agent-core/persistence';
-import { InMemorySessionRepository } from '@agent-core/runtime';
+import { ContextService, HistoryReader, InMemorySessionRepository } from '@agent-core/runtime';
 import { JsonlEventRepository } from '@agent-core/persistence/node';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 const binding = {schemaId:'state-journal-test',schemaVersion:1,subject:{}};
@@ -130,7 +130,7 @@ test('jsonl: incompatible prior session format is rejected without altering sour
   const f = await fixture(t,'jsonl');
   const file = f.repository.location(f.session.id);
   const originalIndex = await readFile(`${file}.index`);
-  const prior = (await readFile(file,'utf8')).replace('agent-core.session/5','agent-core.session/4');
+  const prior = (await readFile(file,'utf8')).replace('agent-core.session/6','agent-core.session/5');
   await writeFile(file,prior);
   const restarted = new JsonlSessionRepository(f.root);
   await assert.rejects(restarted.open(f.session.id,binding),error => {
@@ -260,3 +260,29 @@ for (const kind of ['memory','jsonl']) {
     assert.equal((await f.repository.listSessionState(f.session)).items.length,1);
   });
 }
+
+
+test('jsonl: save-derived previews survive restart and listing performs no body reads', async t => {
+  const f = await fixture(t, 'jsonl');
+  const history = new HistoryReader({ repository: f.repository, session: f.session, artifacts: f.artifacts });
+  const context = new ContextService({ ...f, history, assertStateWrite: async () => {}, policy: { maxSourceBytes: 65536 } });
+  const capturedHistoryCut = await history.capture();
+  const text = '\uFEFF' + '😀'.repeat(1000);
+  await context.saveSessionState({ idempotencyKey: 'derived-preview', branchId: capturedHistoryCut.branchId,
+    capturedHistoryCut, inference: f.inference, operations: [{ kind: 'create', text }] });
+  f.artifacts.readVerified = async () => { throw new Error('metadata listing must not load artifact bodies'); };
+  const restarted = new JsonlSessionRepository(f.root);
+  const session = await restarted.open(f.session.id, binding);
+  for (const rebuild of [false, true]) {
+    if (rebuild) await restarted.rebuildHistoryIndex(session.id, binding);
+    const before = restarted.historyReadMetrics(session.id);
+    const page = await restarted.listSessionState(session);
+    const after = restarted.historyReadMetrics(session.id);
+    assert.equal(after.bodyRecordsRead - before.bodyRecordsRead, 0);
+    assert.equal(after.scannedBytes - before.scannedBytes, 0);
+    assert.equal(page.items[0].contentBytes, Buffer.byteLength(text));
+    assert.ok(text.startsWith(page.items[0].preview));
+    assert.ok(Buffer.byteLength(page.items[0].preview) <= 160);
+    assert.equal(page.items[0].preview.isWellFormed(), true);
+  }
+});

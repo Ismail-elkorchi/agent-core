@@ -68,7 +68,7 @@ request admission and dispatch.
 
 See [Composing persistent context](../../docs/CONTEXT.md) for exact tool inputs,
 per-item revision conflicts, attribution, bounds, view activation and recovery.
-The current session format is `agent-core.session/5`; incompatible originals are
+The current session format is `agent-core.session/6`; incompatible originals are
 rejected in place and require their matching earlier build to read. No migration,
 old-format reader, automatic summary or provider-compaction path is supplied.
 

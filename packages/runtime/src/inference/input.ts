@@ -27,6 +27,7 @@ export type RequestPresentation = z.infer<typeof requestPresentationSchema>;
 export interface AdmittedModelInput {
   readonly runId: string;
   readonly request: ModelRequest;
+  readonly outputReservation: number;
   readonly presentation: RequestPresentation;
 }
 
@@ -45,6 +46,7 @@ export async function readAdmittedModelInput(
     .object({
       runId: z.string().min(1),
       logical: z.unknown(),
+      accounting: z.object({ outputReservation: z.int().nonnegative() }),
       presentation: requestPresentationSchema
     })
     .parse(
@@ -55,6 +57,7 @@ export async function readAdmittedModelInput(
   return {
     runId: record.runId,
     request: parseModelRequest(record.logical),
+    outputReservation: record.accounting.outputReservation,
     presentation: record.presentation
   };
 }

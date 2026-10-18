@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LocalCommandExecution } from '@agent-core/tools-local';
+import { LocalCommandExecution, DEFAULT_LOCAL_TOOL_CONFIGURATION } from '@agent-core/tools-local';
+import { InMemoryArtifactRepository } from '@agent-core/persistence';
+import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
 
 // Exercise observation finalization without launching a process or opening a socket.
 function terminalObservation(report) {
@@ -49,26 +51,36 @@ test('failed receipt persistence keeps terminal truth, defers handoff, and retri
     } }
   };
   const delivered = [];
-  const command = Object.assign(Object.create(LocalCommandExecution.prototype), {
-    options: { ledgerDirectory: root }, descriptor: { recoveryIdentity: 'test-authority' },
-    limits: { completedRetentionMs: 60_000 }, ready: Promise.resolve(),
-    active: new Map(), completed: new Map([[processId, record]]),
-    finalArtifacts: async () => ({}),
-    handoffTerminalReport: async report => { delivered.push(report); }
+  const files = testRootedFileAuthority(root);
+  const command = new LocalCommandExecution({
+    ledgerDirectory: root, rootedFileAuthority: files,
+    artifactRepository: new InMemoryArtifactRepository(),
+    ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process,
+    commitTerminalReport: async report => { delivered.push(report); }
   });
-  t.after(async () => { clearTimeout(record.retention); await rm(root, { recursive: true, force: true }); });
+  await command.reconcile();
+  // Inject the already-exited process only; authority lifecycle/index state comes from construction.
+  command.completed.set(processId, record);
+  command.finalArtifacts = async () => ({});
+  t.after(async () => { clearTimeout(record.retention); files.close(); await rm(root, { recursive: true, force: true }); });
   const pending = await command.query(processId, 100, 0, 0, record.owner);
   assert.equal(pending.status, 'exited');
   assert.equal(pending.exitCode, 0);
   assert.equal(pending.finalizationPending, true);
   assert.match(pending.diagnostic, /terminal record storage failed/);
   assert.equal(delivered.length, 0);
+  const pendingPage = await command.readPendingTerminalReports({ ownerId: record.owner.ownerId });
+  assert.equal(pendingPage.reports[0].finalizationPending, true);
+  assert.equal(pendingPage.reports[0].handoffPending, true);
   assert.equal(record.finishPromise, undefined, 'failed durability must allow another finalization attempt');
   await rm(terminalPath, { recursive: true });
   const repaired = await command.query(processId, 100, 0, 0, record.owner);
   assert.equal(repaired.status, 'exited');
   assert.equal(repaired.finalizationPending, undefined);
   assert.equal(delivered.length, 1);
+  const acknowledged = await command.readPendingTerminalReports({ ownerId: record.owner.ownerId, after: pendingPage.next });
+  assert.deepEqual(acknowledged.reports, []);
+  assert.equal(acknowledged.complete, true);
   const receipt = JSON.parse(await readFile(terminalPath, 'utf8'));
   assert.deepEqual(delivered[0].terminalOutput.combined, receipt.combined);
   assert.equal(delivered[0].terminalDiagnostic, receipt.diagnostic);

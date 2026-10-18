@@ -70,7 +70,6 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     options.configuration === undefined
       ? DEFAULT_LOCAL_TOOL_CONFIGURATION
       : parseLocalToolConfiguration(options.configuration);
-  const readArtifact = createReadArtifactTool({ maxReadBytes: options.artifactReadMaxBytes });
   const artifactRepository = options.artifactRepository;
   let rootedFileAuthority: RootedFileAuthority | undefined;
   let patchJournal: TextPatchJournal | undefined;
@@ -104,22 +103,8 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     rootedFileSelector,
     ...(patchJournal ? { patchJournal } : {})
   });
-  const allTools: readonly CompiledToolDefinition[] = Object.freeze([
-    listDirectoryTool,
-    findFilesTool,
-    readFilesTool,
-    searchTextTool,
-    editTextTool,
-    applyPatchTool,
-    ...(enabledTools.includes('exec_command')
-      ? [createExecCommandTool({ ptySupported: commandExecution?.descriptor.supportsPty ?? false })]
-      : []),
-    writeStdinTool,
-    stopProcessTool,
-    viewImageTool,
-    readArtifact
-  ]);
-  const tools = selectTools(allTools, enabledTools);
+  const tools = describeLocalToolCatalog({ enabledTools, artifactReadMaxBytes: options.artifactReadMaxBytes,
+    ptySupported: commandExecution?.descriptor.supportsPty ?? false });
   const noProcesses: CommandReconciliationResult = Object.freeze({
     resolved: Object.freeze([]),
     unresolved: Object.freeze([])
@@ -185,4 +170,27 @@ function assertKnownTools(enabled: readonly string[]): void {
   ]);
   const unknown = enabled.filter((name) => !known.has(name));
   if (unknown.length > 0) throw new Error(`Unknown configured local tools: ${unknown.join(', ')}.`);
+}
+
+/** Describe built-in definitions without adopting resources or creating an execution host. */
+export function describeLocalToolCatalog(options: { readonly enabledTools: readonly string[];
+  readonly artifactReadMaxBytes: number; readonly ptySupported?: boolean }): readonly CompiledToolDefinition[] {
+  const enabledTools = ownEnabledTools(options.enabledTools);
+  assertKnownTools(enabledTools);
+  const allTools: readonly CompiledToolDefinition[] = Object.freeze([
+    listDirectoryTool,
+    findFilesTool,
+    readFilesTool,
+    searchTextTool,
+    editTextTool,
+    applyPatchTool,
+    ...(enabledTools.includes('exec_command')
+      ? [createExecCommandTool({ ptySupported: options.ptySupported ?? false })]
+      : []),
+    writeStdinTool,
+    stopProcessTool,
+    viewImageTool,
+    createReadArtifactTool({ maxReadBytes: options.artifactReadMaxBytes })
+  ]);
+  return selectTools(allTools, enabledTools);
 }

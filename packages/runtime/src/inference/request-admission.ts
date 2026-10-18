@@ -83,10 +83,15 @@ export class RequestAdmission {
 export class ContextAdmissionError extends Error {
   readonly actions = Object.freeze([
     'select_sources',
-    'reduce_reservation',
     'change_model',
     'cancel'
   ] as const);
+  get hardCapacityExceeded(): boolean {
+    return contextCapacityExceeded(this.compiled.accounting, undefined, this.providerRejected);
+  }
+  get recoveryReserveExceeded(): boolean {
+    return !this.hardCapacityExceeded && contextCapacityExceeded(this.compiled.accounting, this.continuityHeadroomTokens);
+  }
   /** Only measured input/context pressure (or an explicit provider rejection) can justify renewal. */
   get capacityExceeded(): boolean {
     return contextCapacityExceeded(this.compiled.accounting, this.continuityHeadroomTokens, this.providerRejected);
@@ -103,7 +108,7 @@ export class ContextAdmissionError extends Error {
 }
 
 /** Capacity and headroom describe the same compiled admission boundary. */
-export function requestCapacity(accounting: RequestAccounting, headroom?: number) {
+export function requestCapacity(accounting: RequestAccounting, headroom?: number, reserveMode?: 'required' | 'advisory') {
   const inputTokens = requestAccountingInputTokens(accounting);
   const reasoningReservation =
     accounting.pricingSemantics.reasoningIncludedInOutput === false
@@ -136,12 +141,14 @@ export function requestCapacity(accounting: RequestAccounting, headroom?: number
     outputReservation: accounting.outputReservation,
     reasoningReservation,
     continuityHeadroomTokens,
-    continuityHeadroomPolicy: headroom === undefined ? 'advisory' as const : 'required' as const,
+    continuityHeadroomPolicy: reserveMode ?? (headroom === undefined ? 'advisory' as const : 'required' as const),
     ...(remainingTokens === undefined
       ? {}
       : { ordinaryRemainingTokens: Math.max(0, remainingTokens - continuityHeadroomTokens) }),
+    hardCapacityExceeded: inputCapacity !== undefined && inputTokens > inputCapacity,
+    recoveryReserveExceeded: remainingTokens !== undefined && remainingTokens < continuityHeadroomTokens,
     pressure:
-      remainingTokens === undefined
+      inputCapacity !== undefined && inputTokens > inputCapacity ? 'hard_capacity' as const : remainingTokens === undefined
         ? ('unknown' as const)
         : remainingTokens <= continuityHeadroomTokens
           ? ('continuity' as const)

@@ -1,3 +1,5 @@
+import { effectiveCapabilitySnapshotSchema } from '../run/capabilities.js';
+import { captureRequestCapabilities, capturedRequestCapabilities } from './capability-capture.js';
 import { historyCutSchema } from '../history/schema.js';
 import type { HistorySourceCut } from '../history/contracts.js';
 import * as z from 'zod';
@@ -215,7 +217,7 @@ export class InferenceService {
       ...options,
       repository: options.repository,
       artifacts: options.artifacts,
-      budget: parseInferenceBudget(options.budget ?? {})
+      ...(options.budget === undefined ? {} : { budget: parseInferenceBudget(options.budget) })
     });
   }
   static inMemory(
@@ -236,10 +238,33 @@ export class InferenceService {
     return (await this.options.repository.load(ownerId, { runId })).settledUsage;
   }
 
+  async inspectLatestAdmission(ownerId: string) {
+    const { latestInvocation: invocation } = await this.options.repository.load(ownerId);
+    if (!invocation) return null;
+    const ref = invocation.extension?.requestRef ?? invocation.start.requestRef;
+    const record = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await this.options.artifacts.readVerified(ref))) as Record<string, unknown>;
+    if (typeof record.inputIdentity !== 'string' || typeof record.capabilityRevision !== 'string')
+      throw new Error('Recorded inference request lacks operational admission identity.');
+    const snapshot = record.capabilities === undefined ? null : effectiveCapabilitySnapshotSchema.parse(record.capabilities);
+    return Object.freeze({ inputIdentity: record.inputIdentity, protocolCapabilityRevision: record.capabilityRevision,
+      snapshot, invocationId: invocation.start.invocationId, runId: invocation.start.runId, purpose: invocation.start.purpose,
+      contextAdmission: 'admitted' as const,
+      invocationStatus: invocation.settlement ? 'settled' as const : invocation.notSent ? 'not_sent' as const :
+        invocation.rejected ? 'rejected' as const : invocation.uncertain ? 'uncertain' as const : 'started' as const,
+      dispatch: invocation.notSent ? 'not_sent' as const : invocation.settlement || invocation.rejected ? 'observed' as const : 'unconfirmed' as const });
+  }
+
+  private ownerBudget(state: InferenceOwnerState): InferenceBudget {
+    const recorded = state.latestInvocation?.start.limits;
+    if (recorded && this.options.budget !== undefined && hashJson(recorded) !== hashJson(this.options.budget))
+      throw new Error('Inference owner budget policy changed after admission.');
+    return recorded ?? this.options.budget ?? {};
+  }
+
   /** Read the existing owner ledger; this snapshot neither reserves nor authorizes work. */
   async inspectOwnerAllowance(ownerId: string) {
     const state = await this.options.repository.load(ownerId);
-    const limits = this.options.budget ?? {};
+    const limits = this.ownerBudget(state);
     const outstanding = {
       invocations: state.committed.invocations - state.settledUsage.invocations,
       promptTokens: state.committed.usage.promptTokens - state.settledUsage.usage.promptTokens,
@@ -454,6 +479,8 @@ export class InferenceService {
       {
         gateway: this.gateway,
         start: async ({ context, signal, authorize, dispatch }) => {
+          const capabilities = input.capabilities?.(context);
+          if (capabilities) captureRequestCapabilities(context.compiled, capabilities);
           const result = await this.executeDurably({
             identity: ownIdentity(context),
             stateSelectionId: input.stateSelectionId?.() ?? null,
@@ -479,8 +506,11 @@ export class InferenceService {
             replayed: false
           });
         },
-        extend: async (context, compiled, dispatch) =>
-          this.extendNativeInvocation(context, compiled, input.stateSelectionId?.() ?? null, await input.capturedHistoryCut?.(), dispatch)
+        extend: async (context, compiled, dispatch) => {
+          const capabilities = input.capabilities?.({ ...context, compiled, dispatch });
+          if (capabilities) captureRequestCapabilities(compiled, capabilities);
+          return this.extendNativeInvocation(context, compiled, input.stateSelectionId?.() ?? null, await input.capturedHistoryCut?.(), dispatch);
+        }
       },
       {
         ...input,
@@ -505,7 +535,7 @@ export class InferenceService {
     const { repository, artifacts } = this.options;
     capturedHistoryCut = capturedHistoryCut === undefined ? undefined : historyCutSchema.parse(capturedHistoryCut);
     await this.admit(compiled, context.profile);
-    const reservation = inferenceReservation(compiled, context.profile, this.options.budget ?? {});
+    const reservation = inferenceReservation(compiled, context.profile, this.ownerBudget(await repository.load(context.ownerId)));
     const fingerprint = (
       await modelInputIdentity({
         identity: ownIdentity(context),
@@ -535,7 +565,7 @@ export class InferenceService {
         identity: context,
         compiled,
         profile: context.profile,
-        limits: this.options.budget ?? {},
+        limits: this.ownerBudget(state),
         replacing: current.extension?.reservation ?? current.start.reservation
       });
       const requestRef = await artifacts.storeProtected({
@@ -554,7 +584,8 @@ export class InferenceService {
             inputIdentity: compiled.inputIdentity,
             accounting: compiled.accounting,
             endpoint: compiled.endpoint,
-            capabilityRevision: compiled.capabilityRevision
+            capabilityRevision: compiled.capabilityRevision,
+            capabilities: capturedRequestCapabilities(compiled)
           })
         )
       });
@@ -703,7 +734,7 @@ export class InferenceService {
       throw new Error(
         `Inference ${identity.invocationId} was already admitted with different input or configuration.`
       );
-    if (hashJson(existing.start.limits) !== hashJson(this.options.budget ?? {}))
+    if (this.options.budget !== undefined && hashJson(existing.start.limits) !== hashJson(this.options.budget))
       throw new Error('Inference owner budget policy changed after admission.');
     if (input.profile || input.compiled) {
       const record = parseJsonObject(
@@ -796,7 +827,7 @@ export class InferenceService {
         nativeDispatch: input.nativeDispatch ? nativeDispatchProvenance(input.nativeDispatch) : null
       })
     ).slice(7);
-    const reservation = inferenceReservation(compiled, profile, this.options.budget ?? {});
+    const reservation = inferenceReservation(compiled, profile, this.ownerBudget(await repository.load(identity.ownerId)));
     let start: Extract<InferenceEvent, { type: 'inference.started' }>;
     for (;;) {
       signal?.throwIfAborted();
@@ -840,7 +871,7 @@ export class InferenceService {
             'A prior invocation crossed its durable start boundary; replay requires provider outcome evidence.'
         );
       }
-      const limits = this.options.budget ?? {};
+      const limits = this.ownerBudget(state);
       assertBudget({ state, reservation, limits, identity, compiled, profile });
       const requestRef = await artifacts.storeProtected({
         label: `inference-${input.operation}-request`,
@@ -860,6 +891,8 @@ export class InferenceService {
             profile,
             inputIdentity: compiled.inputIdentity,
             accounting: compiled.accounting,
+            capabilityRevision: compiled.capabilityRevision,
+            capabilities: capturedRequestCapabilities(compiled),
             operation: input.operation
           })
         )

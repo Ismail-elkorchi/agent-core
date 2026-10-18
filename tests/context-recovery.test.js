@@ -7,6 +7,7 @@ import { defineTool, ToolInputError, serializeToolModelContent } from '@agent-co
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
   AgentRuntime, ContextService, HistoryReader, InMemorySessionRepository,
+  parseContextControlPolicy, parseOutputReservationPolicy, grantContextControlTool, CONTEXT_CONTROL_POLICY_BOUNDS,
   InMemoryInferenceRepository, InferenceService, agentEventCodec, createHistoryTools, resolveToolObservation, resolveToolModelContent
 } from '@agent-core/runtime';
 
@@ -870,4 +871,136 @@ test('settlement and publication share one immutable presentation artifact', asy
     assert.match(serializeToolModelContent(await resolveToolModelContent(event, f.artifacts)), /SINGLE_PRESENTATION_PAYLOAD/);
   }
   assert.equal((await resolveToolObservation(outcome.observation, f.artifacts)).output, 'SINGLE_PRESENTATION_PAYLOAD');
+});
+
+
+test('context control policy captures finite explicit host bounds', () => {
+  const input = { requestsPerBoundary: 7, toolCalls: 3, reserveMode: 'advisory' };
+  const policy = parseContextControlPolicy(input);
+  input.toolCalls = 100;
+  assert.equal(policy.toolCalls, 3);
+  assert.ok(Object.isFrozen(policy));
+  for (const bad of [Infinity, NaN, 0, -1, 1.5, Number.MAX_SAFE_INTEGER])
+    assert.throws(() => parseContextControlPolicy({ requestsPerBoundary: bad }));
+  assert.throws(() => parseContextControlPolicy({ unexpected: 1 }));
+  assert.throws(() => parseContextControlPolicy({ constructor: 1 }));
+  assert.throws(() => parseContextControlPolicy({ toString: 1 }));
+  assert.throws(() => parseContextControlPolicy({ reserveMode: 'ignore' }));
+  assert.throws(() => parseOutputReservationPolicy({ minimum: 100, maximum: 99 }));
+  for (const [field, maximum] of Object.entries(CONTEXT_CONTROL_POLICY_BOUNDS)) {
+    const dependencies = field === 'toolCalls' ? { exchangeRecords: 4096 } : {};
+    assert.equal(parseContextControlPolicy({ ...dependencies, [field]: maximum })[field], maximum);
+    assert.throws(() => parseContextControlPolicy({ ...dependencies, [field]: maximum + 1 }));
+  }
+  assert.throws(() => parseContextControlPolicy({ toolCalls: 16, exchangeRecords: 16 }));
+});
+
+for (const granted of [false, true]) {
+  test(`control eligibility requires an exact host grant (${granted ? 'granted' : 'self-labeled'})`, async () => {
+    const f = await fixture();
+    let reads = 0;
+    const external = defineTool({
+      name: 'context_external_read', implementationId: 'agent-core.context_external_read.v1',
+      description: 'Read a bounded external context observation.',
+      schema: z.strictObject({ maxBytes: z.int().positive() }), outputSchema: z.string(),
+      canonicalizeInput: value => value,
+      effectEnvelope: { accesses: [{ mode: 'read', scope: 'context' }], lockScopes: [] },
+      deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'context' }], lockScopes: [], recovery: { kind: 'unknown' } }),
+      invoke: async () => { reads++; return { kind: 'result', output: 'Observed', summary: 'Observed', scope: { resources: ['context'], coverage: 'complete' } }; }
+    });
+    if (granted) grantContextControlTool(external, 'read');
+    let turns = 0;
+    f.recover(() => ++turns === 1 ? call(external.name, { maxBytes: 1024 }) : select());
+    const options = f.options();
+    const result = await new AgentRuntime({ ...options, tools: [...options.tools, external] })
+      .run({ runId: `grant-${granted}`, task: 'Preserve work.' }).result;
+    assert.equal(reads, granted ? 1 : 0);
+    assert.equal(result.terminal?.executionStatus, granted ? 'completed' : undefined);
+  });
+}
+
+test('host request limit remains durable across restart', async () => {
+  const f = await fixture();
+  f.recover(() => call('history_latest', { maxBytes: 4096 }));
+  const options = { ...f.options(), contextControlPolicy: { requestsPerBoundary: 1 } };
+  const first = await new AgentRuntime(options).run({ runId: 'one-control-request', task: 'Preserve work.' }).result;
+  assert.equal(first.terminal, undefined);
+  assert.equal(f.recoveryRequests().length, 1);
+  const resumed = await new AgentRuntime({ ...f.options(), contextControlPolicy: { requestsPerBoundary: 1 } }).resume('one-control-request').result;
+  assert.equal(resumed.terminal, undefined);
+  assert.equal(f.recoveryRequests().length, 1);
+});
+
+for (const authorized of [false, true]) {
+  test(`window output reservation choice is ${authorized ? 'host authorized and exact' : 'rejected for fixed allowance'}`, async () => {
+    const f = await fixture();
+    f.recover(() => call('context_transition', { reason: 'Choose bounded output for the successor.', retain: [], outputReservation: 256 }));
+    const result = await new AgentRuntime({ ...f.options(), ...(authorized ? { outputReservationPolicy: { minimum: 128, maximum: 512 } } : {}) })
+      .run({ runId: `output-choice-${authorized}`, task: 'Preserve work.' }).result;
+    const window = await f.history.selectedContext();
+    if (authorized) {
+      assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+      assert.equal(window.outputReservation, 256);
+      assert.equal(f.requests.at(-1).maxOutputTokens, 256);
+    } else {
+      assert.equal(result.terminal, undefined);
+      assert.equal(window?.outputReservation, undefined);
+      assert.ok(f.requests.every(request => request.maxOutputTokens === 512));
+    }
+  });
+}
+
+test('advisory recovery reserve does not become hard input exhaustion', async () => {
+  const f = await fixture();
+  const result = await new AgentRuntime({ ...f.options(), contextControlPolicy: { reserveMode: 'advisory' } })
+    .run({ runId: 'advisory-reserve', task: 'Keep the fitting original context.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(f.recoveryRequests().length, 0);
+  assert.ok(f.requests.at(-1).messages.some(item => item.content.includes('x'.repeat(24000))));
+});
+
+test('an authorized lower reservation cannot publish a successor that still exceeds capacity', async () => {
+  const f = await fixture();
+  f.provider.compileRequest = async request => {
+    const { signal: _signal, ...body } = request;
+    const old = request.messages.some(item => item.role === 'user' && item.content.startsWith('Old optional evidence:'));
+    const checkpoint = request.messages.some(item => item.content.includes(marker));
+    const profile = await f.provider.describeModel();
+    return compileModelRequest({ request, body, profile, endpoint: 'fixture://reservation-rejection',
+      providerInputTokens: old ? profile.limits.contextTokens - (checkpoint ? 600 : 3400) : profile.limits.contextTokens + 1 });
+  };
+  f.recover(() => call('context_transition', { reason: 'Try a lower output reservation.', retain: [], outputReservation: 256 }));
+  const result = await new AgentRuntime({ ...f.options(), outputReservationPolicy: { minimum: 128, maximum: 512 } })
+    .run({ runId: 'oversized-lower-reservation', task: 'Keep original sources until a successor fits.' }).result;
+  assert.equal(result.state, 'suspended');
+  assert.equal(await f.history.selectedContext(), undefined);
+  assert.equal((await f.sessions.loadReplayState(f.descriptor)).branch.filter(entry => entry.type === 'context_transition').length, 0);
+});
+
+test('recovery can request an exact session-state range within a bounded read envelope', async () => {
+  const f = await fixture();
+  const { refs } = await seedSelectedState(f, 'RECOVERY_STATE_EVIDENCE', 'control-state-read');
+  let turns = 0;
+  f.recover(request => {
+    const task = JSON.parse(request.messages.findLast(item => item.role === 'user').content);
+    if (++turns === 1)
+      return call('context_state_read', { ...refs[0], range: { offset: 0, bytes: 23 }, maxBytes: 2048 });
+    assert.ok(task.recentRecoveryResults.some(item => item.tool === 'context_state_read' && item.content.includes('RECOVERY_STATE_EVIDENCE')));
+    return select();
+  });
+  const result = await new AgentRuntime(f.options()).run({ runId: 'bounded-control-state-read', task: 'Preserve evidence.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(turns, 2);
+});
+
+
+test('an explicit reservation range initializes at its maximum below the configured ceiling', async () => {
+  const f = await fixture({ sourceBytes: 64 });
+  const runtime = new AgentRuntime({ ...f.options(), contextRenewal: { automatic: false },
+    outputReservationPolicy: { minimum: 128, maximum: 256 } });
+  const inspection = await runtime.inspectOperational();
+  assert.equal(inspection.generation.outputReservation, 256);
+  const result = await runtime.run({ runId: 'initial-range-allowance', task: 'Use the host-selected default.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(f.requests.at(-1).maxOutputTokens, 256);
 });

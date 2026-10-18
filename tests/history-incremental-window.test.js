@@ -98,9 +98,6 @@ async function fixture() {
     options,
     setCapacity(value) {
       capacity = value;
-    },
-    setSourceCapacity(value) {
-      policy.maxSourceBytes = value;
     }
   };
 }

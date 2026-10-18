@@ -176,3 +176,18 @@ test('generated tool guidance uses the supported system authority channel', asyn
   assert.equal(assembly.messages[0].content, 'Keep original evidence');
   assert.equal(assembly.messages.some(item => item.role === 'developer'), false);
 });
+
+
+test('hard compiled exhaustion and recovery reserve pressure are distinct', async () => {
+  const request = { model: 'model', messages: [{ role: 'user', content: 'input' }], maxOutputTokens: 500 };
+  const compiled = await compileModelRequest({ request, profile, endpoint: 'fixture', body: { input: 'input' }, providerInputTokens: 39000 });
+  const reserve = new ContextAdmissionError(compiled, new Error('Reserve pressure'), false, 1000);
+  assert.equal(reserve.hardCapacityExceeded, false);
+  assert.equal(reserve.recoveryReserveExceeded, true);
+  assert.equal(reserve.capacityExceeded, true);
+  const overflow = await compileModelRequest({ request, profile, endpoint: 'fixture', body: { input: 'input' }, providerInputTokens: 40001 });
+  const hard = new ContextAdmissionError(overflow, new Error('Hard overflow'), false, 1000);
+  assert.equal(hard.hardCapacityExceeded, true);
+  assert.equal(hard.recoveryReserveExceeded, false);
+  assert.equal(hard.capacityExceeded, true);
+});

@@ -1,7 +1,10 @@
+import type { ContextAdmittedCapabilities, ContextOperationalInspectionPage, SessionOperationalInspection } from '../session/operational.js';
+export type { ContextOperationalInspectionPage } from '../session/operational.js';
 import * as z from 'zod';
 import { contextToolDefinitions } from './tools.js';
 import { stageSessionStateBatch } from './session-state.js';
-import { decodeStatePageCursor } from '../session/state-records.js';
+import { HistorySearchIndex } from '../history/search-index.js';
+import { fitStatePage, boundedStateResult, statePageLimits, decodeStatePageCursor } from '../session/state-records.js';
 import type { PromptContextItemInput } from '../inference/prompt-material.js';
 import { contextSourceManifest, selectedHistoryMetadata, SELECTED_METADATA_LIMITS, SelectedHistoryMetadata, type ContextInspectionPage } from './inspection.js';
 import {
@@ -13,7 +16,7 @@ import { ContextSourceCapacityError } from '../run/context-admission.js';
 import { HistorySourceTooLargeError } from '../history/reader.js';
 import { contextCapacityExceeded, requestCapacity } from '../inference/request-admission.js';
 import {
-  hashJson,
+  hashJson, decodeUtf8, isTextMediaType, sameArtifactIdentity,
   PersistenceConflictError,
   type ArtifactRepository
 } from '@agent-core/persistence';
@@ -22,7 +25,7 @@ import type { HistorySourceCut, HistorySourceRef, HistorySourceExcerpt } from '.
 import { HistoryReader, sameHistorySource } from '../history/reader.js';
 import type { ToolInvocationContext } from '@agent-core/tools';
 import {
-  sessionStateView, sessionStateTextRange, sessionStateBatchSchema, sessionStateLimitError, sessionStateItemRefSchema,
+  SESSION_STATE_RETRIEVAL_LIMITS, sessionStateReadSchema, sessionStateSearchSchema, sessionStateView, sessionStateTextRange, sessionStateBatchSchema, sessionStateLimitError, sessionStateItemRefSchema,
   type SessionStateBatch, type SessionStateBatchCommit, type SessionStateItemRef,
   type SessionStatePageRequest, type SessionStateSnapshot, type SessionStateInference
 } from '../session/session-state.js';
@@ -36,6 +39,37 @@ import type { ContextArtifactSelection, ContextTransitionUnchanged, ContextSourc
 import { contextTransitionRequestSchema } from './schema.js';
 import { historyCutSchema } from '../history/schema.js';
 
+export interface ContextResourcePolicy {
+  readonly maxSourceBytes?: number;
+  readonly committedRetainedStateBytes?: number;
+  readonly sessionStateMutationBytes?: number;
+  readonly sessionStateReadBytes?: number;
+}
+export const contextResourcePolicySchema = z.strictObject({
+  maxSourceBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  committedRetainedStateBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  sessionStateMutationBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  sessionStateReadBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional()
+}).readonly();
+export function parseContextResourcePolicy(input: unknown): ContextResourcePolicy {
+  const value = contextResourcePolicySchema.parse(input);
+  return Object.freeze({
+    ...(value.maxSourceBytes === undefined ? {} : { maxSourceBytes: value.maxSourceBytes }),
+    ...(value.committedRetainedStateBytes === undefined ? {} : { committedRetainedStateBytes: value.committedRetainedStateBytes }),
+    ...(value.sessionStateMutationBytes === undefined ? {} : { sessionStateMutationBytes: value.sessionStateMutationBytes }),
+    ...(value.sessionStateReadBytes === undefined ? {} : { sessionStateReadBytes: value.sessionStateReadBytes })
+  });
+}
+export function resolveContextResourcePolicy(input: ContextResourcePolicy = {}): Required<ContextResourcePolicy> {
+  input = parseContextResourcePolicy(input);
+  const policy = { maxSourceBytes: input.maxSourceBytes ?? 4 * 1024 * 1024,
+    committedRetainedStateBytes: input.committedRetainedStateBytes ?? 64 * 1024 * 1024,
+    sessionStateMutationBytes: input.sessionStateMutationBytes ?? 1024 * 1024,
+    sessionStateReadBytes: input.sessionStateReadBytes ?? 64 * 1024 };
+  for (const [name, value] of Object.entries(policy)) if (!Number.isSafeInteger(value) || value < 1)
+    throw new Error(`${name} must be a positive safe integer.`);
+  return Object.freeze(policy);
+}
 export interface ContextPolicy {
   /** Bounds source material read; provider compiled accounting alone decides token fit. */
   readonly maxSourceBytes: number;
@@ -54,6 +88,7 @@ export interface ContextPolicy {
     | Promise<readonly HistorySourceRef[]>;
 }
 export interface ContextAdmissionInput {
+  readonly outputReservation?: number | undefined;
   readonly cut: HistorySourceCut;
   readonly entries: readonly SessionBranchEntry[];
   readonly excerpts: Awaited<ReturnType<HistoryReader['readExcerpts']>>;
@@ -65,21 +100,16 @@ export interface ContextAdmissionInput {
   readonly signal?: AbortSignal;
 }
 export type ContextAdmission = (input: ContextAdmissionInput) => Promise<{
+  readonly outputReservation?: number | undefined;
   readonly compiledInputIdentity: string;
   readonly capabilityRevision: string;
   readonly selection?: ContextSelection;
   readonly renewal?: { readonly selection: ContextSelection; readonly cause: 'capacity' | 'prefix_incompatibility' };
 }>;
-export interface ContextOperationalInspectionPage {
-  readonly target?: 'configured' | 'last_admitted';
-  readonly offset?: number;
-  readonly limit?: number;
-  readonly expectedRevision?: string;
-}
 export interface ContextServiceOptions {
   readonly withStateOwnership?: <T>(operation: () => Promise<T>) => Promise<T>;
   readonly assertStateWrite?: (batch: SessionStateBatch | SessionStateBatchCommit) => Promise<void>;
-  readonly inspectOperational?: (page?: ContextOperationalInspectionPage) => Promise<unknown>;
+  readonly inspectOperational?: (page?: ContextOperationalInspectionPage) => Promise<SessionOperationalInspection>;
   readonly repository: SessionRepository;
   readonly session: SessionDescriptor;
   readonly history?: HistoryReader;
@@ -87,7 +117,19 @@ export interface ContextServiceOptions {
   readonly policy: ContextPolicy;
 }
 
+const admittedContextCapabilities = new WeakMap<ContextService, ContextAdmittedCapabilities>();
+/** Internal runtime publication, intentionally excluded from package exports. */
+export function captureContextCapabilities(context: ContextService, value: ContextAdmittedCapabilities): void {
+  admittedContextCapabilities.set(context, value);
+}
+
 export class ContextService {
+  readonly resourcePolicy: Required<ContextResourcePolicy>;
+  // Disposable negative filter. Authorization always comes from the cut-pinned repository page.
+  private stateSearchIndex = new HistorySearchIndex<{ readonly position: { at: number; sequence: number; entryId: string } }>();
+  private readonly indexedStateRevisions = new Map<string, { readonly position: { at: number; sequence: number; entryId: string } }>();
+  private indexedStateBytes = 0;
+
   readonly history: HistoryReader;
   private readonly selectedMetadataCache: SelectedHistoryMetadata;
 
@@ -95,6 +137,10 @@ export class ContextService {
     return this.selectedMetadataCache.read(cut);
   }
   constructor(private readonly options: ContextServiceOptions) {
+    this.resourcePolicy = resolveContextResourcePolicy({ maxSourceBytes: options.policy.maxSourceBytes,
+      ...(options.policy.committedRetainedStateBytes === undefined ? {} : { committedRetainedStateBytes: options.policy.committedRetainedStateBytes }),
+      ...(options.policy.sessionStateMutationBytes === undefined ? {} : { sessionStateMutationBytes: options.policy.sessionStateMutationBytes }),
+      ...(options.policy.sessionStateReadBytes === undefined ? {} : { sessionStateReadBytes: options.policy.sessionStateReadBytes }) });
     this.history =
       options.history ??
       new HistoryReader({
@@ -103,23 +149,19 @@ export class ContextService {
         artifacts: options.artifacts
       });
     this.selectedMetadataCache = new SelectedHistoryMetadata(this.history);
-    if (!Number.isSafeInteger(options.policy.maxSourceBytes) || options.policy.maxSourceBytes < 1)
-      throw new Error('Context source selection maxSourceBytes must be positive.');
-    for (const [name, value] of Object.entries({ committedRetainedStateBytes: options.policy.committedRetainedStateBytes,
-      sessionStateMutationBytes: options.policy.sessionStateMutationBytes, sessionStateReadBytes: options.policy.sessionStateReadBytes }))
-      if (value !== undefined && (!Number.isSafeInteger(value) || value < 1))
-        throw new Error(`${name} must be a positive safe integer.`);
+
   }
   /** Construct governed context capabilities with this service's owned storage. */
   toolDefinitions(prefix?: string) {
     return contextToolDefinitions({ context: this, artifacts: this.options.artifacts,
-      maxSourceBytes: this.options.policy.maxSourceBytes, ...(prefix ? { prefix } : {}) });
+      maxSourceBytes: this.resourcePolicy.maxSourceBytes, ...(prefix ? { prefix } : {}) });
   }
-  async inspect(cut?: HistorySourceCut, page?: ContextInspectionPage) {
+  async inspect(cut?: HistorySourceCut, page?: ContextInspectionPage, operationalPage?: ContextOperationalInspectionPage) {
     cut ??= await this.history.capture();
     const pending = await this.options.repository.pendingSubmissionSummaries(this.options.session);
     const window = await this.history.selectedContext(cut);
     const capacity = this.capacity();
+    const retainedBytes = await this.options.repository.committedRetainedStateBytes(this.options.session);
     const selection = window
       ? {
           retained: window.selection.retained,
@@ -132,14 +174,18 @@ export class ContextService {
       : undefined;
     return Object.freeze({
       cut,
-      operational: await this.inspectOperational(),
+      operational: page ? null : await this.inspectOperational(operationalPage),
+      operationalCoverage: page ? 'not_requested' as const : 'requested' as const,
       activeSelection: await this.inspectSelection(cut, page),
       window:
         window && selection
           ? Object.freeze({ ...window, selection: Object.freeze(selection) })
           : null,
       budget: Object.freeze({
-        maxSourceBytes: this.options.policy.maxSourceBytes,
+        ...this.resourcePolicy,
+        committedRetainedState: Object.freeze({ usedBytes: retainedBytes,
+          remainingBytes: Math.max(0, this.resourcePolicy.committedRetainedStateBytes - retainedBytes),
+          meaning: 'Committed retained revision metadata and bodies, including historical revisions and forks; not physical artifact disk usage.' }),
         quality: 'byte_bound' as const
       }),
       sessionState: await this.inspectSessionState(cut, page ? 0 : undefined),
@@ -154,9 +200,10 @@ export class ContextService {
       ...(capacity ? { capacity } : {})
     });
   }
-  async inspectOperational(page?: ContextOperationalInspectionPage): Promise<unknown> {
+  admittedCapabilities(): ContextAdmittedCapabilities | undefined { return admittedContextCapabilities.get(this); }
+  async inspectOperational(page?: ContextOperationalInspectionPage) {
     const inspect = this.runtime?.inspectOperational ?? this.options.inspectOperational;
-    if (!inspect) return { status: 'unavailable', reason: 'No runtime inspection provider is bound.' };
+    if (!inspect) return null;
     return inspect(page);
   }
   private async inspectSelection(cut: HistorySourceCut, page?: ContextInspectionPage): Promise<
@@ -182,7 +229,7 @@ export class ContextService {
     | {
         withStateOwnership?: <T>(operation: () => Promise<T>) => Promise<T>;
         assertStateWrite?: (batch: SessionStateBatch | SessionStateBatchCommit) => Promise<void>;
-        inspectOperational?: (page?: ContextOperationalInspectionPage) => Promise<unknown>;
+        inspectOperational?: (page?: ContextOperationalInspectionPage) => Promise<SessionOperationalInspection>;
         origin: (invocation: ToolInvocationContext) => Promise<{
           readonly inference: SessionStateInference;
           readonly capturedHistoryCut: HistorySourceCut;
@@ -196,6 +243,7 @@ export class ContextService {
         readonly inputIdentity: string;
         readonly accounting: import('@agent-core/model').RequestAccounting;
         readonly continuityHeadroomTokens?: number;
+        readonly continuityHeadroomPolicy?: 'required' | 'advisory';
         readonly message?: string;
         readonly providerRejected?: boolean;
         readonly feedback?: {
@@ -219,18 +267,18 @@ export class ContextService {
     let bytes = 0;
     for (const item of contextMetadataGroups(view.items).filter((group) => !group.some((item) => item.contextRecovery)).flat()) {
       bytes += item.sourceBytes;
-      if (bytes > this.options.policy.maxSourceBytes)
+      if (bytes > this.resourcePolicy.maxSourceBytes)
         throw new ContextSourceCapacityError(cut, {
-          unit: 'bytes', limit: this.options.policy.maxSourceBytes, observedAtLeast: bytes
+          unit: 'bytes', limit: this.resourcePolicy.maxSourceBytes, observedAtLeast: bytes
         }, item.source);
     }
   }
 
   /** Reuse unchanged facts; pressure does not create a recurring maintenance instruction. */
-  async capacityFeedback(compiled: CompiledModelRequest, continuityHeadroomTokens?: number) {
+  async capacityFeedback(compiled: CompiledModelRequest, continuityHeadroomTokens?: number, continuityHeadroomPolicy?: 'required' | 'advisory') {
     const view = await this.selectedMetadata(await this.history.capture());
     const sourceBytes = view.items.reduce((sum, item) => sum + item.sourceBytes, 0);
-    const capacity = requestCapacity(compiled.accounting, continuityHeadroomTokens);
+    const capacity = requestCapacity(compiled.accounting, continuityHeadroomTokens, continuityHeadroomPolicy);
     const sourcePressure =
       sourceBytes >= SELECTED_SOURCE_LIMITS.bytes * 0.8 ||
       view.items.length >= SELECTED_SOURCE_LIMITS.entries * 0.8;
@@ -382,7 +430,7 @@ export class ContextService {
     excerpts: readonly HistorySourceExcerpt[], retained: readonly HistorySourceRef[], cut: HistorySourceCut
   ): Promise<readonly HistorySourceExcerpt[]> {
     if (!excerpts.length) return [];
-    const normalized = await this.history.canonicalizeExcerpts(excerpts, cut, this.options.policy.maxSourceBytes);
+    const normalized = await this.history.canonicalizeExcerpts(excerpts, cut, this.resourcePolicy.maxSourceBytes);
     const originals = new Map(retained.map(source => [source.entryId, source]));
     return normalized.filter(excerpt => {
       const original = originals.get(excerpt.source.entryId);
@@ -466,7 +514,8 @@ export class ContextService {
         renewalReason = 'capacity';
       }
     }
-    const sameView = sameSelection &&
+    const outputReservation = request.outputReservation ?? window?.outputReservation;
+    const sameView = outputReservation === window?.outputReservation && sameSelection &&
       hashJson(request.selection.sessionState ?? []) === hashJson(window?.selection.sessionState ?? []) &&
       hashJson(request.selection.artifacts ?? []) === hashJson(window?.selection.artifacts ?? []);
     const freshReset = requiredRenewal || !sameSelection;
@@ -486,7 +535,7 @@ export class ContextService {
         entry = await this.history.resolve(
           ref,
           cut,
-          Math.max(1, this.options.policy.maxSourceBytes - sourceBytes)
+          Math.max(1, this.resourcePolicy.maxSourceBytes - sourceBytes)
         );
       } catch (error) {
         if (!(error instanceof HistorySourceTooLargeError)) throw error;
@@ -494,9 +543,9 @@ export class ContextService {
           cut,
           {
             unit: 'bytes',
-            limit: this.options.policy.maxSourceBytes,
+            limit: this.resourcePolicy.maxSourceBytes,
             observedAtLeast: Math.max(
-              this.options.policy.maxSourceBytes + 1,
+              this.resourcePolicy.maxSourceBytes + 1,
               sourceBytes + error.bytes
             )
           },
@@ -505,10 +554,10 @@ export class ContextService {
       }
       if (!entry) throw new Error('Context source is unavailable on the authorized branch.');
       sourceBytes += Buffer.byteLength(JSON.stringify(entry));
-      if (sourceBytes > this.options.policy.maxSourceBytes)
+      if (sourceBytes > this.resourcePolicy.maxSourceBytes)
         throw new ContextSourceCapacityError(cut, {
           unit: 'bytes',
-          limit: this.options.policy.maxSourceBytes,
+          limit: this.resourcePolicy.maxSourceBytes,
           observedAtLeast: sourceBytes
         });
       if (entry.type === 'context_transition' || entry.type === 'session_state_batch')
@@ -518,7 +567,7 @@ export class ContextService {
       selected.push(entry);
     }
     const excerpts = request.selection.excerpts?.length
-      ? await this.history.readExcerpts(request.selection.excerpts, cut, Math.max(1, this.options.policy.maxSourceBytes - sourceBytes))
+      ? await this.history.readExcerpts(request.selection.excerpts, cut, Math.max(1, this.resourcePolicy.maxSourceBytes - sourceBytes))
       : [];
     for (const source of await this.protectedSources(cut, false)) {
       if (
@@ -582,10 +631,10 @@ export class ContextService {
         acceptedInput: pending.map((item) => item.input)
       })
     );
-    if (bytes > this.options.policy.maxSourceBytes)
+    if (bytes > this.resourcePolicy.maxSourceBytes)
       throw new ContextSourceCapacityError(cut, {
         unit: 'bytes',
-        limit: this.options.policy.maxSourceBytes,
+        limit: this.resourcePolicy.maxSourceBytes,
         observedAtLeast: bytes
       });
     if (!request.sessionState && sameView && !freshReset && !request.renewal) {
@@ -596,6 +645,7 @@ export class ContextService {
     }
     let strategy: 'fresh' | 'append' = freshReset ? 'fresh' : 'append';
     const validation = await options.admit({
+      ...(outputReservation === undefined ? {} : { outputReservation }),
       cut,
       entries: selected,
       excerpts,
@@ -606,6 +656,8 @@ export class ContextService {
       strategy,
       ...(options.signal ? { signal: options.signal } : {})
     });
+    if (validation.outputReservation !== outputReservation)
+      throw new Error('Admission changed or omitted the proposed output reservation.');
     if (validation.renewal) {
       if (strategy !== 'append' || effectiveSelectionIdentity(validation.renewal.selection) !== effectiveSelectionIdentity(request.selection))
         throw new Error('Renewal fallback may not change the admitted source proposal.');
@@ -635,6 +687,7 @@ export class ContextService {
       expectedSourceRevision: cut.sourceRevision,
       expectedWindowId: request.expectedWindowId,
       window: {
+        ...(outputReservation === undefined ? {} : { outputReservation }),
         windowId,
         parentWindowId: request.expectedWindowId,
         historyPosition: cut,
@@ -644,11 +697,13 @@ export class ContextService {
       },
       transition: {
         strategy,
-        cause: validation.renewal?.cause ?? renewalReason ?? (request.renewal ? 'explicit_renewal' : freshReset ? 'selection_change' : 'state_update'),
+        cause: validation.renewal?.cause ?? renewalReason ?? (request.renewal ? 'explicit_renewal' : freshReset ? 'selection_change' : outputReservation !== window?.outputReservation ? 'resource_change' : 'state_update'),
         ...(request.renewal === undefined ? {} : { requestedRenewal: request.renewal }),
+        ...(request.outputReservation === undefined ? {} : { requestedOutputReservation: request.outputReservation }),
         transitionId: randomUUID(),
         admission: { status: 'admitted', compiledInputIdentity: validation.compiledInputIdentity,
-          capabilityRevision: validation.capabilityRevision },
+          capabilityRevision: validation.capabilityRevision,
+          ...(outputReservation === undefined ? {} : { outputReservation }) },
         idempotencyKey: request.idempotencyKey,
         previousWindowId: request.expectedWindowId,
         windowId,
@@ -675,8 +730,8 @@ export class ContextService {
       throw new PersistenceConflictError('Session-state batch belongs to another branch.');
     return stageSessionStateBatch({ batch, artifacts: this.options.artifacts, history: this.history,
       current: itemId => this.options.repository.currentSessionStateItem(this.options.session, itemId),
-      maxMutationBytes: this.options.policy.sessionStateMutationBytes ?? 1024 * 1024,
-      maxStorageBytes: this.options.policy.committedRetainedStateBytes ?? 64 * 1024 * 1024,
+      maxMutationBytes: this.resourcePolicy.sessionStateMutationBytes,
+      maxStorageBytes: this.resourcePolicy.committedRetainedStateBytes,
       committedRetainedBytes: await this.options.repository.committedRetainedStateBytes(this.options.session) });
   }
 
@@ -707,66 +762,113 @@ export class ContextService {
     const cursor = decodeStatePageCursor(cut.sessionId, request);
     const leafId = cursor ? cursor.leafId : request.leafId === undefined ? cut.throughEntryId : request.leafId;
     await this.validateStateReadBoundary(leafId, cut);
-    return boundedStateResult(await this.options.repository.listSessionState(this.options.session, { ...request, leafId }), request.maxBytes ?? 32 * 1024);
+    const { limit, maxBytes } = statePageLimits(request);
+    return boundedStateResult(await this.options.repository.listSessionState(this.options.session, { ...request, leafId, limit, maxBytes }), maxBytes);
   }
 
   async searchSessionState(input: { readonly query: string; readonly cursor?: string; readonly limit?: number;
     readonly maxBytes?: number; readonly maxScannedBytes?: number; readonly cut?: HistorySourceCut }) {
-    if (!input.query.length || Buffer.byteLength(input.query) > 1024) throw new Error('State search requires a literal query of at most 1024 bytes.');
-    const limit = input.limit ?? 20;
-    const maxBytes = input.maxBytes ?? 32 * 1024;
-    const maxScannedBytes = input.maxScannedBytes ?? 1024 * 1024;
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256 || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 1024 * 1024 ||
-        !Number.isSafeInteger(maxScannedBytes) || maxScannedBytes < 1 || maxScannedBytes > 16 * 1024 * 1024)
-      throw new Error('Invalid bounded state-search allowances.');
+    const { query, limit, maxBytes, maxScannedBytes } = sessionStateSearchSchema.parse({ query: input.query, cursor: input.cursor,
+      limit: input.limit, maxBytes: input.maxBytes, maxScannedBytes: input.maxScannedBytes });
     const cut = input.cut ?? await this.history.capture();
     await this.history.validateCut(cut);
     let leafId = cut.throughEntryId;
     let cursor: string | undefined;
     if (input.cursor) {
-      if (input.cursor.length > 65536) throw new Error('State-search cursor exceeds its byte bound.');
+      if (Buffer.byteLength(input.cursor) > SESSION_STATE_RETRIEVAL_LIMITS.maxCursorBytes) throw new Error('State-search cursor exceeds its byte bound.');
       const decoded: unknown = JSON.parse(Buffer.from(input.cursor, 'base64url').toString('utf8'));
       const parsed = stateSearchCursorSchema.parse(decoded);
-      if (parsed.sessionId !== cut.sessionId || parsed.branchId !== cut.branchId || parsed.query !== input.query)
+      if (parsed.sessionId !== cut.sessionId || parsed.branchId !== cut.branchId || parsed.query !== query)
         throw new Error('State-search cursor belongs to another query or branch.');
       leafId = parsed.leafId; cursor = parsed.cursor;
     }
     await this.validateStateReadBoundary(leafId, cut);
-    const resume = () => Buffer.from(JSON.stringify({ sessionId: cut.sessionId, branchId: cut.branchId, query: input.query, leafId, ...(cursor ? { cursor } : {}) })).toString('base64url');
-    const matches = [];
-    let scannedBytes = 0;
-    let resultBytes = 0;
-    let visited = 0;
-    while (visited < 256 && matches.length < limit) {
+    const resume = (next: string | undefined) => Buffer.from(JSON.stringify({ sessionId: cut.sessionId, branchId: cut.branchId, query, leafId, ...(next ? { cursor: next } : {}) })).toString('base64url');
+    const matches: { itemId: string; revisionId: string; range: { offset: number; bytes: number }; excerptRange: { offset: number; bytes: number }; excerpt: string }[] = [];
+    let scannedBytes = 0, visited = 0, indexed = 0, candidates = 0;
+    const result = (next: string | undefined, complete: boolean, items = matches) => ({ matches: items, scannedBytes, visited, indexed, candidates,
+      occurrence: 'first_per_item' as const, coverage: complete ? 'complete' as const : 'partial' as const, ...(complete ? {} : { cursor: resume(next) }) });
+    while (visited < SESSION_STATE_RETRIEVAL_LIMITS.maxLimit && matches.length < limit) {
       const page = await this.listSessionState({ leafId, ...(cursor ? { cursor } : {}), limit: 1, maxBytes: 16 * 1024 }, cut);
       const item = page.items[0];
-      if (!item) { cursor = page.cursor; return boundedStateResult({ matches, scannedBytes, visited, coverage: page.coverage, ...(cursor ? { cursor: resume() } : {}) }, maxBytes); }
-      if (scannedBytes + item.contentBytes > maxScannedBytes) return boundedStateResult({ matches, scannedBytes, visited, coverage: 'partial' as const,
-        cursor: resume(), unsearched: { itemId: item.itemId, revisionId: item.revisionId, requiredBytes: item.contentBytes } }, maxBytes);
-      const revision = await this.options.repository.readSessionStateItem(this.options.session, { itemId: item.itemId, revisionId: item.revisionId }, leafId);
-      const text = new TextDecoder('utf-8', { fatal: true }).decode(await this.options.artifacts.readVerified(revision.contentRef));
-      scannedBytes += item.contentBytes;
-      const at = text.indexOf(input.query);
-      if (at >= 0) {
-        const match = { itemId: item.itemId, revisionId: item.revisionId, excerpt: text.slice(Math.max(0, at - 80), at + input.query.length + 160) };
-        const size = Buffer.byteLength(JSON.stringify(match));
-        if (resultBytes + size > maxBytes) return boundedStateResult({ matches, scannedBytes, visited, coverage: 'partial' as const, cursor: resume() }, maxBytes);
-        resultBytes += size; matches.push(match);
+      if (!item) {
+        if (page.cursor === cursor && page.coverage === 'partial') throw new Error('State inventory did not advance.');
+        cursor = page.cursor;
+        if (page.coverage === 'complete') return boundedStateResult(result(undefined, true), maxBytes);
+        visited++;
+        continue;
       }
+      let indexedSource = this.indexedStateRevisions.get(item.revisionId);
+      let text: string | undefined;
+      const candidate = !indexedSource || this.stateSearchIndex.mayMatch(indexedSource, query);
+      if (candidate) {
+        // Do not consume another body if reporting that work would overflow the
+        // already fitted page. The cursor still addresses this unexamined item.
+        if (visited > 0 && Buffer.byteLength(JSON.stringify({ ...result(cursor, false),
+          scannedBytes: scannedBytes + item.contentBytes, candidates: candidates + 1,
+          indexed: indexed + (indexedSource ? 0 : 1), visited: visited + 1 })) > maxBytes)
+          return boundedStateResult(result(cursor, false), maxBytes);
+        if (scannedBytes + item.contentBytes > maxScannedBytes) {
+          if (visited === 0) throw sessionStateLimitError('state_search_scan', maxScannedBytes, item.contentBytes,
+            item.contentBytes > SESSION_STATE_RETRIEVAL_LIMITS.maxScannedBytes
+              ? `Item ${item.itemId} requires ${String(item.contentBytes)} scan bytes, beyond the supported maximum ${String(SESSION_STATE_RETRIEVAL_LIMITS.maxScannedBytes)}. Read bounded UTF-8 ranges of this revision instead.`
+              : `State search requires maxScannedBytes at least ${String(item.contentBytes)} to examine item ${item.itemId}; retry with that scan allowance.`);
+          const partial = { ...result(cursor, false), unsearched: { itemId: item.itemId, revisionId: item.revisionId, requiredBytes: item.contentBytes } };
+          return boundedStateResult(Buffer.byteLength(JSON.stringify(partial)) <= maxBytes ? partial : result(cursor, false), maxBytes);
+        }
+        const revision = await this.options.repository.readSessionStateItem(this.options.session, { itemId: item.itemId, revisionId: item.revisionId }, leafId);
+        text = decodeUtf8(await this.options.artifacts.readVerified(revision.contentRef));
+        scannedBytes += item.contentBytes; candidates++;
+        if (!indexedSource) {
+          // Bound retained derived work, including tiny revisions; no bodies are retained.
+          if (this.indexedStateBytes + item.contentBytes > 16 * 1024 * 1024 || this.indexedStateRevisions.size >= 16384) {
+            this.stateSearchIndex = new HistorySearchIndex(); this.indexedStateRevisions.clear(); this.indexedStateBytes = 0;
+          }
+          indexedSource = { position: { at: this.indexedStateRevisions.size, sequence: 0, entryId: item.revisionId } };
+          this.stateSearchIndex.add(indexedSource, text); this.indexedStateRevisions.set(item.revisionId, indexedSource);
+          this.indexedStateBytes += item.contentBytes; indexed++;
+        }
+      }
+      const at = text?.indexOf(query) ?? -1;
+      if (text !== undefined && at >= 0) {
+        const prefix = text.slice(0, at);
+        // At most two UTF-16 units per code point, plus one boundary unit.
+        // Never allocate code-point arrays for the whole item just to build an excerpt.
+        const start = Array.from(text.slice(Math.max(0, at - 161), at)).slice(-80).join('');
+        const suffix = Array.from(text.slice(at + query.length, at + query.length + 321)).slice(0, 160).join('');
+        const offset = Buffer.byteLength(prefix), bytes = Buffer.byteLength(query);
+        const excerpt = start + query + suffix;
+        const match = { itemId: item.itemId, revisionId: item.revisionId, range: { offset, bytes },
+          excerptRange: { offset: offset - Buffer.byteLength(start), bytes: Buffer.byteLength(excerpt) }, excerpt };
+        const candidatePage = { ...result(page.cursor, page.coverage === 'complete', [...matches, match]), visited: visited + 1 };
+        if (Buffer.byteLength(JSON.stringify(candidatePage)) > maxBytes) {
+          if (visited === 0) return boundedStateResult(candidatePage, maxBytes);
+          return boundedStateResult(result(cursor, false), maxBytes);
+        }
+        matches.push(match);
+      }
+      if (!candidate && visited > 0 && Buffer.byteLength(JSON.stringify({ ...result(page.cursor, !page.cursor), visited: visited + 1 })) > maxBytes)
+        return boundedStateResult(result(cursor, false), maxBytes);
       visited++;
       cursor = page.cursor;
-      if (!cursor) return boundedStateResult({ matches, scannedBytes, visited, coverage: 'complete' as const }, maxBytes);
+      if (!cursor) return boundedStateResult(result(undefined, true), maxBytes);
+      // Reserve the complete continuation envelope before doing more work.
+      boundedStateResult(result(cursor, false), maxBytes);
     }
-    return boundedStateResult({ matches, scannedBytes, visited, coverage: 'partial' as const, cursor: resume() }, maxBytes);
+    return boundedStateResult(result(cursor, false), maxBytes);
   }
 
-  async readSessionState(ref: SessionStateItemRef, cut?: HistorySourceCut) {
-    const state = await this.selectedSessionState([ref], cut, undefined, this.options.policy.sessionStateReadBytes ?? 64 * 1024);
-    return state.items[0];
+  async readSessionState(ref: SessionStateItemRef, cut?: HistorySourceCut, maxBytes?: number) {
+    ref = sessionStateItemRefSchema.parse(ref);
+    const request = sessionStateReadSchema.parse({ ...ref, maxBytes });
+    const state = await this.selectedSessionState([ref], cut, undefined, this.resourcePolicy.sessionStateReadBytes);
+    const item = state.items[0];
+    if (!item) throw new Error('Session-state read produced no selected item.');
+    return request.maxBytes === undefined ? item : boundedStateResult(item, request.maxBytes);
   }
 
   async selectedSessionState(refs: readonly SessionStateItemRef[], cut?: HistorySourceCut,
-    staged?: SessionStateBatchCommit, maxBytes = this.options.policy.maxSourceBytes): Promise<SessionStateSnapshot> {
+    staged?: SessionStateBatchCommit, maxBytes = this.resourcePolicy.maxSourceBytes): Promise<SessionStateSnapshot> {
     refs = Object.freeze(refs.map(ref => sessionStateItemRefSchema.parse(ref)));
     cut ??= await this.history.capture();
     await this.validateStateReadBoundary(cut.throughEntryId, cut);
@@ -786,7 +888,7 @@ export class ContextService {
       if (bytes > maxBytes) throw sessionStateLimitError('state_read', maxBytes, bytes, 'Selected session-state material exceeds the bounded read limit.');
       const range = await this.options.artifacts.readVerifiedRange(revision.contentRef, { offset, length: size });
       if (range.offset !== offset || range.end !== offset + size) throw new Error('Session-state selection range is not an exact UTF-8 span.');
-      const text = new TextDecoder('utf-8', { fatal: true }).decode(range.bytes);
+      const text = decodeUtf8(range.bytes);
       sessionStateTextRange(text, 0, size);
       items.push(Object.freeze({ ...ref, text, ...(revision.sources ? { sources: revision.sources } : {}) }));
     }
@@ -800,7 +902,10 @@ export class ContextService {
     return this.selectedSessionState(window?.selection.sessionState ?? [], cut);
   }
 
-  async inspectSessionState(cut?: HistorySourceCut, maxBytes = 32 * 1024) {
+  async inspectSessionState(cut?: HistorySourceCut, maxBytes = SESSION_STATE_RETRIEVAL_LIMITS.defaultBytes): Promise<{
+    selectionId: string | null; selected: SessionStateItemRef[]; selectedCount: number;
+    selectedCoverage: 'complete' | 'partial'; stored?: import('../session/session-state.js').SessionStatePage
+  }> {
     cut ??= await this.history.capture();
     const refs = (await this.history.selectedContext(cut))?.selection.sessionState ?? [];
     const selected = [];
@@ -810,9 +915,13 @@ export class ContextService {
       if (bytes + size > Math.floor(maxBytes / 2)) break;
       selected.push(ref); bytes += size;
     }
-    return { selectionId: refs.length ? `state-view-${hashJson(refs)}` : null, selected,
-      selectedCount: refs.length, selectedCoverage: selected.length === refs.length ? 'complete' as const : 'partial' as const,
-      ...(maxBytes ? { stored: await this.listSessionState({ leafId: cut.throughEntryId, maxBytes: Math.max(1, Math.floor(maxBytes / 2)) }) } : {}) };
+    const summary = { selectionId: refs.length ? `state-view-${hashJson(refs)}` : null, selected,
+      selectedCount: refs.length, selectedCoverage: selected.length === refs.length ? 'complete' as const : 'partial' as const };
+    if (!maxBytes) return summary;
+    const remaining = maxBytes - Buffer.byteLength(JSON.stringify({ ...summary, stored: null })) + 4;
+    if (remaining < SESSION_STATE_RETRIEVAL_LIMITS.minBytes) throw sessionStateLimitError('state_result', maxBytes, maxBytes - remaining + SESSION_STATE_RETRIEVAL_LIMITS.minBytes,
+      'State inspection requires room for its summary and a minimum 512-byte inventory page. Increase maxBytes.');
+    return boundedStateResult({ ...summary, stored: await this.listSessionState({ leafId: cut.throughEntryId, maxBytes: remaining }, cut) }, maxBytes);
   }
 
   async listSelectedSessionState(request: SessionStatePageRequest = {}, authorizedCut?: HistorySourceCut) {
@@ -820,7 +929,7 @@ export class ContextService {
     let cut = authority;
     let offset = 0;
     if (request.cursor) {
-      if (request.cursor.length > 65536) throw new Error('Selected-state cursor exceeds its byte bound.');
+      if (Buffer.byteLength(request.cursor) > SESSION_STATE_RETRIEVAL_LIMITS.maxCursorBytes) throw new Error('Selected-state cursor exceeds its byte bound.');
       const cursor = selectedStateCursorSchema.parse(JSON.parse(Buffer.from(request.cursor, 'base64url').toString('utf8')));
       if (cursor.cut.sessionId !== cut.sessionId || cursor.cut.branchId !== cut.branchId) throw new Error('Selected-state cursor belongs to another branch.');
       cut = cursor.cut; offset = cursor.offset;
@@ -829,21 +938,12 @@ export class ContextService {
     await this.history.validateCut(cut);
     const refs = (await this.history.selectedContext(cut))?.selection.sessionState ?? [];
     if (offset > refs.length) throw new Error('Selected-state cursor exceeds the selected inventory.');
-    const limit = request.limit ?? 32;
-    const maxBytes = request.maxBytes ?? 32 * 1024;
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256 || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 1024 * 1024)
-      throw new Error('Invalid selected-state page allowances.');
-    const items = [];
-    let bytes = 0;
-    for (const ref of refs.slice(offset, offset + limit)) {
-      const size = Buffer.byteLength(JSON.stringify(ref));
-      if (bytes + size > maxBytes) break;
-      bytes += size; items.push(ref);
-    }
-    const next = offset + items.length;
-    if (items.length === 0 && offset < refs.length) throw new Error('Selected-state page is too small for one reference.');
-    return boundedStateResult({ items, totalCount: refs.length, coverage: next === refs.length ? 'complete' as const : 'partial' as const,
-      ...(next < refs.length ? { cursor: Buffer.from(JSON.stringify({ cut, offset: next })).toString('base64url') } : {}) }, maxBytes);
+    const { limit, maxBytes } = statePageLimits(request);
+    return fitStatePage(refs.slice(offset, offset + limit), values => {
+      const next = offset + values.length;
+      return { items: values, totalCount: refs.length, coverage: next === refs.length ? 'complete' as const : 'partial' as const,
+        ...(next < refs.length ? { cursor: Buffer.from(JSON.stringify({ cut, offset: next })).toString('base64url') } : {}) };
+    }, maxBytes);
   }
 
   async selectedArtifactContext(cut?: HistorySourceCut): Promise<readonly PromptContextItemInput[]> {
@@ -857,26 +957,25 @@ export class ContextService {
     for (const selected of refs) {
       const ref = selected.artifact;
       const stored = await this.options.artifacts.resolve(ref.artifactId);
-      if (!stored || hashJson(stored) !== hashJson(ref)) throw new Error('Selected public artifact is unavailable or changed.');
+      if (!stored || !sameArtifactIdentity(stored, ref)) throw new Error('Selected public artifact is unavailable or changed.');
       let content: string;
       if (selected.representation === 'reference') {
         content = JSON.stringify({ artifact: ref, representation: 'reference' });
         bytes += Buffer.byteLength(content);
       } else {
-        const mediaType = ref.mediaType.toLowerCase().split(';')[0]?.trim() ?? '';
-        if (!(mediaType.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript', 'application/x-ndjson', 'application/ndjson', 'application/yaml'].includes(mediaType) || mediaType.endsWith('+json') || mediaType.endsWith('+xml')))
+        if (!isTextMediaType(ref.mediaType))
           throw new Error('Artifact text representation requires a supported text media type; use reference for binary or image artifacts.');
         const offset = selected.range?.offset ?? 0;
         const size = selected.range?.bytes ?? ref.size;
         bytes += size;
-        if (bytes > this.options.policy.maxSourceBytes) throw sessionStateLimitError('artifact_preparation', this.options.policy.maxSourceBytes, bytes, 'Selected artifact material exceeds the source preparation limit.');
+        if (bytes > this.resourcePolicy.maxSourceBytes) throw sessionStateLimitError('artifact_preparation', this.resourcePolicy.maxSourceBytes, bytes, 'Selected artifact material exceeds the source preparation limit.');
         if (offset + size > ref.size) throw new Error('Artifact selection exceeds its immutable range.');
         const range = size ? await this.options.artifacts.readVerifiedRange(ref, { offset, length: size }) : undefined;
         if (range && (range.offset !== offset || range.end !== offset + size))
           throw new Error('Artifact selection range is not an exact UTF-8 span.');
-        content = new TextDecoder('utf-8', { fatal: true }).decode(range?.bytes ?? await this.options.artifacts.readVerified(ref));
+        content = decodeUtf8(range?.bytes ?? await this.options.artifacts.readVerified(ref));
       }
-      if (bytes > this.options.policy.maxSourceBytes) throw sessionStateLimitError('artifact_preparation', this.options.policy.maxSourceBytes, bytes, 'Selected artifact material exceeds the source preparation limit.');
+      if (bytes > this.resourcePolicy.maxSourceBytes) throw sessionStateLimitError('artifact_preparation', this.resourcePolicy.maxSourceBytes, bytes, 'Selected artifact material exceeds the source preparation limit.');
       items.push({ id: `artifact:${ref.artifactId}:${hashJson(selected)}`, sourceUri: `artifact://${ref.artifactId}`,
         sourceKind: 'external', representation: selected.representation === 'text' && selected.range ? 'excerpt' : 'full',
         mediaType: selected.representation === 'reference' ? 'application/json' : ref.mediaType,
@@ -901,7 +1000,7 @@ export class ContextService {
   }
 
   private capacity() {
-    return this.admission ? requestCapacity(this.admission.accounting, this.admission.continuityHeadroomTokens) : undefined;
+    return this.admission ? requestCapacity(this.admission.accounting, this.admission.continuityHeadroomTokens, this.admission.continuityHeadroomPolicy) : undefined;
   }
   async protectedSources(
     cut?: HistorySourceCut,
@@ -988,9 +1087,3 @@ const stateSearchCursorSchema = z.strictObject({ sessionId: z.string().min(1), b
   leafId: z.string().nullable(), cursor: z.string().optional() });
 
 const selectedStateCursorSchema = z.strictObject({ cut: historyCutSchema, offset: z.int().nonnegative() });
-
-function boundedStateResult<T>(result: T, maxBytes: number): T {
-  const requiredBytes = Buffer.byteLength(JSON.stringify(result));
-  if (requiredBytes > maxBytes) throw sessionStateLimitError('state_result', maxBytes, requiredBytes, `State result requires ${String(requiredBytes)} bytes including its cursor; maxBytes is ${String(maxBytes)}. Reduce the page or increase maxBytes.`);
-  return result;
-}

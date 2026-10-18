@@ -1,4 +1,4 @@
-import type { ArtifactRepository } from '@agent-core/persistence';
+import { decodeUtf8, isTextMediaType, type ArtifactRepository } from '@agent-core/persistence';
 import { artifactScope } from '../core/resources.js';
 import { defineTool } from '../core/define.js';
 import { requireToolService, ToolInputError } from '../core/context.js';
@@ -61,7 +61,7 @@ export function createReadArtifactTool(options: ReadArtifactToolOptions) {
       const contentType = classifyMediaType(artifact.mediaType);
       const text =
         contentType === 'text'
-          ? new TextDecoder('utf-8', { fatal: true }).decode(selected)
+          ? decodeUtf8(selected)
           : undefined;
       const output = {
         artifact,
@@ -124,13 +124,7 @@ function isArtifactRepository(value: unknown): value is ArtifactRepository {
 }
 
 function classifyMediaType(mediaType: string): 'text' | 'image' | 'artifact' {
-  if (
-    mediaType.startsWith('text/') ||
-    mediaType.includes('json') ||
-    mediaType.includes('xml') ||
-    mediaType.includes('javascript')
-  )
-    return 'text';
-  if (mediaType.startsWith('image/')) return 'image';
+  if (isTextMediaType(mediaType)) return 'text';
+  if (mediaType.trim().toLowerCase().startsWith('image/')) return 'image';
   return 'artifact';
 }

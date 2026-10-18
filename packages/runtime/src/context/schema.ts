@@ -36,6 +36,7 @@ export const contextSelectionSchema = z.strictObject({
 export const contextTransitionRequestSchema = z
   .strictObject({
     renewal: z.boolean().optional(),
+    outputReservation: z.int().positive().optional(),
     expectedCut: historyCutSchema.optional(),
     sessionState: sessionStateBatchCommitSchema.optional(),
     toolInvocation: z
@@ -59,6 +60,7 @@ export const contextTransitionRequestSchema = z
 export const contextWindowSchema = z
   .strictObject({
     windowId: z.string().min(1),
+    outputReservation: z.int().positive().optional(),
     parentWindowId: z.string().min(1).nullable(),
     historyPosition: historyCutSchema,
     selection: contextSelectionSchema,
@@ -69,10 +71,11 @@ export const contextWindowSchema = z
 export const contextTransitionSchema = z
   .strictObject({
     strategy: z.enum(['append', 'fresh']),
-    cause: z.enum(['state_update', 'selection_change', 'explicit_renewal', 'capacity', 'prefix_incompatibility']),
+    cause: z.enum(['state_update', 'resource_change', 'selection_change', 'explicit_renewal', 'capacity', 'prefix_incompatibility']),
     requestedRenewal: z.boolean().optional(),
+    requestedOutputReservation: z.int().positive().optional(),
     transitionId: z.string().min(1),
-    admission: z.strictObject({ status: z.literal('admitted'), compiledInputIdentity: z.string().min(1), capabilityRevision: z.string().min(1) }).readonly(),
+    admission: z.strictObject({ status: z.literal('admitted'), compiledInputIdentity: z.string().min(1), capabilityRevision: z.string().min(1), outputReservation: z.int().positive().optional() }).readonly(),
     idempotencyKey: z.string().min(1),
     previousWindowId: z.string().min(1).nullable(),
     windowId: z.string().min(1),

@@ -16,7 +16,7 @@ import {
 import { assertSessionBinding, type SessionBindingInput } from './binding.js';
 import { SessionHistorySourceError, SessionHistoryIndexPublicationError, type HistoryIndexRebuildOptions } from './history-index.js';
 import { branchNavigation, branchEntryMetadata, type BranchEntryPosition, type BranchPageSource } from './branch-page.js';
-import { sessionStateBatchStorageBytes, sessionStateItemRefSchema, validateSessionStateCommit, type SessionStateBatchCommit, type SessionStateItemRevision, type SessionStatePageRequest, type SessionStatePage } from './session-state.js';
+import { sessionStatePreviewSchema, sessionStateBatchStorageBytes, sessionStateItemRefSchema, validateSessionStateCommit, type SessionStateBatchCommit, type SessionStateItemRevision, type SessionStatePageRequest, type SessionStatePage } from './session-state.js';
 import { assertStateSelection, stateBatch, statePageLimits, stateItemMetadata, statePageResult, decodeStatePageCursor } from './state-records.js';
 import { assertSubmissionOwnership, assertSubmissionTransition, createSessionAdmission } from './submission-lifecycle.js';
 import { SessionIndexStore } from './projection-store-node.js';
@@ -34,14 +34,14 @@ const locatorSchema = z.strictObject({offset: integer, bytes: z.number().int().p
 type Locator = z.infer<typeof locatorSchema>;
 const stampSchema = z.strictObject({size: integer, mtimeMs: z.number(), ctimeMs: z.number()});
 const rootSchema = z.strictObject({
-  format: z.literal('agent-core.session-projection/9'), generation: id, lineage: z.uuid(), header: z.unknown(),
+  format: z.literal('agent-core.session-projection/10'), generation: id, lineage: z.uuid(), header: z.unknown(),
   summary: z.strictObject({id, timestamp: id, updatedAt: id, preview: z.string().max(160).optional(), provider: id.optional(), model: id.optional(), bindingSchemaId: id, bindingSchemaVersion: z.number().int().positive(), bindingSha256: hash}),
   tree: hash.nullable(), confirmedRunsRoot: hash.nullable(), leafId: id.nullable(), sourceRevision: integer, acceptedInputRevision: integer, retainedStateBytes: integer, indexedRecords: integer,
   headerBytes: z.number().int().positive().max(16 * 1024 * 1024), completeBytes: integer, lineCount: integer, marker: z.string(), stamp: stampSchema,
   queueFirst: id.nullable(), queueLast: id.nullable(), occupied: id.nullable(), queuedCount: integer, capacity: integer.nullable()
 });
 type Root = Omit<z.infer<typeof rootSchema>, 'header'> & {header: SessionHeader};
-const statePointerSchema = z.strictObject({entryId:id,itemId:id,revisionId:id,contentBytes:integer,contentSha256:hash,deleted:z.boolean()});
+const statePointerSchema = z.strictObject({entryId:id,itemId:id,revisionId:id,contentBytes:integer,contentSha256:hash,preview:sessionStatePreviewSchema.optional(),deleted:z.boolean()});
 const positionSchema = locatorSchema.extend({
   depth: integer, ancestors: z.array(id).max(53), branchId: id,
   lookupRoot: hash.nullable(), inheritedHeadsRoot: hash.nullable(), activeRunsRoot: hash.nullable(), finalizedRunsRoot: hash.nullable(), unconfirmedRunsRoot: hash.nullable(), confirmedRunsRoot: hash.nullable(),
@@ -350,10 +350,10 @@ export class JsonlBranchIndex {
         const pointer = statePointerSchema.parse(value);
         visited++;
         if (pointer.deleted) {after = key;current = await iterator.next();continue;}
-        const metadata = {itemId:pointer.itemId,revisionId:pointer.revisionId,contentBytes:pointer.contentBytes,contentSha256:pointer.contentSha256};
+        const metadata = {itemId:pointer.itemId,revisionId:pointer.revisionId,contentBytes:pointer.contentBytes,contentSha256:pointer.contentSha256,...(pointer.preview === undefined ? {} : {preview:pointer.preview})};
         if (items.length >= limit) {partial = true;break;}
         const next = await iterator.next();
-        try {statePageResult(session.id,selected,[...items,metadata],!next.done,key,maxBytes);}
+        try {if (statePageResult(session.id,selected,[...items,metadata],!next.done,key,maxBytes).items.length <= items.length) {partial = true;break;}}
         catch (error) {if (items.length === 0) throw error;partial = true;break;}
         items.push(Object.freeze(metadata));after = key;current = next;
       }
@@ -646,7 +646,7 @@ export class JsonlBranchIndex {
     await this.store.repairStorage();
     const stamp = await jsonlStorageStamp(this.filePath);
     const lineage = randomUUID();
-    const root: Root = {format: 'agent-core.session-projection/9', generation: randomUUID(), lineage, header, summary: {
+    const root: Root = {format: 'agent-core.session-projection/10', generation: randomUUID(), lineage, header, summary: {
       id: header.id, timestamp: header.timestamp, updatedAt: header.timestamp,
       ...(header.provider ? {provider: header.provider} : {}), ...(header.model ? {model: header.model} : {}),
       bindingSchemaId: header.binding.schemaId, bindingSchemaVersion: header.binding.schemaVersion, bindingSha256: header.binding.bindingSha256

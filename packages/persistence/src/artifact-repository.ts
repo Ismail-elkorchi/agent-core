@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isTextMediaType } from './text.js';
 import type { JsonObject } from '@agent-core/json';
 
 type ArtifactRefBase = Readonly<{
@@ -61,16 +62,19 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
     const bytes = new Uint8Array(input.content);
     const mediaType = input.mediaType ?? 'application/octet-stream';
     const sha256 = hashArtifactBytes(bytes);
-    const artifactId = `${prefix}${sha256}${artifactExtension(mediaType)}`;
+    const artifactId = artifactIdentity(sha256, mediaType, prefix === 'protected-' ? 'protected' : 'public');
     this.content.set(artifactId, bytes);
     const ref = freezeArtifactRef({ artifactId, sha256, size: bytes.byteLength, mediaType, visibility: prefix === 'protected-' ? 'protected' : 'public', label: safeArtifactLabel(input.label), ...(input.description ? { description: input.description } : {}) });
-    this.references.set(artifactId, ref);
+    if (!this.references.has(artifactId)) this.references.set(artifactId, ref);
     return Promise.resolve(ref);
   }
 
   readVerified(ref: ArtifactRef): Promise<Uint8Array> {
     return Promise.resolve().then(() => {
       validateArtifactRef(ref);
+      const stored = this.references.get(ref.artifactId);
+      if (!stored) throw new Error(`Unknown artifact: ${ref.artifactId}`);
+      if (!sameArtifactIdentity(stored, ref)) throw new ArtifactIntegrityError(ref.artifactId, `Artifact representation verification failed for ${ref.artifactId}.`);
       const bytes = this.content.get(ref.artifactId);
       if (!bytes) throw new Error(`Unknown artifact: ${ref.artifactId}`);
       if (bytes.byteLength !== ref.size || hashArtifactBytes(bytes) !== ref.sha256) throw new ArtifactIntegrityError(ref.artifactId, `Artifact verification failed for ${ref.artifactId}.`);
@@ -94,13 +98,14 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
 export function validateArtifactRef(value: unknown): asserts value is ArtifactRef {
   if (!isRecord(value) || typeof value.artifactId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/u.test(value.artifactId)
     || typeof value.sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(value.sha256)
-    || typeof value.size !== 'number' || !Number.isInteger(value.size) || value.size < 0
+    || typeof value.size !== 'number' || !Number.isSafeInteger(value.size) || value.size < 0
     || typeof value.mediaType !== 'string' || value.mediaType.trim().length === 0
     || (value.visibility !== 'public' && value.visibility !== 'protected')
     || (value.visibility === 'protected') !== value.artifactId.startsWith('protected-')) {
     throw new Error('Invalid artifact reference.');
   }
 }
+
 export function validatePublicArtifactRef(value: unknown): asserts value is PublicArtifactRef {
   validateArtifactRef(value);
   if (value.visibility !== 'public') throw new Error('Protected artifacts are not model-readable.');
@@ -129,18 +134,14 @@ export function artifactExtension(mediaType: string): string {
   return '.bin';
 }
 
-export function mediaTypeFromArtifactId(artifactId: string): string {
-  if (artifactId.endsWith('.png')) return 'image/png';
-  if (artifactId.endsWith('.jpg')) return 'image/jpeg';
-  if (artifactId.endsWith('.webp')) return 'image/webp';
-  if (artifactId.endsWith('.gif')) return 'image/gif';
-  if (artifactId.endsWith('.mp3')) return 'audio/mpeg';
-  if (artifactId.endsWith('.wav')) return 'audio/wav';
-  if (artifactId.endsWith('.ogg')) return 'audio/ogg';
-  if (artifactId.endsWith('.json')) return 'application/json; charset=utf-8';
-  if (artifactId.endsWith('.md')) return 'text/markdown; charset=utf-8';
-  if (artifactId.endsWith('.txt')) return 'text/plain; charset=utf-8';
-  return 'application/octet-stream';
+/** Labels and descriptions are presentation annotations, not immutable representation identity. */
+export function sameArtifactIdentity(left: ArtifactRef, right: ArtifactRef): boolean {
+  return left.artifactId === right.artifactId && left.sha256 === right.sha256 && left.size === right.size
+    && left.mediaType === right.mediaType && left.visibility === right.visibility;
+}
+export function artifactIdentity(sha256: string, mediaType: string, visibility: ArtifactRef['visibility']): string {
+  const representation = hashArtifactBytes(new TextEncoder().encode(mediaType));
+  return `${visibility === 'protected' ? 'protected-' : ''}${sha256}-${representation}${artifactExtension(mediaType)}`;
 }
 export function safeArtifactLabel(name: string): string {
   const cleaned = name.trim().replace(/[^a-zA-Z0-9._:-]+/gu, '-').replace(/^-+|-+$/gu, '');
@@ -161,9 +162,6 @@ function adjustedRange(ref: ArtifactRef, bytes: Uint8Array, offset: number, leng
   return { offset: start, end };
 }
 function isContinuation(value: number | undefined): boolean { return value !== undefined && (value & 0xc0) === 0x80; }
-function isTextMediaType(mediaType: string): boolean {
-  return mediaType.startsWith('text/') || mediaType.includes('json') || mediaType.includes('xml') || mediaType.includes('javascript');
-}
 function validateRange(input: { readonly offset: number; readonly length: number }, ref: ArtifactRef): void {
   validateArtifactRef(ref);
   if (!Number.isSafeInteger(input.offset) || input.offset < 0 || !Number.isSafeInteger(input.length) || input.length < 1) throw new Error('Artifact range must use a nonnegative offset and positive length.');

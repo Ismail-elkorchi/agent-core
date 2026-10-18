@@ -160,6 +160,29 @@ export interface CommandExecutionReport {
   readonly settlementReference?: EventReference;
 }
 
+/** Public immutable terminal metadata. Protected output references never cross this view. */
+export interface PendingCommandReport {
+  readonly processId: string;
+  readonly owner: CommandExecutionOwner;
+  readonly status: CommandExecutionStatus;
+  readonly finalizationPending: boolean;
+  readonly handoffPending: true;
+  readonly details: JsonObject;
+}
+export interface PendingCommandReportRequest {
+  readonly ownerId: string;
+  readonly after?: string;
+  readonly limit?: number;
+  readonly maxBytes?: number;
+}
+export interface PendingCommandReportPage {
+  readonly reports: readonly PendingCommandReport[];
+  readonly next: string;
+  readonly complete: boolean;
+  readonly scanned: number;
+  readonly oversized?: Readonly<{ processId: string; owner: CommandExecutionOwner; bytes: number }>;
+}
+
 /** A refusal establishes that the target command was never dispatched. */
 export type CommandStartResult =
   | Readonly<{ kind: 'not_started'; diagnostic: string }>
@@ -226,7 +249,7 @@ export interface CommandExecution {
   ): Promise<void>;
   terminate(processId: string, requester?: CommandExecutionOwner, observationSignal?: AbortSignal): Promise<CommandExecutionResult>;
   disposeOwner(ownerId: string): Promise<readonly CommandExecutionReport[]>;
-  recoveredTerminalReports(): readonly CommandExecutionReport[];
+  readPendingTerminalReports(request: PendingCommandReportRequest): Promise<PendingCommandReportPage>;
   acknowledgeTerminalReport(processId: string): Promise<void>;
   reconcile(): Promise<CommandReconciliationResult>;
   retryReconciliation(): Promise<CommandReconciliationResult>;
@@ -342,7 +365,7 @@ export function adoptCommandExecution(value: unknown): CommandExecution {
     'closeInput',
     'terminate',
     'disposeOwner',
-    'recoveredTerminalReports',
+    'readPendingTerminalReports',
     'acknowledgeTerminalReport',
     'reconcile',
     'retryReconciliation',

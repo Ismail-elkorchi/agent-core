@@ -91,8 +91,9 @@ test('native and restarted captured requests retain their entire exact prefix du
   assert.equal(first.request.messages.filter(message => message.role === 'protocol').length, 1);
   await f.inference.invoke({ ownerId: 'owner', invocationId: 'original', runId: 'run', purpose: 'test', request: logical, compiled, profile });
   const persisted = await f.inference.admittedInput('owner', 'original');
+  assert.equal(persisted.outputReservation, 500, 'Replay uses the admitted reservation rather than current host defaults.');
   const restarted = new RequestAdmission(new ModelRequestAssembler(), f.inference);
-  const replayed = await restarted.compile(persisted.request, profile, 500, persisted.presentation);
+  const replayed = await restarted.compile(persisted.request, profile, persisted.outputReservation, persisted.presentation);
   const next = await restarted.assembleControl({ original: replayed, profile, control, outputReservation: 200 });
   assert.deepEqual(next.request.messages, first.request.messages);
   assert.deepEqual(next.assembly.presentation, first.assembly.presentation);

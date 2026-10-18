@@ -17,6 +17,9 @@ import {
   type CommandExecutionOwner,
   type CommandExecutionPlanRequest,
   type CommandExecutionReport,
+  type PendingCommandReport,
+  type PendingCommandReportRequest,
+  type PendingCommandReportPage,
   type CommandExecutionReservation,
   type CommandExecutionResult,
   type CommandExecutionStatus,
@@ -169,6 +172,10 @@ export class LocalCommandExecution implements CommandExecution {
   private readonly completed = new Map<string, ManagedProcess>();
   private readonly terminalRecords = new Map<string, ProcessTerminalRecord>();
   private readonly recovered = new Map<string, CommandExecutionReport>();
+  private readonly pendingReportGeneration = randomUUID();
+  private nextPendingReportPosition = 0;
+  private readonly pendingReports = new Map<string, { positions: number[]; records: Map<number, { report: PendingCommandReport; bytes: number }> }>();
+  private readonly pendingPositions = new Map<string, { ownerId: string; position: number }>();
   private readonly recoveredEntries = new Map<string, ProcessLedgerEntry>();
   private readonly cleanupResidues = new Map<string, string>();
   private readonly limits: Required<
@@ -594,8 +601,101 @@ export class LocalCommandExecution implements CommandExecution {
     return Object.freeze(reports);
   }
 
-  recoveredTerminalReports(): readonly CommandExecutionReport[] {
-    return Object.freeze([...this.recovered.values()]);
+  async readPendingTerminalReports(request: PendingCommandReportRequest): Promise<PendingCommandReportPage> {
+    await this.ready;
+    const index = this.pendingReports.get(request.ownerId);
+    let after = -1;
+    if (request.after !== undefined) {
+      if (typeof request.after !== 'string' || request.after.length > 4096) throw new TypeError('Invalid pending report cursor.');
+      const cursor = parseJsonObject(JSON.parse(request.after));
+      if (cursor.generation !== this.pendingReportGeneration || cursor.ownerId !== request.ownerId ||
+          typeof cursor.position !== 'number' || !Number.isSafeInteger(cursor.position) || cursor.position < -1)
+        throw new Error('Pending report cursor belongs to another owner or authority generation.');
+      after = cursor.position;
+    }
+    const cursor = (position: number) => JSON.stringify({ generation: this.pendingReportGeneration, ownerId: request.ownerId, position });
+    const limit = request.limit ?? 16;
+    const maxBytes = request.maxBytes ?? 16_384;
+    if (!request.ownerId || !Number.isSafeInteger(after) || after < -1 ||
+        !Number.isSafeInteger(limit) || limit < 1 || limit > 64 ||
+        !Number.isSafeInteger(maxBytes) || maxBytes < 512 || maxBytes > 65_536)
+      throw new TypeError('Invalid pending command report bounds.');
+    const end = this.nextPendingReportPosition;
+    if (after >= end && after !== -1) throw new TypeError('Pending report cursor is outside this owner inventory.');
+    const reports: PendingCommandReport[] = [];
+    let next = after;
+    let scanned = 0;
+    const positions = index?.positions ?? [];
+    let offset = pendingPositionAfter(positions, after);
+    const page = (): PendingCommandReportPage => Object.freeze({
+      reports: Object.freeze([...reports]), next: cursor(next), complete: offset >= positions.length, scanned
+    });
+    for (; offset < positions.length && reports.length < limit; offset++) {
+      const position = positions[offset];
+      if (position === undefined) throw new Error('Pending report position is unavailable.');
+      const entry = index?.records.get(position);
+      const report = entry?.report;
+      scanned++;
+      if (!report) { next = position; continue; }
+      reports.push(report);
+      const candidate = { reports, next: cursor(position), complete: false, scanned: 64 };
+      if (entry.bytes > maxBytes || Buffer.byteLength(JSON.stringify(candidate)) > maxBytes) {
+        reports.pop();
+        if (reports.length) break;
+        const oversized = Object.freeze({ processId: report.processId, owner: report.owner,
+          bytes: entry.bytes });
+        const result = Object.freeze({ ...page(), next: cursor(position), complete: offset + 1 >= positions.length, oversized });
+        if (Buffer.byteLength(JSON.stringify(result)) > maxBytes)
+          throw new RangeError('Pending report identity exceeds the requested envelope budget.');
+        return result;
+      }
+      next = position;
+    }
+    const result = page();
+    if (Buffer.byteLength(JSON.stringify(result)) > maxBytes)
+      throw new RangeError('Pending report identity exceeds the requested envelope budget.');
+    return result;
+  }
+
+  /** Updated at settlement/reconciliation, never during request assembly. */
+  private recordPendingReport(report: CommandExecutionReport): void {
+    const { result } = report;
+    let index = this.pendingReports.get(result.owner.ownerId);
+    if (!index) {
+      index = { positions: [], records: new Map() };
+      this.pendingReports.set(result.owner.ownerId, index);
+    }
+    const existing = this.pendingPositions.get(result.processId);
+    const position = existing?.position ?? this.nextPendingReportPosition++;
+    if (!existing) index.positions.push(position);
+    this.pendingPositions.set(result.processId, { ownerId: result.owner.ownerId, position });
+    const publicReport: PendingCommandReport = Object.freeze({
+      processId: result.processId, owner: result.owner, status: result.status,
+      finalizationPending: result.finalizationPending === true, handoffPending: true,
+      details: parseJsonObject({
+        cursorEnd: result.cursorEnd,
+        ...(report.terminalOutput ? { terminalOutput: report.terminalOutput } : {}),
+        ...(report.terminalDiagnostic === undefined ? {} : { terminalDiagnostic: report.terminalDiagnostic }),
+        ...(result.diagnostic === undefined ? {} : { recoveryDiagnostic: result.diagnostic }),
+        ...(result.artifact === undefined ? {} : { artifact: result.artifact }),
+        ...(result.originalOutput === undefined ? {} : { originalOutput: result.originalOutput }),
+        ...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
+        ...(result.signal === undefined ? {} : { signal: result.signal })
+      })
+    });
+    index.records.set(position, { report: publicReport, bytes: Buffer.byteLength(JSON.stringify(publicReport)) });
+  }
+
+  private forgetPendingReport(processId: string): void {
+    const position = this.pendingPositions.get(processId);
+    if (!position) return;
+    const index = this.pendingReports.get(position.ownerId);
+    index?.records.delete(position.position);
+    if (index) {
+      index.positions.splice(pendingPositionAfter(index.positions, position.position - 1), 1);
+      if (index.positions.length === 0) this.pendingReports.delete(position.ownerId);
+    }
+    this.pendingPositions.delete(processId);
   }
 
   /** Call only after resource.released persistence succeeds or another durable handoff exists. */
@@ -604,18 +704,20 @@ export class LocalCommandExecution implements CommandExecution {
     const record = this.completed.get(processId);
     if (record && !(await this.readTerminalRecord(processId)))
       await this.persistTerminalRecord(record, await this.finalArtifacts(record));
-    if (record) record.terminalReported = true;
     try {
       await this.markLedgerTerminalReported(processId);
-      await this.removeLedger(processId);
+      if (record) record.terminalReported = true;
+      this.forgetPendingReport(processId);
       this.recovered.delete(processId);
       this.recoveredEntries.delete(processId);
+      await this.removeLedger(processId);
       this.cleanupResidues.delete(processId);
     } catch (error) {
       this.cleanupResidues.set(
         processId,
         `Process terminal ledger cleanup residue: ${errorMessage(error)}`
       );
+      if (this.pendingPositions.has(processId)) throw error;
     }
   }
 
@@ -906,6 +1008,7 @@ export class LocalCommandExecution implements CommandExecution {
       ...(receipt === undefined ? {} : terminalFacts(receipt)),
       ...(artifacts.protectedArtifact === undefined ? {} : { protectedArtifact: artifacts.protectedArtifact })
     });
+    this.recordPendingReport(report);
     if (receipt !== undefined) await this.handoffTerminalReport(report);
     record.retention ??= setTimeout(() => {
       void this.expire(record.id).catch((error: unknown) => {
@@ -920,7 +1023,7 @@ export class LocalCommandExecution implements CommandExecution {
   }
 
   private async handoffTerminalReport(report: CommandExecutionReport): Promise<void> {
-    if (!this.options.commitTerminalReport) return;
+    if (!this.options.commitTerminalReport || report.result.finalizationPending) return;
     try {
       await this.options.commitTerminalReport(report);
       await this.acknowledgeTerminalReport(report.result.processId);
@@ -930,6 +1033,11 @@ export class LocalCommandExecution implements CommandExecution {
   }
 
   private async deliverRecoveredReports(): Promise<void> {
+    for (const record of this.completed.values()) {
+      if (record.terminalReported) continue;
+      const report = await this.finish(record);
+      if (this.pendingPositions.has(record.id)) await this.handoffTerminalReport(report);
+    }
     for (const report of this.recovered.values()) await this.handoffTerminalReport(report);
   }
 
@@ -1113,6 +1221,7 @@ export class LocalCommandExecution implements CommandExecution {
         } else {
           const report = this.recovered.get(processId) ?? await this.recoverTerminalReport(entry, terminal, stopped);
           this.recovered.set(processId, report);
+          this.recordPendingReport(report);
           this.recoveredEntries.set(processId, entry);
         }
         this.resourceLeases.releaseResource(processId);
@@ -1576,4 +1685,18 @@ function terminalFacts(receipt: ProcessTerminalRecord) {
     }),
     ...(receipt.diagnostic === undefined ? {} : { terminalDiagnostic: receipt.diagnostic })
   });
+}
+
+/** Binary search over only active positions; acknowledged entries leave no tombstones. */
+function pendingPositionAfter(positions: readonly number[], after: number): number {
+  let low = 0;
+  let high = positions.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    const position = positions[middle];
+    if (position === undefined) throw new Error('Pending report index is incomplete.');
+    if (position <= after) low = middle + 1;
+    else high = middle;
+  }
+  return low;
 }

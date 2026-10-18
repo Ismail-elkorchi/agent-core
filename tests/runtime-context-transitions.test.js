@@ -39,7 +39,7 @@ function profile(capacity) {
     supportedParameters: ['maxOutputTokens', 'tools', 'temperature']
   };
 }
-async function fixture() {
+async function fixture({ maxSourceBytes = 4 * 1024 * 1024 } = {}) {
   const sessions = new InMemorySessionRepository();
   const session = await sessions.create({
     binding: { schemaId: 'tests/context', schemaVersion: 1, subject: {} }
@@ -47,7 +47,7 @@ async function fixture() {
   const events = new InMemoryEventRepository(agentEventCodec);
   const artifacts = new InMemoryArtifactRepository();
   const history = new HistoryReader({ repository: sessions, session, events, artifacts });
-  const policy = { maxSourceBytes: 4 * 1024 * 1024, historyRead: { history, isAvailable: () => true } };
+  const policy = { maxSourceBytes, historyRead: { history, isAvailable: () => true } };
   const context = new ContextService({
     artifacts,
     repository: sessions,
@@ -101,9 +101,6 @@ async function fixture() {
     options,
     setCapacity(value) {
       capacity = value;
-    },
-    setSourceCapacity(value) {
-      policy.maxSourceBytes = value;
     }
   };
 }
@@ -446,7 +443,15 @@ test('a short conversation cannot waive retained-generation checkpoint capacity'
     describeModel: async () => ({
       ...profile(32768),
       limits: { contextTokens: 32768, outputTokens: 16384 }
-    })
+    }),
+    async compileRequest(request) {
+      // This is an admission-arithmetic test, independent of evolving tool-schema text.
+      // Ordinary input fits both allowances; retaining the larger generation does not.
+      const { signal: _signal, ...body } = request;
+      const control = request.messages.some(message => message.content.includes('Prepare a fresh context for the same ongoing work'));
+      return compileModelRequest({ request, body, profile: await this.describeModel(),
+        endpoint: 'fixture://retained-generation-reserve', providerInputTokens: control ? 12000 : 10000 });
+    }
   };
   const inferenceService = new InferenceService({ provider, artifacts: state.options.repositories.artifacts,
     repository: new InMemoryInferenceRepository() });
@@ -934,15 +939,17 @@ for (const fault of ['before_confirmation', 'lost_confirmation_receipt']) {
 }
 
 test('a later rejected proposal cannot erase a committed source-capacity repair', async () => {
-  const f = await fixture();
+  const f = await fixture({ maxSourceBytes: 120000 });
   const seed = await new AgentRuntime(f.options).run({ task: 'Old oversized source: ' + 'x'.repeat(100000) }).result;
   assert.equal(seed.terminal.executionStatus, 'completed');
   let turns = 0;
   f.provider.complete = async request => {
     f.requests.push(request);
     if (++turns === 1) {
-      f.setSourceCapacity(12000);
-      return { provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
+      await f.context.assertSourceCapacity();
+      // This committed assistant source crosses the fixed bound with old history;
+      // the current exchange alone fits after the first proposal repairs it.
+      return { provider: 'fixture', model: 'context', content: 'New source: ' + 'y'.repeat(50000), terminationReason: 'tool_calls',
         toolCalls: ['first-repair', 'second-stale'].map(id => ({ id, type: 'function', name: 'context_transition',
           input: { kind: 'json', value: { reason: id, retain: [] } } })) };
     }
@@ -957,6 +964,7 @@ test('a later rejected proposal cannot erase a committed source-capacity repair'
   const events = await Array.fromAsync(f.events.read(runId));
   assert.equal(events.filter(entry => entry.event.type === 'context.transition.rejected').length, 1);
   await f.context.assertSourceCapacity();
+  assert.equal(f.context.resourcePolicy.maxSourceBytes, 120000);
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(turns, 2);
 });
@@ -1336,3 +1344,36 @@ for (const code of ['session_state_conflict', 'session_state_limit']) {
     assert.equal((await f.sessions.loadReplayState(f.session)).branch.filter(entry => entry.type === 'context_transition').length, 1);
   });
 }
+
+test('admitted transition candidate rejected before publication does not replace the live admitted inspection', async () => {
+  const f = await fixture();
+  const transition = f.context.transition.bind(f.context);
+  let rejectedCandidate = false;
+  f.context.transition = (request, options) => transition(request, { ...options,
+    admit: async input => {
+      const before = f.context.admittedCapabilities();
+      assert.ok(before, 'The originating invocation must already have admitted inspection evidence.');
+      await options.admit(input);
+      assert.deepEqual(f.context.admittedCapabilities(), before,
+        'Compiling and admitting a candidate must not publish its inspection before the source/commit fence.');
+      rejectedCandidate = true;
+      throw new Error('Simulated source fence changed after candidate admission.');
+    }
+  });
+  let turns = 0;
+  f.provider.complete = async request => {
+    f.requests.push(request);
+    if (++turns === 1) return { provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
+      toolCalls: [{ id: 'candidate', type: 'function', name: 'context_save_and_activate', input: { kind: 'json',
+        value: { reason: 'Stage an interpretation.', operations: [{ kind: 'create', text: 'Rejected candidate.' }] } } }] };
+    return { provider: 'fixture', model: 'context', content: 'Preserved the committed view.', terminationReason: 'stop' };
+  };
+  const runtime = new AgentRuntime({ ...f.options, inferenceOwnerId: 'inspection-publication-owner' });
+  try {
+    const result = await runtime.run({ runId: 'inspection-publication-fence', task: 'Preserve publication truth.' }).result;
+    assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+    assert.ok(rejectedCandidate);
+    assert.equal((await f.context.inspect()).window, null);
+    assert.equal((await runtime.inspectOperational()).lastAdmittedRequest.invocation.status, 'settled');
+  } finally { await runtime.close(); }
+});

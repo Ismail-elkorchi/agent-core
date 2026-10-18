@@ -86,3 +86,7 @@ export { commitResourceRelease } from './orchestration/resource-settlement.js';
 export * from './run/capabilities.js';
 
 export { SessionReadLifetime } from './session/read-lifetime.js';
+
+export * from "./session/operational.js";
+
+export { createResourceReportTool, readPendingResourceReports, readResourceReleaseReports } from './orchestration/resource-reports.js';
