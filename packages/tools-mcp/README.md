@@ -79,9 +79,18 @@ The `/node` subpath provides bounded `createMcpHttpTransport` and
 `createMcpStdioTransport`. HTTP requires HTTPS (explicitly allowed loopback HTTP
 is supported), refuses redirects, does not refresh credentials or create OAuth
 grants, and does not reconnect/retry a dispatched call. Stdio starts only a
-host-specified executable without a shell, with a required absolute working
-directory and explicit environment. SDK-inherited environment values are
-cleared unless the host supplies them. Remote tools cannot select executables.
+host-specified absolute executable path without implicit shell or `PATH` lookup,
+with a required absolute working directory and explicit environment. On Windows,
+the command must be a readable `.exe` or `.com` file without a shebang; `.cmd`,
+`.bat` and other script wrappers are rejected. Use an absolute Node executable
+(for example `process.execPath`) with the server script in `args`. An explicitly
+selected shell executable such as `cmd.exe` remains host-granted authority.
+SDK-inherited environment values are
+cleared unless the host supplies them, except Windows `SYSTEMROOT`, `SYSTEMDRIVE`
+and `WINDIR` installation paths required for process startup. Ambient `PATH`,
+home/profile values and credentials are not inherited. Windows environment names
+are normalized case-insensitively, and ambiguous duplicate names are rejected.
+Remote tools cannot select executables.
 
 `parseMcpConfiguration(parsedJson)` validates a serializable, HTTP-only host
 configuration. `createConfiguredMcpSources(config, { artifacts, environment, allowedRisks })`

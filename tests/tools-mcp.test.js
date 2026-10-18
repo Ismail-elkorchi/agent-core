@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { McpToolSource, MCP_PROTOCOL_VERSION } from '@agent-core/tools-mcp';
 import { createMcpHttpTransport, createMcpStdioTransport, parseMcpConfiguration, createConfiguredMcpSources } from '@agent-core/tools-mcp/node';
 import { InMemoryArtifactRepository } from '@agent-core/persistence';
@@ -298,6 +301,9 @@ test('MCP malformed result and protocol rejection stay separate from internal-se
 });
 
 test('MCP explicit stdio construction uses the modern SDK with bounded framing and an owned environment', async t => {
+  const previous = process.env.MCP_AMBIENT_SECRET;
+  process.env.MCP_AMBIENT_SECRET = 'test-only-ambient-secret';
+  t.after(() => { if (previous === undefined) delete process.env.MCP_AMBIENT_SECRET; else process.env.MCP_AMBIENT_SECRET = previous; });
   const transport = createMcpStdioTransport({ command: process.execPath, args: ['tests/mcp-stdio-fixture.mjs'],
     cwd: process.cwd(), env: { MCP_FIXTURE_ENV: 'explicit-value' }, limits: { maxMessageBytes: 32_000 } });
   const source = sourceFor(transport, { limits: { requestTimeoutMs: 2000 } }); t.after(() => source.close());
@@ -306,6 +312,50 @@ test('MCP explicit stdio construction uses the modern SDK with bounded framing a
   assert.equal(result.output.structuredContent.value, 'x');
   assert.equal(result.output.structuredContent.explicit, 'explicit-value');
   assert.equal(result.output.structuredContent.ambientHome, '');
+  assert.equal(result.output.structuredContent.ambientSecretPresent, false);
+  const environment = result.output.structuredContent.environment;
+  for (const name of ['PATH', 'USERPROFILE', 'USERDOMAIN', 'LOGONSERVER']) assert.equal(environment[name], '', name);
+  if (process.platform === 'win32') {
+    assert.ok(environment.SYSTEMROOT, 'Windows bootstrap keeps its installation root');
+    for (const name of ['SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR']) assert.equal(environment[name], process.env[name] ?? '', name);
+  }
+});
+
+test('MCP stdio captures explicit environment overrides with platform-correct name identity', async t => {
+  const env = { MCP_FIXTURE_ENV: 'before-mutation', [process.platform === 'win32' ? 'Path' : 'PATH']: 'explicit-host-search-path',
+    ['__proto__']: 'explicit-special-value' };
+  if (process.platform === 'win32') env.SystemRoot = process.env.SYSTEMROOT;
+  const transport = createMcpStdioTransport({ command: process.execPath, args: ['tests/mcp-stdio-fixture.mjs'],
+    cwd: process.cwd(), env });
+  env.MCP_FIXTURE_ENV = 'after-mutation';
+  const source = sourceFor(transport, { limits: { requestTimeoutMs: 2000 } }); t.after(() => source.close());
+  const result = await call(source);
+  assert.equal(result.kind, 'result');
+  assert.equal(result.output.structuredContent.explicit, 'before-mutation');
+  assert.equal(result.output.structuredContent.specialEnvironmentName, 'explicit-special-value');
+  assert.equal(result.output.structuredContent.environment.PATH, 'explicit-host-search-path');
+  if (process.platform === 'win32') {
+    assert.equal(result.output.structuredContent.environment.SYSTEMROOT, process.env.SYSTEMROOT);
+    assert.throws(() => createMcpStdioTransport({ command: process.execPath, cwd: process.cwd(), env: { Path: 'one', PATH: 'two' } }), /duplicate case-insensitive/);
+    assert.throws(() => createMcpStdioTransport({ command: process.execPath, cwd: process.cwd(), env: { SystemRoot: '' } }), /SYSTEMROOT/);
+  }
+});
+
+test('MCP stdio requires an absolute executable and rejects implicit Windows shell wrappers', async t => {
+  for (const command of ['node', 'node.exe', './node', 'relative/server'])
+    assert.throws(() => createMcpStdioTransport({ command, cwd: process.cwd(), env: {} }), /absolute executable/);
+  assert.throws(() => createMcpStdioTransport({ command: process.execPath, cwd: 'relative', env: {} }), /absolute executable/);
+  if (process.platform === 'win32') {
+    for (const name of ['server.cmd', 'server.bat', 'server.ps1', 'server.js'])
+      assert.throws(() => createMcpStdioTransport({ command: path.join(process.cwd(), name), cwd: process.cwd(), env: {} }), /explicit .exe or .com/);
+    const directory = await mkdtemp(path.join(tmpdir(), 'mcp-stdio-executable-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const wrapper = path.join(directory, 'wrapper.exe');
+    await writeFile(wrapper, '#!/usr/bin/env node\n');
+    assert.throws(() => createMcpStdioTransport({ command: wrapper, cwd: process.cwd(), env: {} }), /without a shebang wrapper/);
+    assert.throws(() => createMcpStdioTransport({ command: path.join(directory, 'missing.exe'), cwd: process.cwd(), env: {} }), /readable executable/);
+    assert.doesNotThrow(() => createMcpStdioTransport({ command: path.join(process.env.SYSTEMROOT, 'System32', 'cmd.exe'), cwd: process.cwd(), env: {} }));
+  }
 });
 
 

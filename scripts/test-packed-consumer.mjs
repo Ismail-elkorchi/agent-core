@@ -188,7 +188,7 @@ const sourceOptions: McpToolSourceOptions = { id: 'source', binding, createTrans
 const source: ToolCatalogSource = new McpToolSource(sourceOptions);
 const catalog = new ToolCatalog({ tools: [tool], sources: [source] });
 const httpOptions: McpHttpTransportOptions = { endpoint: 'https://example.invalid/mcp', limits: mcpLimits, headers: () => ({ 'x-client': 'packed' }) };
-const stdioOptions: McpStdioTransportOptions = { command: 'mcp-server', args: [], cwd: '/tmp', env: {}, limits: mcpLimits };
+const stdioOptions: McpStdioTransportOptions = { command: process.execPath, args: [], cwd: process.cwd(), env: {}, limits: mcpLimits };
 const http = createMcpHttpTransport(httpOptions);
 const stdio = createMcpStdioTransport(stdioOptions);
 const mcpConfiguration: NodeMcpConfiguration = parseMcpConfiguration({ servers: [] });

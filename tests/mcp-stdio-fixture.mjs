@@ -13,7 +13,11 @@ for await (const line of input) {
   };
   else if (request.method === 'tools/call') result = {
     content: [], structuredContent: { value: request.params.arguments.value,
-      explicit: process.env.MCP_FIXTURE_ENV, ambientHome: process.env.HOME ?? '' }
+      explicit: process.env.MCP_FIXTURE_ENV, ambientHome: process.env.HOME ?? '',
+      ambientSecretPresent: process.env.MCP_AMBIENT_SECRET !== undefined,
+      specialEnvironmentName: typeof process.env.__proto__ === 'string' ? process.env.__proto__ : '',
+      environment: Object.fromEntries(['SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'PATH', 'USERPROFILE', 'USERDOMAIN', 'LOGONSERVER']
+        .map(name => [name, process.env[name] ?? ''])) }
   };
   else result = { content: [], isError: true };
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { resultType: 'complete', ...result } }) + '\n');
