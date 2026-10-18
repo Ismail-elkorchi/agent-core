@@ -973,7 +973,7 @@ for (const recordKind of ['current', 'incompatible']) {
     const files = RootedFileAuthority.adopt(root);
     const artifacts = new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') });
     const commands = new LocalCommandExecution({ rootedFileAuthority: files,
-      artifactRepository: artifacts, ledgerDirectory });
+      artifactRepository: artifacts, ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
     const host = createLocalToolHost({
       artifactReadMaxBytes: 2_000_000,
       rootedFileAuthority: files,
@@ -1102,6 +1102,7 @@ test('local host durably hands recovered terminal reports to old runs during sta
   const artifacts = new LocalArtifactRepository({ rootDir: path.join(root, 'host-artifacts') });
   const commands = new LocalCommandExecution({
     rootedFileAuthority: files, artifactRepository: artifacts,
+    ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process,
     ledgerDirectory: path.join(root, 'processes'),
     async commitTerminalReport(report) { delivered.push(report); }
   });
@@ -1279,8 +1280,10 @@ test('an output receipt write failure cannot erase a known terminal outcome', as
   const files = testRootedFileAuthority(root);
   const ledgerDirectory = path.join(root, 'processes');
   let blockedPath;
+  const delivered = [];
   const manager = new LocalCommandExecution({ artifactRepository: new InMemoryArtifactRepository(),
     rootedFileAuthority: files, ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process,
+    async commitTerminalReport(report) { delivered.push(report); },
     async onSupervisorCheckpoint(checkpoint, processId) {
       if (checkpoint !== 'ledger_persisted' || blockedPath) return;
       blockedPath = path.join(ledgerDirectory, `${processId}.terminal.json`);
@@ -1293,11 +1296,26 @@ test('an output receipt write failure cannot erase a known terminal outcome', as
   assert.equal(result.status, 'exited');
   assert.equal(result.exitCode, 0);
   assert.match(result.diagnostic, /terminal record storage failed/);
+  assert.equal(result.finalizationPending, true);
   const [report] = await manager.disposeOwner(invocation.ownerId);
   assert.equal(report.result.status, 'exited');
+  assert.equal(report.result.finalizationPending, true);
+  assert.equal(report.terminalOutput, undefined);
+  assert.equal(delivered.length, 0, 'undurable terminal reports cannot cross the handoff boundary');
   const next = await startSettledCommand(manager, request);
   assert.equal(next.status, 'exited');
   await rm(blockedPath, { recursive: true });
+  const repaired = await manager.query(result.processId, 100, 0, 0, invocation);
+  assert.equal(repaired.status, 'exited');
+  assert.equal(repaired.exitCode, 0);
+  assert.equal(repaired.finalizationPending, undefined);
+  const repairedReport = delivered.find(({ result: item }) => item.processId === result.processId);
+  assert.equal(repairedReport.terminalOutput.combined.observedBytes, 6);
+  assert.equal(repairedReport.terminalOutput.combined.capturedBytes, 6);
+  assert.match(repairedReport.terminalDiagnostic, /terminal record storage failed/);
+  const repeated = await manager.query(result.processId, 100, 0, 0, invocation);
+  assert.equal(repeated.finalizationPending, undefined);
+  assert.equal(delivered.filter(({ result: item }) => item.processId === result.processId).length, 1);
   await manager.acknowledgeTerminalReport(result.processId);
   await manager.acknowledgeTerminalReport(next.processId);
 });

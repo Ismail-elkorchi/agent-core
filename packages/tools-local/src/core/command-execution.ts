@@ -447,7 +447,7 @@ export class LocalCommandExecution implements CommandExecution {
     // still add diagnostics, and the terminal report handoff must finish first.
     if (record.status !== 'running') {
       const report = await this.observeFinalization(this.finish(record), observationSignal);
-      return this.processResult(record, outputTokenBudget, afterCursor, report?.result.artifact, report === undefined);
+      return this.processResult(record, outputTokenBudget, afterCursor, report?.result.artifact, report === undefined || report.result.finalizationPending === true);
     }
     return this.processResult(record, outputTokenBudget, afterCursor);
   }
@@ -890,8 +890,9 @@ export class LocalCommandExecution implements CommandExecution {
     record.lease?.release();
     this.signalActivity(record);
     const artifacts = await this.finalArtifacts(record);
+    let receipt: ProcessTerminalRecord | undefined;
     try {
-      await this.persistTerminalRecord(record, artifacts);
+      receipt = await this.persistTerminalRecord(record, artifacts);
     } catch (error) {
       record.diagnostic = appendDiagnostic(record.diagnostic, `Process terminal record storage failed: ${errorMessage(error)}`);
     }
@@ -900,13 +901,12 @@ export class LocalCommandExecution implements CommandExecution {
     } catch (error) {
       record.diagnostic = appendDiagnostic(record.diagnostic, `Process terminal metadata storage failed: ${errorMessage(error)}`);
     }
-    const receipt = await this.readTerminalRecord(record.id);
     const result = this.processResult(record, 4_000, 0, artifacts.publicArtifact, receipt === undefined);
     const report = Object.freeze({ result,
       ...(receipt === undefined ? {} : terminalFacts(receipt)),
       ...(artifacts.protectedArtifact === undefined ? {} : { protectedArtifact: artifacts.protectedArtifact })
     });
-    await this.handoffTerminalReport(report);
+    if (receipt !== undefined) await this.handoffTerminalReport(report);
     record.retention ??= setTimeout(() => {
       void this.expire(record.id).catch((error: unknown) => {
         record.diagnostic = appendDiagnostic(
@@ -1206,7 +1206,7 @@ export class LocalCommandExecution implements CommandExecution {
     else this.terminalRecords.set(record.processId, record);
   }
 
-  private async persistTerminalRecord(record: ManagedProcess, artifacts: ProcessArtifacts): Promise<void> {
+  private async persistTerminalRecord(record: ManagedProcess, artifacts: ProcessArtifacts): Promise<ProcessTerminalRecord> {
     const chunks = record.capture.chunks();
     const captured = (stream: LocalOutputStream) => chunks.filter((chunk) => chunk.stream === stream).reduce((sum, chunk) => sum + chunk.bytes, 0);
     const receipt: ProcessTerminalRecord = {
@@ -1227,6 +1227,7 @@ export class LocalCommandExecution implements CommandExecution {
       ...(record.diagnostic === undefined ? {} : { diagnostic: record.diagnostic })
     };
     await this.storeTerminalRecord(receipt);
+    return receipt;
   }
 
   private async persistJsonRecord(target: string, value: unknown): Promise<void> {
