@@ -13,6 +13,25 @@ import {
   withPersistenceFileLock
 } from '@agent-core/persistence/node';
 
+test('long-root ownership preserves exclusion, release and reacquisition beyond MAX_PATH', async (t) => {
+  const directory = await fs.mkdtemp(path.join(tmpdir(), 'lock-long-root-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const root = path.join(directory, ...Array.from({ length: 4 }, (_, index) => `${index}-${'nested'.repeat(12)}`));
+  const file = path.join(root, 'events.jsonl');
+  assert.ok(`${file}.lock.pending-XXXXXX`.length > 300);
+  const owner = await tryAcquirePersistenceFileLock(file);
+  assert.ok(owner);
+  await owner.assertOwned();
+  assert.equal(await tryAcquirePersistenceFileLock(file), undefined);
+  await owner.release();
+  assert.deepEqual(await fs.readdir(root), []);
+  const replacement = await tryAcquirePersistenceFileLock(file);
+  assert.ok(replacement);
+  await replacement.assertOwned();
+  await replacement.release();
+  assert.deepEqual(await fs.readdir(root), []);
+});
+
 test('same-process writers wait in order without spending the external lock timeout', async (t) => {
   const directory = await fs.mkdtemp(path.join(tmpdir(), 'persistence-lock-order-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));

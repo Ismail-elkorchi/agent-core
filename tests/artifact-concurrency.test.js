@@ -16,6 +16,24 @@ const bodyPath = (directory, ref) => path.join(directory, ...(ref.visibility ===
 const identity = stat => [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs, stat.mode];
 
 for (const visibility of ['public', 'protected']) {
+  test(`${visibility}: long-root publication and reopened verification preserve immutable storage`, async t => {
+    const directory = await fs.mkdtemp(path.join(tmpdir(), 'artifact-long-root-'));
+    t.after(() => fs.rm(directory, { recursive: true, force: true }));
+    const root = path.join(directory, ...Array.from({ length: 3 }, (_, index) => `${index}-${'nested'.repeat(12)}`));
+    const original = await store(new LocalArtifactRepository(root), visibility);
+    const target = bodyPath(root, original);
+    assert.ok(target.length > 300);
+    const before = identity(await fs.stat(target, { bigint: true }));
+    const reopened = new LocalArtifactRepository(root);
+    const repeated = await store(reopened, visibility, { ...input, label: 'reopened' });
+    assert.equal(repeated.artifactId, original.artifactId);
+    assert.deepEqual(identity(await fs.stat(target, { bigint: true })), before);
+    assert.deepEqual(Buffer.from(await reopened.readVerified(original)), content);
+    assert.deepEqual(Buffer.from((await reopened.readVerifiedRange(original, { offset: 0, length: 9 })).bytes), content.subarray(0, 9));
+    assert.deepEqual(await reopened.resolve(original.artifactId), visibility === 'public' ? original : undefined);
+    assert.deepEqual(await fs.readdir(path.join(root, '.locks')), []);
+  });
+
   for (const readKind of ['full', 'range', 'cached range']) {
     test(`${visibility}: identical concurrent stores preserve an in-flight ${readKind} verification`, async t => {
       const directory = await fs.mkdtemp(path.join(tmpdir(), 'artifact-concurrent-read-'));

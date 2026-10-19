@@ -283,6 +283,8 @@ const agent = new AgentRuntime({ maxOutputTokens: 64,
 if (mode === 'suspend') {
   const result = await agent.run({ task: 'crash after approved effect with unknown recovery' })
     .result;
+  if (result.state !== 'suspended' || result.reason !== 'approval_required' || result.pendingApprovals.length === 0)
+    throw new Error(`Expected the initial approval suspension; received ${JSON.stringify(result)}`);
   const approval = result.pendingApprovals[0];
   process.stdout.write(
     JSON.stringify({

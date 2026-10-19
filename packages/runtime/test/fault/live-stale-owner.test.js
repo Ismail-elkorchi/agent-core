@@ -34,7 +34,8 @@ for (const mode of modes) {
         const runMessage = initialMessages.find((message) => message.type === 'run');
         const checkpoint = initialMessages.find((message) => message.type === 'checkpoint');
         assert.ok(runMessage);
-        assert.deepEqual(checkpoint, { type: 'checkpoint', checkpoint: mode });
+        assert.deepEqual(checkpoint, { type: 'checkpoint', checkpoint: mode },
+          `Old driver did not reach its checkpoint: ${JSON.stringify({ initialMessages, stderr })}`);
 
         const replacement = createLiveDriverRuntime({ root, mode, role: 'replacement' });
         const firstRecovery = await replacement.resume(runMessage.runId).result;

@@ -1947,7 +1947,9 @@ export async function tryAcquirePersistenceFileLock(
     return undefined;
   await ensurePrivateDirectory(path.dirname(lockPath));
   options.signal?.throwIfAborted();
-  const preparedPath = await fs.mkdtemp(`${lockPath}.pending-`);
+  // Unlike open/mkdir/rename, Node's mkdtemp binding does not namespace Windows
+  // paths. Qualify this private candidate path before crossing that boundary.
+  const preparedPath = await fs.mkdtemp(path.toNamespacedPath(`${lockPath}.pending-`));
   const token = randomUUID();
   const owner: PersistenceFileLockOwner = { pid: process.pid, token };
   let published = false;

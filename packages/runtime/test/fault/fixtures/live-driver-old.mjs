@@ -17,7 +17,8 @@ const control = runtime.run({ task: `exercise ${mode} stale-owner recovery` });
 process.stdout.write(`${JSON.stringify({ type: 'run', runId: control.runId })}\n`);
 try {
   const result = await control.result;
-  process.stdout.write(`${JSON.stringify({ type: 'result', state: result.state })}\n`);
+  process.stdout.write(`${JSON.stringify({ type: 'result', state: result.state, result })}\n`);
 } catch (error) {
-  process.stdout.write(`${JSON.stringify({ type: 'error', message: error instanceof Error ? error.message : String(error) })}\n`);
+  process.stdout.write(`${JSON.stringify({ type: 'error', message: error instanceof Error ? error.message : String(error),
+    ...(error instanceof Error ? { stack: error.stack } : {}) })}\n`);
 }
