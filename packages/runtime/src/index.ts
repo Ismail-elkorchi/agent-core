@@ -125,7 +125,7 @@ export type {
   CollaborationRepository, CollaborationEvent, CollaborationHostOwnership,
   CollaborationHostRequest, CollaborationLifetimeLock
 } from './collaboration/repository.js';
-export { createCollaborationTools, createCollaborationToolHost } from './collaboration/tools.js';
+export { createCollaborationTools, createCollaborationToolHost, createCollaborationToolSource } from './collaboration/tools.js';
 export type { CollaborationToolHost, CollaborationToolHostOptions, CollaborationProfile } from './collaboration/tools.js';
 
 export { createCollaborationPeerDelivery } from './collaboration/peer-host.js';
