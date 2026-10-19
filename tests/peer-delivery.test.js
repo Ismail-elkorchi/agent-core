@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import * as z from 'zod';
+import { defineTool } from '@agent-core/tools';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import { JsonlEventRepository } from '@agent-core/persistence/node';
 import { conservativeProtocolCapabilities } from '@agent-core/model';
@@ -13,6 +15,57 @@ const binding = { schemaId: 'peer-delivery-test', schemaVersion: 1, subject: {} 
 function contribution(content = 'Model-authored finding 😀', deliveryId = 'delivery') {
   const body = { deliveryId, groupId: 'group', sender: { participantId: 'sender', sessionId: 'sender-session' }, recipient: { participantId: 'recipient', sessionId: 'recipient-session' }, assignmentId: 'assignment', assignmentRevision: 1, senderRunId: 'sender-run', correctionEpoch: 0, content, shares: [] };
   return { ...body, fingerprint: peerContributionFingerprint(body) };
+}
+for (const { precedingToolTurns, importDuringTool } of [
+  { precedingToolTurns: 0, importDuringTool: false },
+  { precedingToolTurns: 1, importDuringTool: false },
+  { precedingToolTurns: 1, importDuringTool: true }
+]) {
+  test(`peer access revoked after admission fences dispatch after ${precedingToolTurns} own tool turns (late import: ${importDuringTool})`, async t => {
+    const sessions = new InMemorySessionRepository();
+    const session = await sessions.create({ id: 'recipient-session', binding });
+    let peer = importDuringTool ? undefined : await sessions.appendPeerContribution(session, contribution());
+    const events = new InMemoryEventRepository(agentEventCodec);
+    const artifacts = new InMemoryArtifactRepository();
+    let authorized = true, admissions = 0, rejectedChecks = 0, orders = 0;
+    let ordersAtFirstAdmission, ordersAtRevocation;
+    const history = new HistoryReader({ repository: sessions, session, events, artifacts,
+      authorizePeerContribution: async (entry, stage) => {
+        assert.equal(entry.id, peer.id);
+        if (!authorized) { assert.equal(stage, 'admit'); rejectedChecks++; throw new Error('Peer source grant revoked at admission'); }
+      } });
+    const order = history.orderEntries.bind(history);
+    t.mock.method(history, 'orderEntries', async (...args) => { orders++; return order(...args); });
+    const context = new ContextService({ repository: sessions, session, history, artifacts, policy: { maxSourceBytes: 4 * 1024 * 1024 } });
+    const fixture = collaborationProvider([{
+      content: '', terminationReason: 'tool_calls',
+      toolCalls: [{ id: 'lookup', name: 'lookup', type: 'function', input: { kind: 'json', value: {} } }]
+    }, {}]);
+    const lookup = defineTool({ name: 'lookup', implementationId: 'tests/lookup@1', description: 'Read evidence.',
+      schema: z.strictObject({}), outputSchema: z.strictObject({}), canonicalizeInput: input => input,
+      effectEnvelope: { accesses: [{ mode: 'read', scope: 'facts' }], lockScopes: [] },
+      deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'facts' }], lockScopes: [], recovery: { kind: 'unknown' } }),
+      invoke: async () => {
+        if (importDuringTool) peer = await sessions.appendPeerContribution(session, contribution());
+        return { kind: 'result', output: {}, summary: 'Observed', scope: { resources: ['facts'], coverage: 'complete' } };
+      } });
+    const runtime = new AgentRuntime({ provider: fixture.provider, model: fixture.profile.id, maxOutputTokens: 64, context,
+      tools: [lookup], repositories: { events, artifacts, session: { repository: sessions, descriptor: session } },
+      toolBoundary: { authorizationPolicyId: 'tests/peer', executionTargetId: 'tests/peer' },
+      onRequestAdmitted: () => {
+        admissions++;
+        ordersAtFirstAdmission ??= orders;
+        if (admissions > precedingToolTurns) { authorized = false; ordersAtRevocation = orders; }
+      } });
+    t.after(() => runtime.close());
+    const result = await runtime.run({ runId: 'recipient-run', task: 'Read the permitted evidence.' }).result;
+    assert.notEqual(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+    assert.equal(fixture.requests.length, precedingToolTurns, 'Revoked peer bytes cannot reach another provider effect');
+    assert.equal(rejectedChecks, 1, 'Every dispatch checks the captured peer entries against current host authority');
+    assert.equal(orders, ordersAtRevocation, 'Fresh effect authorization cannot reorder the captured immutable source window');
+    assert.equal(ordersAtRevocation - ordersAtFirstAdmission, importDuringTool ? 1 : 0,
+      'Only a newly imported source requires replay; already-applied own tool turns cannot reorder the window');
+  });
 }
 for (const persistence of ['memory', 'jsonl']) {
   test(`${persistence}: initial exact source imports reach the first delegated assignment request`, async t => {

@@ -508,6 +508,8 @@ export interface SessionExecutionOwnership {
   release(): Promise<void>;
 }
 
+/** Publication ownership guards enclose repository queue/lock acquisition and the full
+ * validated write. Exact committed receipts may be read before acquiring live ownership. */
 export interface SessionRepository {
   tryAcquireExecution(session: SessionDescriptor): Promise<SessionExecutionOwnership | undefined>;
   create(options: CreateSessionOptions): Promise<SessionDescriptor>;

@@ -17,7 +17,7 @@ import {
   type ProviderContextState,
   type RequestEstimator
 } from '@agent-core/model';
-import type { ArtifactRef, ArtifactRepository, EventRepository } from '@agent-core/persistence';
+import { hashJson, type ArtifactRef, type ArtifactRepository, type EventRepository } from '@agent-core/persistence';
 import { decodeToolCall } from '@agent-core/tools';
 import type { AgentEvent, AgentProviderStateSummary } from '../events.js';
 import type { HistorySourceCut } from '../history/contracts.js';
@@ -26,14 +26,19 @@ import { ContextSourceCapacityError } from '../run/context-admission.js';
 import { HistorySourceTooLargeError, HistoryReader, sourceRef } from '../history/reader.js';
 import { readAdmittedModelInput, type AdmittedModelInput } from '../inference/input.js';
 import { ModelWindow, type ModelWindowImageLimits } from '../inference/model-window.js';
-import type { SessionBranchEntry } from '../session/contracts.js';
+import type { SessionBranchEntry, SessionPeerContributionEntry } from '../session/contracts.js';
 import { resolveSessionImages } from '../session/images.js';
 import { modelToolCallFromToolCall } from './model-request.js';
 import { serializeToolModelContent } from '@agent-core/tools';
 import { readProviderStateArtifact } from './provider-state-artifacts.js';
 
+export interface CapturedHistorySourceAccess {
+  readonly cut: HistorySourceCut;
+  readonly peerContributions: readonly SessionPeerContributionEntry[];
+}
+
 export interface ModelWindowReplayResult {
-  readonly historyCut?: HistorySourceCut;
+  readonly historySourceAccess?: CapturedHistorySourceAccess;
   readonly modelWindow: ModelWindow;
   readonly invalidatedProviderStates: readonly {
     readonly state: ProviderContextState;
@@ -266,7 +271,8 @@ export async function rebuildModelWindowFromRepositories(input: {
   if (incompatibleState) throw new NativeContextIncompatibilityError(incompatibleState.reason);
   return {
     modelWindow,
-    ...(view ? { historyCut: view.cut } : {}),
+    ...(view ? { historySourceAccess: Object.freeze({ cut: view.cut,
+      peerContributions: Object.freeze(selected.filter((entry): entry is SessionPeerContributionEntry => entry.type === 'peer_contribution')) }) } : {}),
     invalidatedProviderStates: Object.freeze(invalidatedProviderStates),
     replayedLedgers,
     replayedTurns: new Set(selected.flatMap((entry) => ('runId' in entry ? [entry.runId] : [])))
@@ -299,8 +305,13 @@ export async function readSelectedHistorySources(
   cut?: HistorySourceCut
 ): Promise<SelectedHistorySources> {
   cut ??= await history.capture();
-  const contextWindow = await history.selectedContext(cut);
   const cached = selectedSourceCache.get(history);
+  if (cached && hashJson(cached.value.cut) === hashJson(cut)) {
+    // Immutable source material can be reused; its current access grant cannot.
+    await history.assertPeerContributions(cached.value.entries, 'admit');
+    return cached.value;
+  }
+  const contextWindow = await history.selectedContext(cut);
   const previous =
     cached &&
     cached.value.contextWindow?.windowId === contextWindow?.windowId &&

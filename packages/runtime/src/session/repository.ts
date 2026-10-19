@@ -218,24 +218,30 @@ export class InMemorySessionRepository implements SessionRepository {
       return entry ? stateReceipt(entry) : undefined;
     });
   }
-  saveSessionState(session: SessionDescriptor, input: Parameters<SessionRepository['saveSessionState']>[1], options: Parameters<SessionRepository['saveSessionState']>[2] = {}) {
+  async saveSessionState(session: SessionDescriptor, input: Parameters<SessionRepository['saveSessionState']>[1], options: Parameters<SessionRepository['saveSessionState']>[2] = {}) {
     const batch = sessionStateBatchCommitSchema.parse(input);
-    return this.serial(async () => {
+    if (options.withOwnership) {
+      const committed = await this.serial(() => {
+        const state = this.requireDescriptor(session);
+        const previous = stateItems(state,branchLeaf(state.branchEntries)).batches.get(batch.idempotencyKey);
+        return previous ? assertStateRetry(previous,batch) : undefined;
+      });
+      if (committed) return committed;
+    }
+    const publish = () => this.serial(async () => {
       const state = this.requireDescriptor(session);
       const branch = activeBranch(state.branchEntries, branchLeaf(state.branchEntries));
       const items = stateItems(state,branchLeaf(state.branchEntries));
       const previous = items.batches.get(batch.idempotencyKey);
       if (previous) return assertStateRetry(previous, batch);
-      const publish = async () => {
-        if (batch.capturedHistoryCut.sourceRevision < state.acceptedInputRevision) throw new PersistenceConflictError('Accepted input changed after the state inference.');
-        assertStateSourceCut(session.id, branch, batch, state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length);
-        await validateSessionStateCommit(batch, itemId => Promise.resolve(items.heads.get(itemId)), state.retainedStateBytes);
-        const entry = decodeSessionStateBatchEntry({...baseEntry(branchLeaf(state.branchEntries)), type: 'session_state_batch', batch});
-        appendBranchRecord(state, entry);
-        return stateReceipt(entry);
-      };
-      return options.withOwnership ? options.withOwnership(publish) : publish();
+      if (batch.capturedHistoryCut.sourceRevision < state.acceptedInputRevision) throw new PersistenceConflictError('Accepted input changed after the state inference.');
+      assertStateSourceCut(session.id, branch, batch, state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length);
+      await validateSessionStateCommit(batch, itemId => Promise.resolve(items.heads.get(itemId)), state.retainedStateBytes);
+      const entry = decodeSessionStateBatchEntry({...baseEntry(branchLeaf(state.branchEntries)), type: 'session_state_batch', batch});
+      appendBranchRecord(state, entry);
+      return stateReceipt(entry);
     });
+    return options.withOwnership ? options.withOwnership(publish) : publish();
   }
   currentSessionStateItem(session: SessionDescriptor, itemId: string, leafId?: string | null) {
     return this.serial(() => {
@@ -299,9 +305,17 @@ export class InMemorySessionRepository implements SessionRepository {
       return selection ? Object.freeze({ ownerId: current.state.ownerId, selection }) : undefined;
     });
   }
-  saveToolCatalogSelection(session: SessionDescriptor, input: Parameters<SessionRepository['saveToolCatalogSelection']>[1], options: Parameters<SessionRepository['saveToolCatalogSelection']>[2] = {}): Promise<ToolCatalogSelectionState> {
+  async saveToolCatalogSelection(session: SessionDescriptor, input: Parameters<SessionRepository['saveToolCatalogSelection']>[1], options: Parameters<SessionRepository['saveToolCatalogSelection']>[2] = {}): Promise<ToolCatalogSelectionState> {
     const selection = parseToolCatalogSelection(input.selection);
-    return this.serial(() => {
+    if (options.withOwnership) {
+      const previous = await this.findToolCatalogSelection(session,input.operationId);
+      if (previous) {
+        if (input.ownerId !== previous.ownerId) throw new PersistenceConflictError('Tool catalog branch changed.');
+        if (previous.selection.revision !== selection.revision) throw new PersistenceConflictError('Tool catalog operation changed.');
+        return previous;
+      }
+    }
+    const publish = () => this.serial(() => {
       const state = this.requireDescriptor(session);
       const current = catalogState(state, branchLeaf(state.branchEntries));
       if (input.ownerId !== current.state.ownerId) throw new PersistenceConflictError('Tool catalog branch changed.');
@@ -313,12 +327,10 @@ export class InMemorySessionRepository implements SessionRepository {
       if (input.expectedRevision !== current.state.selection.revision) throw new PersistenceConflictError('Tool catalog selection changed.');
       const entry = decodeSessionToolCatalogSelection({ ...baseEntry(branchLeaf(state.branchEntries)), type: 'tool_catalog_selection',
         branchId: current.branchId, operationId: input.operationId, selection });
-      const publish = () => {
-        appendBranchRecord(state, entry);
-        return Promise.resolve(catalogState(state, entry.id).state);
-      };
-      return options.withOwnership ? options.withOwnership(publish) : publish();
+      appendBranchRecord(state, entry);
+      return catalogState(state, entry.id).state;
     });
+    return options.withOwnership ? options.withOwnership(publish) : publish();
   }
   sourceSnapshot(session: SessionDescriptor, leafId?: string | null) {
     return this.serial(() => {
@@ -475,20 +487,22 @@ export class InMemorySessionRepository implements SessionRepository {
     return this.serial(() => this.requireDescriptor(session).peerDeliveries.get(deliveryId));
   }
 
-  appendPeerContribution(session: SessionDescriptor, input: Parameters<SessionRepository['appendPeerContribution']>[1], options: Parameters<SessionRepository['appendPeerContribution']>[2] = {}) {
+  async appendPeerContribution(session: SessionDescriptor, input: Parameters<SessionRepository['appendPeerContribution']>[1], options: Parameters<SessionRepository['appendPeerContribution']>[2] = {}) {
     const owned = ownPeerContributionInput(input);
     if (owned.recipient.sessionId !== session.id) throw new Error('Peer contribution recipient session does not match.');
-    return this.serial(async () => {
+    if (options.withOwnership) {
+      const existing = await this.findPeerContribution(session,owned.deliveryId);
+      if (existing) return samePeerContribution(existing,owned);
+    }
+    const publish = () => this.serial(() => {
       const state = this.requireDescriptor(session);
       const existing = state.peerDeliveries.get(owned.deliveryId);
       if (existing?.type === 'peer_contribution') return samePeerContribution(existing, owned);
-      const publish = () => {
-        const entry = decodePeerContributionEntry({ ...baseEntry(branchLeaf(state.branchEntries)), type: 'peer_contribution', authorship: 'model', contribution: owned });
-        appendBranchRecord(state, entry);
-        return Promise.resolve(entry);
-      };
-      return options.withOwnership ? options.withOwnership(publish) : publish();
+      const entry = decodePeerContributionEntry({ ...baseEntry(branchLeaf(state.branchEntries)), type: 'peer_contribution', authorship: 'model', contribution: owned });
+      appendBranchRecord(state, entry);
+      return entry;
     });
+    return options.withOwnership ? options.withOwnership(publish) : publish();
   }
 
   appendAssistant(
@@ -655,46 +669,51 @@ export class InMemorySessionRepository implements SessionRepository {
       return entry;
     });
   }
-  commitContextTransition(
+  async commitContextTransition(
     session: SessionDescriptor,
     input: ContextTransitionCommit,
     options: Parameters<SessionRepository['commitContextTransition']>[2] = {}
   ): Promise<SessionContextTransitionEntry> {
-    return this.serial(async () => {
+    if (options.withOwnership) {
+      const committed = await this.serial(() => {
+        const state = this.requireDescriptor(session);
+        return contextCommitRetry(activeBranch(state.branchEntries,branchLeaf(state.branchEntries)),input);
+      });
+      if (committed) return committed;
+    }
+    const publish = () => this.serial(async () => {
       const state = this.requireDescriptor(session);
       const branch = activeBranch(state.branchEntries, branchLeaf(state.branchEntries));
       const existing = contextCommitRetry(branch, input);
       if (existing) return existing;
-      const publish = async () => {
-        validateContextCommit(
-          session.id,
-          branch,
-          state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length,
-          input,
-          state.finalizations
-        );
-        if (input.sessionState) {
-          const items = stateItems(state,branchLeaf(state.branchEntries));
-          if (items.batches.has(input.sessionState.idempotencyKey)) throw new PersistenceConflictError('State batch was already committed.');
-          if (input.sessionState.capturedHistoryCut.sourceRevision < state.acceptedInputRevision) throw new PersistenceConflictError('Accepted input changed after the state inference.');
-          assertStateSourceCut(session.id, branch, input.sessionState, state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length);
-          await validateSessionStateCommit(input.sessionState, itemId => Promise.resolve(items.heads.get(itemId)), state.retainedStateBytes);
-        }
-        const selectedItems = new Map(stateItems(state,branchLeaf(state.branchEntries)).revisions);
-        for (const revision of input.sessionState?.revisions ?? []) selectedItems.set(revision.revisionId,revision);
-        for (const ref of input.window.selection.sessionState ?? []) assertStateSelection(ref,selectedItems.get(ref.revisionId));
-        const entry = decodeContextTransitionEntry({
-          ...baseEntry(branchLeaf(state.branchEntries)),
-          type: 'context_transition',
-          ...(input.sessionState ? { sessionState: input.sessionState } : {}),
-          window: input.window,
-          transition: input.transition
-        });
-        appendBranchRecord(state, entry);
-        return entry;
-      };
-      return options.withOwnership ? options.withOwnership(publish) : publish();
+      validateContextCommit(
+        session.id,
+        branch,
+        state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length,
+        input,
+        state.finalizations
+      );
+      if (input.sessionState) {
+        const items = stateItems(state,branchLeaf(state.branchEntries));
+        if (items.batches.has(input.sessionState.idempotencyKey)) throw new PersistenceConflictError('State batch was already committed.');
+        if (input.sessionState.capturedHistoryCut.sourceRevision < state.acceptedInputRevision) throw new PersistenceConflictError('Accepted input changed after the state inference.');
+        assertStateSourceCut(session.id, branch, input.sessionState, state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length);
+        await validateSessionStateCommit(input.sessionState, itemId => Promise.resolve(items.heads.get(itemId)), state.retainedStateBytes);
+      }
+      const selectedItems = new Map(stateItems(state,branchLeaf(state.branchEntries)).revisions);
+      for (const revision of input.sessionState?.revisions ?? []) selectedItems.set(revision.revisionId,revision);
+      for (const ref of input.window.selection.sessionState ?? []) assertStateSelection(ref,selectedItems.get(ref.revisionId));
+      const entry = decodeContextTransitionEntry({
+        ...baseEntry(branchLeaf(state.branchEntries)),
+        type: 'context_transition',
+        ...(input.sessionState ? { sessionState: input.sessionState } : {}),
+        window: input.window,
+        transition: input.transition
+      });
+      appendBranchRecord(state, entry);
+      return entry;
     });
+    return options.withOwnership ? options.withOwnership(publish) : publish();
   }
   branchFrom(
     session: SessionDescriptor,

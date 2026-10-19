@@ -119,7 +119,7 @@ interface ManagedProcess {
   terminalStatus?: Exclude<CommandExecutionStatus, 'running'>;
   readonly observed: { stdout: number; stderr: number };
   exitCode?: number | null;
-  signal?: NodeJS.Signals | null;
+  signal?: string | null;
   diagnostic?: string;
   timeout?: ReturnType<typeof setTimeout>;
   retention?: ReturnType<typeof setTimeout>;
@@ -592,7 +592,7 @@ export class LocalCommandExecution implements CommandExecution {
         });
       this.requestTermination(record, 'stopped');
     }
-    await this.observeFinalization(record.tree.settle().then(() => this.finish(record)), observationSignal);
+    await this.observeFinalization(this.finish(record), observationSignal);
     return this.query(processId, 4_000, 0, 0, requester, observationSignal);
   }
 
@@ -968,26 +968,13 @@ export class LocalCommandExecution implements CommandExecution {
 
   private async settleAndFinish(record: ManagedProcess): Promise<void> {
     try {
-      await record.tree.settle();
-      const terminalState = await record.tree.terminalState;
-      if (record.terminalStatus !== 'timed_out' && record.terminalStatus !== 'stopped') {
-        record.terminalStatus = terminalState?.state ?? 'failed';
-      }
-    } catch (error) {
-      record.diagnostic = appendDiagnostic(
-        record.diagnostic,
-        `Process settlement failed: ${errorMessage(error)}`
-      );
-      this.signalActivity(record);
-      return;
-    }
-    try {
       await this.finish(record);
     } catch (error) {
       record.diagnostic = appendDiagnostic(
         record.diagnostic,
         `Process finalization failed: ${errorMessage(error)}`
       );
+      this.signalActivity(record);
     }
   }
 
@@ -1003,6 +990,17 @@ export class LocalCommandExecution implements CommandExecution {
   }
 
   private async finishOnce(record: ManagedProcess): Promise<CommandExecutionReport> {
+    await record.tree.settle();
+    const terminalState = await record.tree.terminalState;
+    if (record.terminalStatus !== 'timed_out' && record.terminalStatus !== 'stopped')
+      record.terminalStatus = terminalState?.state ?? 'failed';
+    // The host child is the supervisor, whose exit code can differ from the
+    // command's. Every finalization caller must use authenticated command facts
+    // before publishing a receipt, including explicit stop and owner cleanup.
+    if (terminalState) {
+      record.exitCode = terminalState.exitCode;
+      record.signal = terminalState.signal;
+    }
     const terminalStatus = record.terminalStatus ?? 'failed';
     let terminalDelivery = Promise.resolve();
     if (!record.progressClosed) {
@@ -1238,7 +1236,7 @@ export class LocalCommandExecution implements CommandExecution {
     if (this.options.ledgerDirectory) {
       await mkdir(this.options.ledgerDirectory, { recursive: true, mode: 0o700 });
       const ledgerDirectory = await realpath(this.options.ledgerDirectory);
-      this.ledgerOwner = await tryAcquirePersistenceFileLock(`${ledgerDirectory}.manager`);
+      this.ledgerOwner = await tryAcquirePersistenceFileLock(path.join(ledgerDirectory, '.manager', 'owner'));
       if (!this.ledgerOwner) throw new Error('Command execution ledger is owned by another live manager.');
     }
     try { await this.refreshReconciliation(); }

@@ -2,12 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   access,
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
   readdir,
   rename,
   rm,
+  stat,
   symlink,
   writeFile
 } from 'node:fs/promises';
@@ -659,7 +661,7 @@ test('ledger cleanup residue does not change a terminal result and is retried on
   const reconciliation = await retry.reconcile();
   assert.equal(reconciliation.unresolved.length, 0);
   assert.equal(reconciliation.resolved.includes(result.processId), true);
-  assert((await readdir(ledgerDirectory)).every(name => name.endsWith('.terminal.json')));
+  assert((await readdir(ledgerDirectory)).every(name => name === '.manager' || name.endsWith('.terminal.json')));
 });
 
 test('public process redaction detects a secret split across output chunks', async () => {
@@ -907,7 +909,7 @@ test('process ledger restores unreported terminal records across manager restart
   assert.equal(reports.length, 1);
   assert.equal(reports[0].result.processId, started.processId);
   await second.acknowledgeTerminalReport(started.processId);
-  assert((await readdir(ledgerDirectory)).every(name => name.endsWith('.terminal.json')));
+  assert((await readdir(ledgerDirectory)).every(name => name === '.manager' || name.endsWith('.terminal.json')));
 });
 
 test('startup reclaims a dead manager lifetime lock before reconciling its orphaned child process tree', async (t) => {
@@ -920,7 +922,7 @@ test('startup reclaims a dead manager lifetime lock before reconciling its orpha
   assert.equal(crashed.status, 44, crashed.stderr);
   const { processId } = JSON.parse(crashed.stdout);
   const ledgerDirectory = path.join(root, 'processes');
-  const lockPath = `${ledgerDirectory}.manager.lock`;
+  const lockPath = path.join(ledgerDirectory, '.manager', 'owner.lock');
   const [lockName] = await readdir(lockPath);
   const deadOwner = JSON.parse(await readFile(path.join(lockPath, lockName), 'utf8'));
   assert.equal(deadOwner.pid, crashed.pid);
@@ -951,7 +953,7 @@ test('startup reclaims a dead manager lifetime lock before reconciling its orpha
   assert.equal(reports.length, 1);
   assert.equal(reports[0].result.status, 'stopped');
   await manager.acknowledgeTerminalReport(processId);
-  assert((await readdir(ledgerDirectory)).every(name => name.endsWith('.terminal.json')));
+  assert((await readdir(ledgerDirectory)).every(name => name === '.manager' || name.endsWith('.terminal.json')));
 });
 
 for (const recordKind of ['current', 'incompatible']) {
@@ -1131,7 +1133,7 @@ test('local host durably hands recovered terminal reports to old runs during sta
   assert.equal(delivered.length, 1, JSON.stringify(await host.reconciliation()));
   assert.equal(delivered[0].result.processId, processId);
   assert.equal(delivered[0].result.owner.runId, 'orphan-run');
-  assert((await readdir(path.join(root, 'processes'))).every(name => name.endsWith('.terminal.json')));
+  assert((await readdir(path.join(root, 'processes'))).every(name => name === '.manager' || name.endsWith('.terminal.json')));
   await commands.close();
   await host.close();
 });
@@ -1287,7 +1289,7 @@ test('terminal handoff retries use stable evidence and retain it until durable a
   assert.deepEqual(deliveries.at(-1), recovered);
   accepted = true;
   await second.retryReconciliation();
-  assert((await readdir(ledgerDirectory)).every(name => name.endsWith('.terminal.json')));
+  assert((await readdir(ledgerDirectory)).every(name => name === '.manager' || name.endsWith('.terminal.json')));
   assert.deepEqual((await second.readPendingTerminalReports({ ownerId: invocation.ownerId })).reports, []);
 });
 
@@ -1384,7 +1386,7 @@ test('acknowledged terminal processes survive buffer expiration and restart with
   assert(bounded.combined.capturedBytes <= 2);
   assert(bounded.stdout.capturedBytes + bounded.stderr.capturedBytes + bounded.combined.capturedBytes <= 4);
   assert.equal(reports.length, 2, 'querying terminal truth does not republish completion');
-  assert((await readdir(options.ledgerDirectory)).every(name => name.endsWith('.terminal.json')));
+  assert((await readdir(options.ledgerDirectory)).every(name => name === '.manager' || name.endsWith('.terminal.json')));
 });
 
 test('late output recovery preserves redaction, UTF-8 ranges and terminal truth when storage fails', async t => {
@@ -1793,7 +1795,8 @@ test('pending report pagination is owner-scoped, public, read-only and clears on
   artifacts.store = async (...args) => { stores++; return store(...args); };
   const manager = new LocalCommandExecution({ artifactRepository: artifacts, rootedFileAuthority: files,
     ledgerDirectory: path.join(root, 'processes'), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
-  t.after(async () => { await manager.close(); files.close(); await rm(root, { recursive: true, force: true }); });
+  let restarted;
+  t.after(async () => { await manager.close(); await restarted?.close(); files.close(); await rm(root, { recursive: true, force: true }); });
   const ids = [];
   for (let index = 0; index < 4; index++) {
     const result = await startSettledCommand(manager, { command: `printf '${index}'`, rootedDirectory: '.', pty: false,
@@ -1833,9 +1836,8 @@ test('pending report pagination is owner-scoped, public, read-only and clears on
   assert.equal(empty.complete, true);
   await assert.rejects(manager.readPendingTerminalReports({ ownerId: 'other-owner', after: firstPage.next }), /another owner/);
   await manager.close();
-  const restarted = new LocalCommandExecution({ artifactRepository: artifacts, rootedFileAuthority: files,
+  restarted = new LocalCommandExecution({ artifactRepository: artifacts, rootedFileAuthority: files,
     ledgerDirectory: path.join(root, 'processes'), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
-  t.after(() => restarted.close());
   await assert.rejects(restarted.readPendingTerminalReports({ ownerId: invocation.ownerId, after: firstPage.next }), /generation/);
 });
 
@@ -1882,12 +1884,13 @@ test('failed receipt persistence keeps terminal truth, defers handoff, and retri
   const record = { id: processId,
     owner: { ownerId: 'owner', runId: 'run', turnId: 'turn', toolBatchId: 'batch', callIndex: 0 },
     rootPath: root, command: 'already-exited', startedAt: Date.now(),
-    status: 'exited', terminalStatus: 'exited', exitCode: 0, signal: null,
+    status: 'stopped', terminalStatus: 'stopped', exitCode: 1, signal: null,
     cursor: 0, oldestCursor: 0, history: [], observed: { stdout: 0, stderr: 0 },
     progressDroppedEvents: 0, progressDeliveryErrors: 0, progressClosed: true,
     terminalReported: false, activityWaiters: new Set(),
     capture: { chunks: () => [], retainedBytes: 0 },
-    tree: { child: { pid: process.pid }, supervision: {
+    tree: { child: { pid: process.pid }, settle: async () => undefined,
+      terminalState: Promise.resolve({ state: 'stopped', exitCode: null, signal: 'SIGTERM' }), supervision: {
       identity: 'supervisor_22222222-2222-4222-8222-222222222222', endpoint: '/unused'
     } }
   };
@@ -1903,10 +1906,11 @@ test('failed receipt persistence keeps terminal truth, defers handoff, and retri
   // Inject the already-exited process only; authority lifecycle/index state comes from construction.
   command.completed.set(processId, record);
   command.finalArtifacts = async () => ({});
-  t.after(async () => { clearTimeout(record.retention); files.close(); await rm(root, { recursive: true, force: true }); });
+  t.after(async () => { await command.close(); clearTimeout(record.retention); files.close(); await rm(root, { recursive: true, force: true }); });
   const pending = await command.query(processId, 100, 0, 0, record.owner);
-  assert.equal(pending.status, 'exited');
-  assert.equal(pending.exitCode, 0);
+  assert.equal(pending.status, 'stopped');
+  assert.equal(pending.exitCode, null, 'A supervisor exit code cannot replace the authenticated command exit code');
+  assert.equal(pending.signal, 'SIGTERM');
   assert.equal(pending.finalizationPending, true);
   assert.match(pending.diagnostic, /terminal record storage failed/);
   assert.equal(delivered.length, 0);
@@ -1916,13 +1920,15 @@ test('failed receipt persistence keeps terminal truth, defers handoff, and retri
   assert.equal(record.finishPromise, undefined, 'failed durability must allow another finalization attempt');
   await rm(terminalPath, { recursive: true });
   const repaired = await command.query(processId, 100, 0, 0, record.owner);
-  assert.equal(repaired.status, 'exited');
+  assert.equal(repaired.status, 'stopped');
   assert.equal(repaired.finalizationPending, undefined);
   assert.equal(delivered.length, 1);
   const acknowledged = await command.readPendingTerminalReports({ ownerId: record.owner.ownerId, after: pendingPage.next });
   assert.deepEqual(acknowledged.reports, []);
   assert.equal(acknowledged.complete, true);
   const receipt = JSON.parse(await readFile(terminalPath, 'utf8'));
+  assert.equal(receipt.exitCode, null);
+  assert.equal(receipt.signal, 'SIGTERM');
   assert.deepEqual(delivered[0].terminalOutput.combined, receipt.combined);
   assert.equal(delivered[0].terminalDiagnostic, receipt.diagnostic);
   const originalBytes = await readFile(terminalPath, 'utf8');
@@ -1955,6 +1961,12 @@ test('a second manager is denied before reconciliation can stop a live owner pro
   assert.ok(after.cursorEnd > running.cursorEnd, 'The actual command continues producing output after the competing manager is denied');
   const reports = await first.disposeOwner(invocation.ownerId);
   assert.equal(reports[0].result.status, 'stopped');
+  const receipt = JSON.parse(await readFile(path.join(ledgerDirectory, `${running.processId}.terminal.json`), 'utf8'));
+  const authenticated = JSON.parse(await readFile(path.join(ledgerDirectory, `${running.processId}.state.json`), 'utf8'));
+  assert.equal(receipt.exitCode, authenticated.exitCode);
+  assert.equal(receipt.signal, authenticated.signal);
+  assert.equal(reports[0].result.exitCode, authenticated.exitCode);
+  assert.equal(reports[0].result.signal, authenticated.signal);
   await first.close();
   reopened = new LocalCommandExecution(options);
   assert.deepEqual((await reopened.reconcile()).unresolved, []);
@@ -1982,4 +1994,19 @@ test('a closed manager cannot mutate the replacement ledger owner even without p
   await assert.rejects(contender.reconcile(), /owned by another live manager/u);
   await assert.rejects(contender.close(), /owned by another live manager/u);
   assert.deepEqual((await replacement.retryReconciliation()).unresolved, []);
+});
+
+test('manager lifetime locking only changes its dedicated ledger-owned directory', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'process-manager-directory-'));
+  await chmod(root, 0o755);
+  const files = testRootedFileAuthority(root);
+  const manager = new LocalCommandExecution({ artifactRepository: new InMemoryArtifactRepository(),
+    rootedFileAuthority: files, ledgerDirectory: root, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  t.after(async () => { await manager.close(); files.close(); await rm(root, { recursive: true, force: true }); });
+  const parentMode = (await stat(path.dirname(root))).mode;
+  await manager.reconcile();
+  assert.equal((await stat(root)).mode & 0o777, 0o755, 'The caller-owned ledger directory mode is unchanged');
+  assert.equal((await stat(path.dirname(root))).mode, parentMode, 'The caller parent directory is untouched');
+  assert.equal((await stat(path.join(root, '.manager'))).mode & 0o777, 0o700);
+  assert.equal((await readdir(path.join(root, '.manager', 'owner.lock'))).length, 1);
 });

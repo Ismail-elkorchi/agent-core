@@ -183,9 +183,17 @@ export class JsonlSessionRepository implements SessionRepository {
   findToolCatalogSelection(session: SessionDescriptor, operationId: string): Promise<ToolCatalogSelectionState | undefined> {
     return this.branchIndex(session.id).toolCatalogSelection(session, operationId);
   }
-  saveToolCatalogSelection(session: SessionDescriptor, input: Parameters<SessionRepository['saveToolCatalogSelection']>[1], options: Parameters<SessionRepository['saveToolCatalogSelection']>[2] = {}): Promise<ToolCatalogSelectionState> {
+  async saveToolCatalogSelection(session: SessionDescriptor, input: Parameters<SessionRepository['saveToolCatalogSelection']>[1], options: Parameters<SessionRepository['saveToolCatalogSelection']>[2] = {}): Promise<ToolCatalogSelectionState> {
     const selection = parseToolCatalogSelection(input.selection);
-    return this.enqueue(session.id, () => this.withSessionLock(session.id, async () => {
+    if (options.withOwnership) {
+      const previous = await this.findToolCatalogSelection(session,input.operationId);
+      if (previous) {
+        if (input.ownerId !== previous.ownerId) throw new PersistenceConflictError('Tool catalog branch changed.');
+        if (previous.selection.revision !== selection.revision) throw new PersistenceConflictError('Tool catalog operation changed.');
+        return previous;
+      }
+    }
+    const publish = () => this.enqueue(session.id, () => this.withSessionLock(session.id, async () => {
       const state = await this.branchIndex(session.id).descriptor(session.header.binding);
       assertDescriptor(session, state);
       const current = await this.currentToolCatalogSelection(session);
@@ -199,12 +207,10 @@ export class JsonlSessionRepository implements SessionRepository {
       const snapshot = await this.branchIndex(session.id).snapshot(session);
       const entry = decodeSessionToolCatalogSelection({ ...baseEntry(state.leafId), type: 'tool_catalog_selection',
         branchId: snapshot.branchId, operationId: input.operationId, selection });
-      const publish = async () => {
-        await this.appendRecord(session.id, state, entry);
-        return Object.freeze({ ownerId: current.ownerId, selection });
-      };
-      return options.withOwnership ? options.withOwnership(publish) : publish();
+      await this.appendRecord(session.id, state, entry);
+      return Object.freeze({ ownerId: current.ownerId, selection });
     }));
+    return options.withOwnership ? options.withOwnership(publish) : publish();
   }
   async committedRetainedStateBytes(session: SessionDescriptor): Promise<number> {
     return (await this.branchIndex(session.id).checked(session)).retainedStateBytes;
@@ -213,22 +219,24 @@ export class JsonlSessionRepository implements SessionRepository {
     const entry = await this.branchIndex(session.id).findStateBatch(session,idempotencyKey);
     return entry ? stateReceipt(entry) : undefined;
   }
-  saveSessionState(session: SessionDescriptor, input: Parameters<SessionRepository['saveSessionState']>[1], options: Parameters<SessionRepository['saveSessionState']>[2] = {}) {
+  async saveSessionState(session: SessionDescriptor, input: Parameters<SessionRepository['saveSessionState']>[1], options: Parameters<SessionRepository['saveSessionState']>[2] = {}) {
     const batch = sessionStateBatchCommitSchema.parse(input);
-    return this.enqueue(session.id,() => this.withSessionLock(session.id,async () => {
+    if (options.withOwnership) {
+      const previous = await this.branchIndex(session.id).findStateBatch(session,batch.idempotencyKey);
+      if (previous) return assertStateRetry(previous,batch);
+    }
+    const publish = () => this.enqueue(session.id,() => this.withSessionLock(session.id,async () => {
       const index = this.branchIndex(session.id);
       const state = await index.descriptor(session.header.binding);
       assertDescriptor(session,state);
       const previous = await index.findStateBatch(session,batch.idempotencyKey);
       if (previous) return assertStateRetry(previous,batch);
-      const publish = async () => {
-        await index.validateState(session,batch);
-        const entry = decodeSessionStateBatchEntry({...baseEntry(state.leafId),type:'session_state_batch',batch});
-        await this.appendRecord(session.id,state,entry);
-        return stateReceipt(entry);
-      };
-      return options.withOwnership ? options.withOwnership(publish) : publish();
+      await index.validateState(session,batch);
+      const entry = decodeSessionStateBatchEntry({...baseEntry(state.leafId),type:'session_state_batch',batch});
+      await this.appendRecord(session.id,state,entry);
+      return stateReceipt(entry);
     }));
+    return options.withOwnership ? options.withOwnership(publish) : publish();
   }
   currentSessionStateItem(session: SessionDescriptor, itemId: string, leafId?: string | null) {
     return this.branchIndex(session.id).currentStateItem(session,itemId,leafId);
@@ -507,21 +515,23 @@ export class JsonlSessionRepository implements SessionRepository {
     return entry?.type === 'peer_contribution' ? entry : undefined;
   }
 
-  appendPeerContribution(session: SessionDescriptor, input: Parameters<SessionRepository['appendPeerContribution']>[1], options: Parameters<SessionRepository['appendPeerContribution']>[2] = {}) {
+  async appendPeerContribution(session: SessionDescriptor, input: Parameters<SessionRepository['appendPeerContribution']>[1], options: Parameters<SessionRepository['appendPeerContribution']>[2] = {}) {
     const owned = ownPeerContributionInput(input);
     if (owned.recipient.sessionId !== session.id) throw new Error('Peer contribution recipient session does not match.');
-    return this.enqueue(session.id, () => this.withSessionLock(session.id, async () => {
+    if (options.withOwnership) {
+      const existing = await this.findPeerContribution(session,owned.deliveryId);
+      if (existing) return samePeerContribution(existing,owned);
+    }
+    const publish = () => this.enqueue(session.id, () => this.withSessionLock(session.id, async () => {
       const state = await this.branchIndex(session.id).descriptor(session.header.binding);
       assertDescriptor(session, state);
       const existing = await this.branchIndex(session.id).find(session, `peer:${hashJson(owned.deliveryId)}`);
       if (existing?.type === 'peer_contribution') return samePeerContribution(existing, owned);
-      const publish = async () => {
-        const entry = decodePeerContributionEntry({ ...baseEntry(state.leafId), type: 'peer_contribution', authorship: 'model', contribution: owned });
-        await this.appendRecord(session.id, state, entry);
-        return entry;
-      };
-      return options.withOwnership ? options.withOwnership(publish) : publish();
+      const entry = decodePeerContributionEntry({ ...baseEntry(state.leafId), type: 'peer_contribution', authorship: 'model', contribution: owned });
+      await this.appendRecord(session.id, state, entry);
+      return entry;
     }));
+    return options.withOwnership ? options.withOwnership(publish) : publish();
   }
 
   appendAssistant(
@@ -686,35 +696,37 @@ export class JsonlSessionRepository implements SessionRepository {
       }
     ));
   }
-  commitContextTransition(
+  async commitContextTransition(
     session: SessionDescriptor,
     input: ContextTransitionCommit,
     options: Parameters<SessionRepository['commitContextTransition']>[2] = {}
   ): Promise<SessionContextTransitionEntry> {
-    return this.enqueue(session.id, () =>
+    if (options.withOwnership) {
+      const committed = await this.branchIndex(session.id).contextRetry(session,input);
+      if (committed) return committed;
+    }
+    const publish = () => this.enqueue(session.id, () =>
       this.withSessionLock(session.id,
         async () => {
           const state = await this.branchIndex(session.id).descriptor(session.header.binding);
           assertDescriptor(session, state);
           const existing = await this.branchIndex(session.id).contextRetry(session, input);
           if (existing) return existing;
-          const publish = async () => {
-            await this.branchIndex(session.id).validateContext(session, input);
-            if (input.sessionState) await this.branchIndex(session.id).validateState(session,input.sessionState);
-            const entry = decodeContextTransitionEntry({
-              ...baseEntry(state.leafId),
-              type: 'context_transition',
-              ...(input.sessionState ? {sessionState: input.sessionState} : {}),
-              window: input.window,
-              transition: input.transition
-            });
-            await this.appendRecord(session.id, state, entry);
-            return entry;
-          };
-          return options.withOwnership ? options.withOwnership(publish) : publish();
+          await this.branchIndex(session.id).validateContext(session, input);
+          if (input.sessionState) await this.branchIndex(session.id).validateState(session,input.sessionState);
+          const entry = decodeContextTransitionEntry({
+            ...baseEntry(state.leafId),
+            type: 'context_transition',
+            ...(input.sessionState ? {sessionState: input.sessionState} : {}),
+            window: input.window,
+            transition: input.transition
+          });
+          await this.appendRecord(session.id, state, entry);
+          return entry;
         }
       )
     );
+    return options.withOwnership ? options.withOwnership(publish) : publish();
   }
   branchFrom(
     session: SessionDescriptor,

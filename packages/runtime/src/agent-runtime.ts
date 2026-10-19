@@ -90,7 +90,7 @@ import {
   assertPortableHistoryCompatibility,
   rebuildModelWindowFromRepositories,
   replaySourceEntries,
-  readSelectedHistorySources,
+  type CapturedHistorySourceAccess,
   recordContextExcerpts,
   type ModelWindowReplayResult
 } from './orchestration/session-replay.js';
@@ -335,6 +335,7 @@ type AssistantTurnResult =
   | { readonly kind: 'outcome_unknown'; readonly effectId: string };
 interface RequestAssemblyResult {
   readonly capturedHistoryCut?: import('./history/contracts.js').HistorySourceCut;
+  readonly sourceAccess?: CapturedHistorySourceAccess | undefined;
   readonly freshContext?: boolean;
   readonly recoveryAttempt?: number;
   readonly request: ModelRequest;
@@ -477,7 +478,7 @@ export class AgentRuntime {
   private lastAdmittedCapabilities: { readonly inputIdentity: string; readonly protocolCapabilityRevision: string;
     readonly snapshot: EffectiveCapabilitySnapshot } | undefined;
   private activeContextIdentity: string | null | undefined;
-  private activeHistoryCut: import('./history/contracts.js').HistorySourceCut | undefined;
+  private activeHistorySourceAccess: CapturedHistorySourceAccess | undefined;
   private pendingCompatibilityTransition = false;
   private nativeSteering: NativeSteeringCoordinator | undefined;
   private steeringWrites: Promise<void> = Promise.resolve();
@@ -672,8 +673,8 @@ export class AgentRuntime {
     return authority ? authority.withCurrent(operation) : operation();
   }
 
-  private async assertHistorySourceAccess(cut?: import('./history/contracts.js').HistorySourceCut): Promise<void> {
-    if (this.history && cut) await readSelectedHistorySources(this.history, cut);
+  private async assertHistorySourceAccess(access?: CapturedHistorySourceAccess): Promise<void> {
+    if (this.history && access) await this.history.assertPeerContributions(access.peerContributions, 'admit');
   }
 
   /** These facts are observations; only the actual request/effect admission grants authority. */
@@ -1581,7 +1582,7 @@ export class AgentRuntime {
       };
     }
     const modelWindow = replay.modelWindow;
-    this.activeHistoryCut = replay.historyCut;
+    this.activeHistorySourceAccess = replay.historySourceAccess;
     const observationStore = new ObservationStore({
       ...(this.options.context && this.options.contextRenewal?.automatic
         ? { maxPresentationBytes: this.contextControlPolicy.resultBytes } : {}),
@@ -2662,9 +2663,10 @@ export class AgentRuntime {
       const started = { type: 'assistant.started' as const, ...turnIdentity(snapshot.record) };
       await runtime.append(started);
       await runtime.emit(started);
+      const sourceAccess = first ? assembly.sourceAccess : this.activeHistorySourceAccess;
       const governed = createRunInferenceLifecycle({
         operation: 'native_generation',
-        assertSources: () => this.assertHistorySourceAccess(this.activeHistoryCut),
+        assertSources: () => this.assertHistorySourceAccess(sourceAccess),
         service: this.inferenceService,
         options: this.options,
         request,
@@ -2988,7 +2990,7 @@ export class AgentRuntime {
         let completedAttempt;
         try { completedAttempt = await invokeRunInference({
           service: this.inferenceService,
-          assertSources: () => this.assertHistorySourceAccess(assembly.capturedHistoryCut),
+          assertSources: () => this.assertHistorySourceAccess(assembly.sourceAccess),
           ...(assembly.capturedHistoryCut ? { capturedHistoryCut: assembly.capturedHistoryCut } : {}),
           ...(this.nativeSteering ? { steering: this.nativeSteering } : {}),
           options: this.options,
@@ -3591,7 +3593,8 @@ export class AgentRuntime {
       await append({ type: 'prompt.material.selected', material: assembled.assembly.material });
       await append({ type: 'budget.estimate.created', ...turnIdentity(snapshot.record), attempt: 1, estimate });
     }
-    return { request, assembly: { capturedHistoryCut: cut, request: assembled.request, compiled: assembled.compiled, estimate, fingerprint, recoveryAttempt: attempts + 1 } };
+    return { request, assembly: { capturedHistoryCut: cut, sourceAccess: this.activeHistorySourceAccess,
+      request: assembled.request, compiled: assembled.compiled, estimate, fingerprint, recoveryAttempt: attempts + 1 } };
   }
 
   private validateOutputReservation(value: number | undefined): number {
@@ -3617,7 +3620,7 @@ export class AgentRuntime {
       await this.activateCommittedContext(request.modelWindow, request.runId);
       // Incrementally recorded tool turns may have advanced the source boundary.
       // Refresh before compiling; the same fence runs again before dispatch for races.
-      await this.refreshAdvancedHistory(request.modelWindow, request.runId, this.activeHistoryCut);
+      await this.refreshAdvancedHistory(request.modelWindow, request.runId, this.activeHistorySourceAccess?.cut);
     } catch (error) {
       if (!(error instanceof ContextSourceCapacityError)) throw error;
       sourceConflict = error;
@@ -3814,7 +3817,8 @@ export class AgentRuntime {
     // Admission must describe the source boundary actually replayed, not a later
     // capture that could silently claim an unseen correction. The dispatch fence
     // refreshes the window if accepted sources advanced during validation/replay.
-    const cut = this.activeHistoryCut ?? await this.options.context?.history.capture();
+    const sourceAccess = this.activeHistorySourceAccess;
+    const cut = sourceAccess?.cut ?? await this.options.context?.history.capture();
     const sessionState = (await this.options.context?.sessionState(cut)) ?? {
       id: null, items: []
     };
@@ -3935,7 +3939,8 @@ export class AgentRuntime {
       outputReservation: compiled.accounting.outputReservation,
       presentation: assembly.presentation
     });
-    return { request: result.request, compiled, estimate, fingerprint, freshContext: contextPublication.fresh, ...(cut ? { capturedHistoryCut: cut } : {}) };
+    return { request: result.request, compiled, estimate, fingerprint, freshContext: contextPublication.fresh,
+      sourceAccess, ...(cut ? { capturedHistoryCut: cut } : {}) };
   }
 
   private async programReceiptCursor(runId: string): Promise<{ readonly programReceiptsThrough?: number }> {
@@ -4074,7 +4079,9 @@ export class AgentRuntime {
       if (applied) {
         // Never acknowledge an arbitrary fresh capture: every intervening source
         // must have an exact committed identity already delivered to the window.
-        this.activeHistoryCut = current;
+        if (!this.activeHistorySourceAccess || hashJson(this.activeHistorySourceAccess.cut) !== hashJson(captured))
+          throw new Error('Incremental history advancement requires the captured model-window sources.');
+        this.activeHistorySourceAccess = Object.freeze({ ...this.activeHistorySourceAccess, cut: current });
         return false;
       }
     }
@@ -4128,7 +4135,7 @@ export class AgentRuntime {
       );
     }
     window.replaceWith(replay.modelWindow);
-    this.activeHistoryCut = replay.historyCut;
+    this.activeHistorySourceAccess = replay.historySourceAccess;
     this.activeContextIdentity = identity;
     this.pendingCompatibilityTransition = false;
   }
