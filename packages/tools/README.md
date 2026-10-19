@@ -47,3 +47,11 @@ an author wraps an exact schema in a larger result contract. The path is an arra
 of property names from the new schema root, such as `['$defs', 'toolOutput']`.
 Names are JSON-pointer escaped; only schema-position references are rebased.
 Literal `const`, `enum`, `default`, and `examples` data remains unchanged.
+
+When rebinding an existing durable tool plan, the runtime can supply
+`ToolPlanningContext.recordedCanonicalInput`. This is an owned copy of the
+recorded input snapshot. A stateful canonicalizer may deliberately validate and
+reuse it instead of reading a newer revision. It must still match the original
+call and invocation identity. Planning, effect derivation, authorization and the
+recorded fingerprint checks are unchanged. Ordinary tools do not automatically
+restore this input; resource-sensitive tools retain their current validation.

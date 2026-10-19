@@ -109,3 +109,56 @@ When a session repository is configured, the runtime binds catalog selection to 
 Loading is independent of request admission. It neither changes a previously admitted tool catalog nor permits a new tool in the same response batch. A successor must compile and pass admission before calling the loaded definition. Failed successor admission retains the saved selection without publishing it as last-admitted capability. Every later call also rechecks current exact definitions and eligibility, so removal, permission changes, and connection rebinding revoke new starts.
 
 The exact host-created selector is an eager bounded-recovery control. When selected schemas prevent admission, a portable recovery request can advertise only granted controls so the selection can shrink. Native exact-prefix recovery instead retains the last accepted inventory, configuration, and protocol prefix; a failed fresh proposal never grants permission to discard them. Missing or incompatible accepted state is an explicit continuity refusal.
+
+## Governed collaboration
+
+`CollaborationCoordinator` supervises ordinary `AgentSession` instances. Each
+participant has a separate session, assignment and run identity. It does not add
+another model loop. A new group acquires its host ownership when collaboration
+first starts; reopening existing work restores its ownership and unfinished
+submissions. A competing live host cannot execute that group.
+
+Use `createCollaborationToolHost` with host-defined capability profiles, then
+`createCollaborationTools` to expose start, bounded inspection/result reads,
+continuation, peer delivery, wait, interrupt, cancel and acceptance. Participant
+bindings narrow the runtime's effective tool catalog. Parent identity grants no
+extra permissions. An assignment result is model-authored output; application
+verification and acceptance remain separate decisions.
+
+Participants share one inference owner with immutable participant budget scopes.
+Register scopes through `InferenceService.registerBudgetScope`; new runs and
+renewals retain those scopes. Admission reserves the owner and scope together,
+including outstanding/uncertain exposure. This accounting does not claim a hard
+currency cap when pricing is unknown.
+
+Share exact history cuts, state-item revisions or authorized public artifact
+ranges through `ScopedShareService` and `PeerDeliveryService`. Imported
+contributions keep their original attribution in the recipient's journal. A
+peer message is never user steering. Public artifact identity is not permission
+to disclose its bytes. Provider continuation and protected artifacts are not
+portable participant inputs.
+
+The initial execution boundary is one fenced host. All collaborating runtimes
+using the same workspace must use the same command manager/resource coordinator.
+A parent wait holds no workspace lease. Unrestricted commands retain their broad
+filesystem lease; a worktree is not sandbox isolation. Independent processes and
+external editors remain outside cooperative resource coordination.
+
+`AgentSession.withSubmissionAdmission` and the supervisor execution guard
+serialize accepted corrections with new participant effect starts. The durable
+correction revision closes the restart gap between session acceptance and group
+recording. Already-started effects retain their settlement identity; correction
+or cancellation does not prove that an external operation did not execute.
+
+Qualification uses scripted providers through the actual runtime and public
+application surfaces, disk-backed restart, fault injection, concurrent admission
+and packed-consumer checks. These establish runtime guarantees, not an empirical
+claim that multiple models outperform one model.
+
+`createParticipantArtifactRepository` retains the canonical artifact store while
+checking durable participant ownership for public reads. Public output creation
+records its ownership before returning the reference. A range-only import does
+not grant whole-artifact access. Host policy separately authorizes supervisor
+exports. Historical peer imports remain readable after sender continuation or
+departure; explicit access revocation still applies. Peer delivery admission is
+bounded before materialization (`maxPendingDeliveries`, default 32).

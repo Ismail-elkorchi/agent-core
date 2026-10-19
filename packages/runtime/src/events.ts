@@ -1,3 +1,4 @@
+import { parseSessionSubmissionOrigin } from './session/submission-origin.js';
 import { decodeContextAdmissionConflict } from './run/context-admission.js';
 import { validatePublicArtifactRef } from '@agent-core/persistence';
 import {
@@ -272,6 +273,7 @@ export type AgentEvent =
     }
   | ({
       readonly type: 'turn.started';
+      readonly origin?: import('./session/contracts.js').SessionSubmissionOrigin;
       readonly runId: string;
       readonly task: string;
       readonly sessionId?: string;
@@ -295,6 +297,7 @@ export type AgentEvent =
     }
   | {
       readonly type: 'input.received';
+      readonly origin?: import('./session/contracts.js').SessionSubmissionOrigin;
       readonly task: string;
       readonly images?: readonly import('./session/images.js').SessionImageInput[];
     }
@@ -459,6 +462,7 @@ export type AgentProgressEvent =
     }
   | ({
       readonly type: 'turn.started';
+      readonly origin?: import('./session/contracts.js').SessionSubmissionOrigin;
       readonly runId: string;
       readonly task: string;
       readonly sessionId?: string;
@@ -827,11 +831,12 @@ const AGENT_EVENT_DECODERS = {
     });
   },
   'turn.started': (value) => {
-    exact(value, ['type', 'runId', 'task', 'sessionId', 'sessionEntryId', ...TURN_KEYS]);
+    exact(value, ['type', 'runId', 'task', 'origin', 'sessionId', 'sessionEntryId', ...TURN_KEYS]);
     const sessionId = optionalString(value.sessionId, 'sessionId');
     const sessionEntryId = optionalString(value.sessionEntryId, 'sessionEntryId');
     return Object.freeze({
       type: 'turn.started',
+      ...(value.origin === undefined ? {} : { origin: parseSessionSubmissionOrigin(value.origin) }),
       ...decodeTurnIdentity(value),
       runId: requiredString(value.runId, 'runId'),
       task: requiredString(value.task, 'task'),
@@ -873,9 +878,10 @@ const AGENT_EVENT_DECODERS = {
     });
   },
   'input.received': (value) => {
-    exact(value, ['type', 'task', 'images']);
+    exact(value, ['type', 'task', 'origin', 'images']);
     return Object.freeze({
       type: 'input.received',
+      ...(value.origin === undefined ? {} : { origin: parseSessionSubmissionOrigin(value.origin) }),
       ...(value.images === undefined ? {} : { images: parseSessionImages(value.images) }),
       task: requiredString(value.task, 'task')
     });
@@ -1768,6 +1774,7 @@ function decodePromptMaterial(value: JsonValue | undefined): PromptMaterial {
   exact(object, [
     'id',
     'task',
+    'origin',
     'images',
     'instructions',
     'context',
@@ -1783,6 +1790,7 @@ function decodePromptMaterial(value: JsonValue | undefined): PromptMaterial {
   return Object.freeze({
     id: requiredString(object.id, 'material.id'),
     task: requiredStringValue(object.task, 'material.task'),
+    ...(object.origin === undefined ? {} : { origin: parseSessionSubmissionOrigin(object.origin) }),
     ...(object.images === undefined ? {} : { images: parseSessionImages(object.images) }),
     instructions: requiredArray(object.instructions, 'material.instructions').map((item, index) =>
       decodePromptInstruction(item, `material.instructions[${String(index)}]`)

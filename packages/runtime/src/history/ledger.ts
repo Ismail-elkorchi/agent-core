@@ -135,6 +135,7 @@ export function mergeMirror(
 }
 
 export function entryIdentity(entry: SessionBranchEntry): string {
+  if (entry.type === 'peer_contribution') return `peer:${entry.contribution.deliveryId}`;
   if (entry.type === 'steering' && entry.deliveryId)
     return `steering:${entry.runId}:${entry.deliveryId}`;
   if (entry.type === 'assistant')

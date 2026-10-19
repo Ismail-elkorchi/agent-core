@@ -1,4 +1,5 @@
 import type { EffectResourcePrecondition } from '@agent-core/effects';
+import type { JsonValue } from '@agent-core/json';
 import type { MissingServiceDetails } from './definition.js';
 import type { ToolPolicy } from './policy.js';
 
@@ -81,6 +82,8 @@ export interface ToolAuthorizationBoundary {
 export interface ToolPlanningContext extends Omit<ToolExecutionContext, 'signal'> {
   readonly signal: AbortSignal;
   readonly boundary: ToolAuthorizationBoundary;
+  /** Host-owned prior plan input for opt-in rebinding. Never grants authority or skips fingerprint checks. */
+  readonly recordedCanonicalInput?: JsonValue;
 }
 
 export interface ToolPlanResource {

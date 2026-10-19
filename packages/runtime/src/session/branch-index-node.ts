@@ -20,7 +20,7 @@ import { SessionHistorySourceError, SessionHistoryIndexPublicationError, type Hi
 import { branchNavigation, branchEntryMetadata, type BranchEntryPosition, type BranchPageSource } from './branch-page.js';
 import { sessionStatePreviewSchema, sessionStateBatchStorageBytes, sessionStateItemRefSchema, validateSessionStateCommit, type SessionStateBatchCommit, type SessionStateItemRevision, type SessionStatePageRequest, type SessionStatePage } from './session-state.js';
 import { assertStateSelection, stateBatch, statePageLimits, stateItemMetadata, statePageResult, decodeStatePageCursor } from './state-records.js';
-import { assertSubmissionOwnership, assertSubmissionTransition, createSessionAdmission } from './submission-lifecycle.js';
+import { assertSubmissionOwnership, assertSubmissionTransition, createSessionAdmission, isAcceptedUserCorrection } from './submission-lifecycle.js';
 import { SessionIndexStore } from './projection-store-node.js';
 import { SessionIndexTree, SessionIndexNodeError } from './projection-tree-node.js';
 import type {
@@ -36,9 +36,9 @@ const locatorSchema = z.strictObject({offset: integer, bytes: z.number().int().p
 type Locator = z.infer<typeof locatorSchema>;
 const stampSchema = z.strictObject({size: integer, mtimeMs: z.number(), ctimeMs: z.number()});
 const rootSchema = z.strictObject({
-  format: z.literal('agent-core.session-projection/11'), generation: id, lineage: z.uuid(), header: z.unknown(),
+  format: z.literal('agent-core.session-projection/13'), generation: id, lineage: z.uuid(), header: z.unknown(),
   summary: z.strictObject({id, timestamp: id, updatedAt: id, preview: z.string().max(160).optional(), provider: id.optional(), model: id.optional(), bindingSchemaId: id, bindingSchemaVersion: z.number().int().positive(), bindingSha256: hash}),
-  tree: hash.nullable(), confirmedRunsRoot: hash.nullable(), leafId: id.nullable(), sourceRevision: integer, acceptedInputRevision: integer, retainedStateBytes: integer, indexedRecords: integer,
+  tree: hash.nullable(), confirmedRunsRoot: hash.nullable(), leafId: id.nullable(), sourceRevision: integer, acceptedInputRevision: integer, acceptedCorrectionRevision: integer, retainedStateBytes: integer, indexedRecords: integer,
   headerBytes: z.number().int().positive().max(16 * 1024 * 1024), completeBytes: integer, lineCount: integer, marker: z.string(), stamp: stampSchema,
   queueFirst: id.nullable(), queueLast: id.nullable(), occupied: id.nullable(), queuedCount: integer, capacity: integer.nullable()
 });
@@ -47,12 +47,14 @@ const statePointerSchema = z.strictObject({entryId:id,itemId:id,revisionId:id,co
 const positionSchema = locatorSchema.extend({
   depth: integer, ancestors: z.array(id).max(53), branchId: id,
   lookupRoot: hash.nullable(), inheritedHeadsRoot: hash.nullable(), activeRunsRoot: hash.nullable(), finalizedRunsRoot: hash.nullable(), unconfirmedRunsRoot: hash.nullable(), confirmedRunsRoot: hash.nullable(),
-  parentId: id.nullable(), identity: id, type: z.enum(['input','steering','assistant','tool_call','observation','branch','model_settings','context_transition','session_state_batch','tool_catalog_selection']),
+  parentId: id.nullable(), identity: id, type: z.enum(['input','steering','peer_contribution','assistant','tool_call','observation','branch','model_settings','context_transition','session_state_batch','tool_catalog_selection']),
+  inputAuthorship: z.literal('model').optional(),
   timestamp: id, runId: id.optional(), toolName: id.optional(), source: historyEventSourceSchema.optional(),
   fromEntryId: id.nullable().optional(), historyPosition: historyCutSchema.optional(),
   stateHeadsRoot: hash.nullable(), stateRevisionsRoot: hash.nullable(), latestInputDepth: z.number().int().min(-1), modelSourceId: id.nullable(), contextId: id.nullable(),
   context: z.strictObject({
-    type: z.enum(['input','steering','assistant','tool_call','observation','branch','model_settings','context_transition','session_state_batch','tool_catalog_selection']),
+    type: z.enum(['input','steering','peer_contribution','assistant','tool_call','observation','branch','model_settings','context_transition','session_state_batch','tool_catalog_selection']),
+    inputAuthorship: z.literal('model').optional(),
     description: z.string().max(400), runId: id.optional(), exchangeId: id.optional(),
     callIndex: integer.optional(), toolBatchId: id.optional(), expectedCalls: integer.optional(),
     prefixBound: z.boolean().optional(), contextRecovery: z.literal(true).optional()
@@ -562,12 +564,14 @@ export class JsonlBranchIndex {
       offset: parsed.offset, bytes: parsed.bytes, line: parsed.line, hash: parsed.hash,
       parentId: parsed.parentId, identity: parsed.identity, type: parsed.type, timestamp: parsed.timestamp,
       stateHeadsRoot: parsed.stateHeadsRoot, stateRevisionsRoot: parsed.stateRevisionsRoot, latestInputDepth: parsed.latestInputDepth, modelSourceId: parsed.modelSourceId, contextId: parsed.contextId,
+      ...(parsed.inputAuthorship === undefined ? {} : {inputAuthorship: parsed.inputAuthorship}),
       ...(parsed.runId === undefined ? {} : {runId: parsed.runId}),
       ...(parsed.toolName === undefined ? {} : {toolName: parsed.toolName}),
       ...(parsed.source === undefined ? {} : {source: parsed.source}),
       ...(parsed.fromEntryId === undefined ? {} : {fromEntryId: parsed.fromEntryId}),
       ...(parsed.historyPosition === undefined ? {} : {historyPosition: parsed.historyPosition}),
       context: {type: context.type, description: context.description,
+        ...(context.inputAuthorship === undefined ? {} : {inputAuthorship: context.inputAuthorship}),
         ...(context.runId === undefined ? {} : {runId: context.runId}),
         ...(context.exchangeId === undefined ? {} : {exchangeId: context.exchangeId}),
         ...(context.callIndex === undefined ? {} : {callIndex: context.callIndex}),
@@ -660,11 +664,11 @@ export class JsonlBranchIndex {
     await this.store.repairStorage();
     const stamp = await jsonlStorageStamp(this.filePath);
     const lineage = randomUUID();
-    const root: Root = {format: 'agent-core.session-projection/11', generation: randomUUID(), lineage, header, summary: {
+    const root: Root = {format: 'agent-core.session-projection/13', generation: randomUUID(), lineage, header, summary: {
       id: header.id, timestamp: header.timestamp, updatedAt: header.timestamp,
       ...(header.provider ? {provider: header.provider} : {}), ...(header.model ? {model: header.model} : {}),
       bindingSchemaId: header.binding.schemaId, bindingSchemaVersion: header.binding.schemaVersion, bindingSha256: header.binding.bindingSha256
-    }, tree: null, confirmedRunsRoot: null, queueFirst: null, queueLast: null, occupied: null, queuedCount: 0, capacity: null, leafId: null, sourceRevision: 0, acceptedInputRevision: 0, retainedStateBytes: 0, indexedRecords: 0, headerBytes: 0, completeBytes: 0, lineCount: 0, marker: '', stamp};
+    }, tree: null, confirmedRunsRoot: null, queueFirst: null, queueLast: null, occupied: null, queuedCount: 0, capacity: null, leafId: null, sourceRevision: 0, acceptedInputRevision: 0, acceptedCorrectionRevision: 0, retainedStateBytes: 0, indexedRecords: 0, headerBytes: 0, completeBytes: 0, lineCount: 0, marker: '', stamp};
     await this.store.commit(async () => {
       await this.scan(root, stamp, options);
       this.store.retireNamespaces(`main-${lineage}`);
@@ -733,6 +737,7 @@ export class JsonlBranchIndex {
     const flush = async () => {if (changes.size > 0) root.tree = await this.main(root).setMany(root.tree, [...changes]);};
     root.sourceRevision++;
     if (record.type === 'input' || record.type === 'steering' || record.type === 'submission.admitted' || record.type === 'submission.revised') root.acceptedInputRevision = root.sourceRevision;
+    if (isAcceptedUserCorrection(record)) root.acceptedCorrectionRevision = root.sourceRevision;
     root.summary = {...root.summary, updatedAt: record.timestamp > root.summary.updatedAt ? record.timestamp : root.summary.updatedAt,
       ...(root.summary.preview === undefined && record.type === 'input' ? {preview: record.task.replace(/\s+/gu, ' ').slice(0,160)} : {})};
     if ('submissionId' in record) {
@@ -933,6 +938,7 @@ export class JsonlBranchIndex {
 
 function sessionRetryKey(record: SessionBranchEntry): string | undefined {
   switch (record.type) {
+    case 'peer_contribution': return `peer:${hashJson(record.contribution.deliveryId)}`;
     case 'input': return `input:${record.runId}`;
     case 'steering': return record.deliveryId === undefined ? undefined : `steering:${hashJson([record.runId,record.deliveryId])}`;
     case 'assistant': return `assistant:${hashJson([record.runId,record.turnId,record.requestAttempt,record.source?.eventId ?? null])}`;

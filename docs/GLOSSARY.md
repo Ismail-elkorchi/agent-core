@@ -5,6 +5,9 @@ events, state fields, and documentation use them consistently.
 
 | Term | Meaning |
 | --- | --- |
+| **participant** | A host-admitted collaboration member with its own session, exact capability grant and continuing budget scope. A participant can execute several ordinary runs; membership does not grant authority over peers. |
+| **assignment** | A revisioned request for participant work, bound to its source selections, correction boundary, capability grant and run. It does not prescribe a planning ontology. |
+| **peer contribution** | Attributed model-authored reference material durably imported into a recipient session under an explicit sharing grant. It is not user steering, verification or a grant of authority. |
 | **run** | One admitted agent execution from task input to suspension or finalization. Core does not call this an operation. |
 | **model output** | Content returned by a model invocation. `candidate` is not a Core synonym. |
 | **context window** | A committed selection of session history and derived artifacts. It can span many completed runs; run completion does not evict history. |

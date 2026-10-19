@@ -1,3 +1,4 @@
+import { parseSessionSubmissionOrigin } from './session/submission-origin.js';
 import { parseNativeToolExposure, type NativeToolExposure } from './orchestration/native-tool-exposure.js';
 import { toolInvocationCaller } from './run/control/tool-state.js';
 import { settledProgramReceiptsThrough, programCompletionContext } from './orchestration/program-observations.js';
@@ -89,6 +90,7 @@ import {
   assertPortableHistoryCompatibility,
   rebuildModelWindowFromRepositories,
   replaySourceEntries,
+  readSelectedHistorySources,
   recordContextExcerpts,
   type ModelWindowReplayResult
 } from './orchestration/session-replay.js';
@@ -176,6 +178,8 @@ import type { AgentToolCallPlanRecord, AgentToolCallState } from './run/control/
 import { pendingToolCalls, assertToolTransitionBoundary } from './run/pending-calls.js';
 import { assertToolCatalogCurrent, captureToolCatalog } from './run/tool-catalog.js';
 import { parseSessionImages } from './session/images.js';
+import type { ParticipantExecutionBinding } from './collaboration/contracts.js';
+import { authorizeCollaborationToolEffects } from './collaboration/tools.js';
 
 export type {} from './run/contracts.js';
 
@@ -211,6 +215,13 @@ export interface AgentRuntimeOptions {
   readonly toolResourceLeases?: ResourceLeaseCoordinator;
   readonly resources?: ExecutionResources;
   readonly inferenceOwnerId?: string;
+  /** Continuing-owner accounting for a supervised root or ordinary scoped invocation. */
+  readonly inferenceScope?: Readonly<{ participantId: string; budgetScopeId: string }>;
+  /** Host-owned participant authority, checked at admission and effect start boundaries. */
+  readonly participant?: ParticipantExecutionBinding;
+  /** Shared-host ownership fence for the supervising session, without a child assignment. */
+  readonly supervisor?: Readonly<{ groupId: string; withCurrent: <T>(operation: () => Promise<T>) => Promise<T> }>;
+  readonly authorizePeerContribution?: (entry: import('./session/contracts.js').SessionPeerContributionEntry, stage: 'read' | 'admit') => Promise<void>;
   readonly modelBindingId?: string;
   readonly toolPolicy?: ToolPolicy;
   readonly toolAuthorizer?: ToolAuthorizer;
@@ -243,6 +254,7 @@ export interface AgentRuntimeOptions {
 }
 
 export interface AgentRunInput {
+  readonly origin?: import('./session/contracts.js').SessionSubmissionOrigin;
   readonly task: string;
   readonly images?: readonly import('./session/images.js').SessionImageInput[];
   readonly runId?: string;
@@ -488,6 +500,37 @@ export class AgentRuntime {
   private static readonly MAX_STEERING_ITEMS = 1024;
 
   constructor(private readonly options: AgentRuntimeOptions) {
+    const participant = options.participant;
+    if (participant && options.supervisor) throw new TypeError('An execution has one collaboration authority owner.');
+    if (options.supervisor) {
+      const supervisor = options.supervisor;
+      if (!supervisor.groupId.trim() || typeof supervisor.withCurrent !== 'function')
+        throw new TypeError('A supervisor requires its exact group and host-owned execution fence.');
+      options = { ...options, supervisor: Object.freeze({ groupId: supervisor.groupId, withCurrent: supervisor.withCurrent.bind(supervisor) }) };
+    }
+    if (participant) {
+      if (!options.inferenceService || options.repositories.session?.descriptor.id !== participant.sessionId ||
+          (options.inferenceOwnerId !== undefined && options.inferenceOwnerId !== participant.budgetOwnerId) ||
+          (options.inferenceScope && (options.inferenceScope.participantId !== participant.participantId ||
+            options.inferenceScope.budgetScopeId !== participant.budgetScopeId)))
+        throw new TypeError('A participant requires its bound session and shared inference owner.');
+      if (typeof participant.assertCurrent !== 'function' || typeof participant.withCurrent !== 'function')
+        throw new TypeError('A participant requires host-owned execution boundary guards.');
+      options = { ...options, participant: Object.freeze({ ...participant,
+        capabilities: Object.freeze({ ...participant.capabilities,
+          toolNames: Object.freeze([...participant.capabilities.toolNames]),
+          ...(participant.capabilities.collaboration ? { collaboration: Object.freeze({
+            actions: Object.freeze([...participant.capabilities.collaboration.actions]),
+            participantIds: Object.freeze([...participant.capabilities.collaboration.participantIds]) }) } : {}) }),
+        assertCurrent: participant.assertCurrent.bind(participant), withCurrent: participant.withCurrent.bind(participant) }),
+        inferenceOwnerId: participant.budgetOwnerId,
+        inferenceScope: Object.freeze({ participantId: participant.participantId, budgetScopeId: participant.budgetScopeId }) };
+    } else if (options.inferenceScope) {
+      if (!options.inferenceService || !options.inferenceOwnerId ||
+          !options.inferenceScope.participantId.trim() || !options.inferenceScope.budgetScopeId.trim())
+        throw new TypeError('Scoped inference requires an explicit shared service, owner and scope identity.');
+      options = { ...options, inferenceScope: Object.freeze({ ...options.inferenceScope }) };
+    }
     const runner = options.programRunner;
     const runnerRevision = runner?.configurationRevision;
     // Capture once before validation, then bind below without rereading a potentially mutable getter.
@@ -513,6 +556,7 @@ export class AgentRuntime {
             repository: options.repositories.session.repository,
             session: options.repositories.session.descriptor,
             events: options.repositories.events,
+            ...(options.authorizePeerContribution ? { authorizePeerContribution: options.authorizePeerContribution } : {}),
             ...(options.repositories.artifacts ? { artifacts: options.repositories.artifacts } : {})
           })
         : undefined);
@@ -575,6 +619,7 @@ export class AgentRuntime {
       operation => this.withStateOwnership(operation)));
     this.tools = Object.freeze(new ToolRegistry([...this.toolCatalog.current(),
       ...(this.toolCatalog.hasSelectionControls() ? createToolCatalogTools({ catalog: this.toolCatalog }) : [])]).list());
+    this.assertParticipantTools(this.tools);
     this.resourceLeases =
       options.toolResourceLeases ??
       options.resources?.resourceLeases ??
@@ -584,9 +629,11 @@ export class AgentRuntime {
 
   run(input: AgentRunInput): AgentRunHandle {
     this.assertOpen();
-    const runId = input.runId ?? randomUUID();
+    const runId = input.runId ?? this.options.participant?.runId ?? randomUUID();
+    if (this.options.participant && runId !== this.options.participant.runId)
+      throw new TypeError('Participant run does not match its admitted assignment.');
     const finalizationId = input.finalizationId ?? randomUUID();
-    return this.startRun({ ...input, runId, finalizationId });
+    return this.startRun({ ...input, ...(input.origin === undefined ? {} : { origin: parseSessionSubmissionOrigin(input.origin) }), runId, finalizationId });
   }
 
   /** Release an idle runtime, including one whose session dispatch was superseded. */
@@ -608,16 +655,25 @@ export class AgentRuntime {
     const runId = run.state().runId;
     const generation = run.state().driverGeneration;
     try {
-      return await this.options.repositories.events.withDriverGeneration(runId, generation, async () => {
+      return await this.withParticipantBoundary(() => this.options.repositories.events.withDriverGeneration(runId, generation, async () => {
         if (this.activeRunDriver !== run || run.state().control.status !== 'owned' ||
             run.state().driverGeneration !== generation || this.activeRunId !== runId)
           throw new AgentRunOwnershipLostError(runId);
         return operation();
-      });
+      }));
     } catch (cause) {
       if (cause instanceof PersistenceDriverOwnershipLostError) throw new AgentRunOwnershipLostError(runId);
       throw cause;
     }
+  }
+
+  private withParticipantBoundary<T>(operation: () => Promise<T>): Promise<T> {
+    const authority = this.options.participant ?? this.options.supervisor;
+    return authority ? authority.withCurrent(operation) : operation();
+  }
+
+  private async assertHistorySourceAccess(cut?: import('./history/contracts.js').HistorySourceCut): Promise<void> {
+    if (this.history && cut) await readSelectedHistorySources(this.history, cut);
   }
 
   /** These facts are observations; only the actual request/effect admission grants authority. */
@@ -644,6 +700,8 @@ export class AgentRuntime {
 
   resume(runId: string, signal?: AbortSignal): AgentRunHandle {
     this.assertOpen();
+    if (this.options.participant && runId !== this.options.participant.runId)
+      throw new TypeError('Participant resume does not match its admitted assignment.');
     if (this.activeAbortController) throw new Error('AgentRuntime already has an active run.');
     const runs = new AgentRunCoordinator(
       this.options.repositories.events,
@@ -754,6 +812,7 @@ export class AgentRuntime {
     const caller = toolInvocationCaller(pendingApproval.batch, pendingApproval.callIndex);
     const authorizationContext = Object.freeze({
       ...this.toolContext(input.signal ?? new AbortController().signal),
+      recordedCanonicalInput: approval.input,
       invocation: Object.freeze({
         runId: input.runId,
         turnId: approval.turnId,
@@ -844,7 +903,7 @@ export class AgentRuntime {
     );
     const runReady = attachedRun
       ? Promise.resolve(attachedRun)
-      : runs.accept(this.runAcceptance(input)).then(() => runs.attach(runId));
+      : this.withParticipantBoundary(() => runs.accept(this.runAcceptance(input)).then(() => runs.attach(runId)));
     this.activeAbortController = abortController;
     this.activeRunId = runId;
     this.activeRunReady = runReady;
@@ -1050,6 +1109,7 @@ export class AgentRuntime {
       }
       const input: ResolvedAgentRunInput = {
         task: run.state().input.task,
+        ...(run.state().input.origin === undefined ? {} : { origin: run.state().input.origin }),
         ...(run.state().input.images === undefined ? {} : { images: run.state().input.images }),
         runId,
         finalizationId: run.state().finalizationId,
@@ -1348,6 +1408,7 @@ export class AgentRuntime {
     return repository.appendInput(descriptor, {
       runId: input.runId,
       task: input.task,
+      ...(input.origin === undefined ? {} : { origin: parseSessionSubmissionOrigin(input.origin) }),
       ...(input.images === undefined ? {} : { images: input.images }),
       instructions:
         original?.type === 'input'
@@ -1479,6 +1540,7 @@ export class AgentRuntime {
       await runtime.append({
         type: 'input.received',
         task: runtime.input.task,
+        ...(runtime.input.origin === undefined ? {} : { origin: runtime.input.origin }),
         ...(runtime.input.images === undefined ? {} : { images: runtime.input.images })
       });
     const sessionEntryId = runtime.sessionInput?.id;
@@ -1708,6 +1770,7 @@ export class AgentRuntime {
             type: 'turn.started' as const,
             runId: runtime.runId,
             task: runtime.input.task,
+            ...(runtime.input.origin === undefined ? {} : { origin: runtime.input.origin }),
             ...activeTurnIdentity,
             ...(this.options.repositories.session
               ? { sessionId: this.options.repositories.session.descriptor.id }
@@ -2007,6 +2070,7 @@ export class AgentRuntime {
       driverGeneration: runtime.run.state().driverGeneration,
       resolveTools: (catalog) => this.catalogTools.get(catalog.revision) ?? this.tools,
       currentTools: async phase => {
+        await this.options.participant?.assertCurrent();
         await this.refreshTools(signal);
         return resolveToolHostEligibility({ tools: this.tools, policy: this.toolPolicy, host: this.toolHostRequirements(phase.modelInputModalities) });
       },
@@ -2038,6 +2102,7 @@ export class AgentRuntime {
         }, runtime.controller.snapshot());
       },
       resourceLeases: this.resourceLeases,
+      ...(this.options.participant || this.options.supervisor ? { withStartBoundary: <T>(operation: () => Promise<T>) => this.withParticipantBoundary(operation) } : {}),
       authorizer: this.authorizeTool,
       ...(this.options.toolContextPrerequisite
         ? { contextPrerequisite: this.options.toolContextPrerequisite }
@@ -2285,14 +2350,15 @@ export class AgentRuntime {
       };
     }
     const failureModelOutput = partialOrAbsent(recoveredModelOutput);
-    if (cause instanceof AgentLimitExceededError) {
+    if (cause instanceof AgentLimitExceededError || cause instanceof InferenceBudgetExceededError) {
       return {
         executionStatus: 'failed',
         terminationReason: 'limit_exhausted',
         modelOutput: failureModelOutput,
         errorMessage: message,
         turnCount,
-        exhaustedLimit: cause.limit
+        exhaustedLimit: cause instanceof AgentLimitExceededError ? cause.limit :
+          cause.resource === 'invocations' ? 'inference_invocations' : cause.resource
       };
     }
     const boundaryError = cause instanceof ModelStreamInterruptedError ? cause.cause : cause;
@@ -2529,6 +2595,7 @@ export class AgentRuntime {
           type: 'turn.started' as const,
           runId: runtime.runId,
           task: runtime.input.task,
+          ...(runtime.input.origin === undefined ? {} : { origin: runtime.input.origin }),
           ...turnIdentity(snapshot.record)
         };
         await runtime.append(started);
@@ -2597,6 +2664,7 @@ export class AgentRuntime {
       await runtime.emit(started);
       const governed = createRunInferenceLifecycle({
         operation: 'native_generation',
+        assertSources: () => this.assertHistorySourceAccess(this.activeHistoryCut),
         service: this.inferenceService,
         options: this.options,
         request,
@@ -2626,6 +2694,7 @@ export class AgentRuntime {
         stateSelectionId: () => nativeStateSelectionId,
         capturedHistoryCut: () => this.options.context?.history.capture(),
         ownerId: this.options.inferenceOwnerId ?? runtime.runId,
+        ...this.options.inferenceScope,
         purpose: 'agent_step',
         runId: runtime.runId,
         request: assembly.request,
@@ -2919,6 +2988,7 @@ export class AgentRuntime {
         let completedAttempt;
         try { completedAttempt = await invokeRunInference({
           service: this.inferenceService,
+          assertSources: () => this.assertHistorySourceAccess(assembly.capturedHistoryCut),
           ...(assembly.capturedHistoryCut ? { capturedHistoryCut: assembly.capturedHistoryCut } : {}),
           ...(this.nativeSteering ? { steering: this.nativeSteering } : {}),
           options: this.options,
@@ -3367,7 +3437,7 @@ export class AgentRuntime {
       recoveryBoundary: hashJson({
         windowId: inspection.window?.windowId ?? null,
         stateSelectionId: inspection.sessionState.selectionId,
-        task: ordinary.input.task, images: ordinary.input.images ?? null,
+        task: ordinary.input.task, origin: ordinary.input.origin ?? null, images: ordinary.input.images ?? null,
         configuration: ordinary.snapshot.configuration, profile: ordinary.snapshot.profile,
         instructions: ordinary.snapshot.instructions, catalog: ordinary.snapshot.record.toolCatalog.revision,
         outputReservation: failure.compiled.accounting.outputReservation
@@ -3577,6 +3647,7 @@ export class AgentRuntime {
           window,
           runId: request.runId,
           task: request.input.task,
+          ...(request.input.origin === undefined ? {} : { origin: request.input.origin }),
           ...(request.input.images === undefined ? {} : { images: request.input.images }),
           instructions: promptInstructionsForRequest({
             runInstructions: request.snapshot.instructions
@@ -3894,6 +3965,7 @@ export class AgentRuntime {
     request: AssistantTurnRequest,
     append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>
   ): Promise<number | undefined> {
+    await this.options.participant?.assertCurrent();
     await this.requestAdmission.admit(compiled, request.snapshot.profile);
     const context = this.options.context;
     if (!this.options.contextRenewal?.automatic || !context ||
@@ -4422,6 +4494,7 @@ export class AgentRuntime {
     const caller = toolInvocationCaller(phase, callIndex);
     const context = Object.freeze({
       ...this.toolContext(signal),
+      recordedCanonicalInput: callState.plan.canonicalInput,
       invocation: Object.freeze({
         runId: run.state().runId,
         ...phase.identity,
@@ -4662,6 +4735,7 @@ export class AgentRuntime {
               await this.inferenceService.cancelBeforeDispatch(
                 {
                   ownerId: this.options.inferenceOwnerId ?? state.runId,
+                  ...this.options.inferenceScope,
                   invocationId: request.invocationId,
                   runId: state.runId
                 },
@@ -4703,6 +4777,7 @@ export class AgentRuntime {
       finalizationId: input.finalizationId,
       input: Object.freeze({
         task: input.task,
+        ...(input.origin === undefined ? {} : { origin: parseSessionSubmissionOrigin(input.origin) }),
         ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
         instructions: Object.freeze([...(input.instructions ?? [])]),
         contextItems: Object.freeze(
@@ -4752,6 +4827,17 @@ export class AgentRuntime {
         policy: this.toolPolicy,
         resourceLifetime: this.options.resources?.lifetime ?? { kind: 'run' },
         inferenceOwnerId: this.options.inferenceOwnerId ?? null,
+        inferenceScope: this.options.inferenceScope ?? null,
+        supervisorGroupId: this.options.supervisor?.groupId ?? null,
+        participant: this.options.participant ? {
+          groupId: this.options.participant.groupId,
+          participantId: this.options.participant.participantId,
+          sessionId: this.options.participant.sessionId,
+          assignmentId: this.options.participant.assignmentId,
+          assignmentRevision: this.options.participant.assignmentRevision,
+          correctionEpoch: this.options.participant.correctionEpoch,
+          capabilityRevision: this.options.participant.capabilityRevision
+        } : null,
         nativeToolExposure: this.options.nativeToolExposure ?? null,
         programRunner: this.options.programRunner ? { toolName: this.options.programRunner.toolName, configurationRevision: this.options.programRunner.configurationRevision, maxConcurrentPrograms: this.options.programRunner.maxConcurrentPrograms ?? 1 } : null
       })
@@ -4811,10 +4897,18 @@ export class AgentRuntime {
   }
   private readonly authorizeTool: ToolAuthorizer = request => {
     const tool = this.tools.find(tool => tool.name === request.call.name && tool.implementationId === request.toolImplementationId);
-    return authorizeToolCatalogEffects(request, tool) ?? (this.options.toolAuthorizer ?? POLICY_TOOL_AUTHORIZER)(request);
+    return authorizeCollaborationToolEffects(request, tool) ?? authorizeToolCatalogEffects(request, tool) ?? (this.options.toolAuthorizer ?? POLICY_TOOL_AUTHORIZER)(request);
   };
   private async refreshTools(signal?: AbortSignal): Promise<void> {
-    this.tools = await resolveRuntimeToolCatalog(this.toolCatalog, signal);
+    const tools = await resolveRuntimeToolCatalog(this.toolCatalog, signal);
+    this.assertParticipantTools(tools);
+    this.tools = tools;
+  }
+
+  private assertParticipantTools(tools: readonly CompiledToolDefinition[]): void {
+    const grant = this.options.participant?.capabilities;
+    if (grant && tools.some(tool => !grant.toolNames.includes(tool.name)))
+      throw new Error('Participant tool catalog exceeds its admitted capability grant.');
   }
   private toolHostRequirements(modelInputModalities?: ModelProfile['modalities']['input']) {
     const context = this.toolContext(new AbortController().signal);
@@ -5183,6 +5277,7 @@ function runInput(
 ): ResolvedAgentRunInput {
   return {
     task: state.input.task,
+    ...(state.input.origin === undefined ? {} : { origin: state.input.origin }),
     ...(state.input.images === undefined ? {} : { images: state.input.images }),
     runId: state.runId,
     finalizationId: state.finalizationId,

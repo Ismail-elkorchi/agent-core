@@ -9,7 +9,7 @@ export function contextMetadataGroups(items: readonly HistorySourceMetadata[], f
   const groups: HistorySourceMetadata[][] = [];
   const responses = new Map<string, HistorySourceMetadata[]>();
   for (const item of items) {
-    if (item.type === 'input' || item.type === 'steering') groups.push([item]);
+    if (item.type === 'input' || item.type === 'steering' || item.type === 'peer_contribution') groups.push([item]);
     else if (item.exchangeId) {
       let group = responses.get(item.exchangeId);
       if (!group) { group = []; responses.set(item.exchangeId, group); groups.push(group); }
@@ -78,7 +78,7 @@ export async function assertContextProtocolClosure(
     historicalPrefixes.delete(item.source.entryId);
     if (item.prefixBound && !ids.has(item.source.entryId) && !portableSources.has(item.source.entryId) && !freshReset)
       throw new Error('Releasing native protocol state requires an explicit fresh continuation.');
-    if (latestPrefix && !ids.has(item.source.entryId) && ['input', 'steering', 'assistant', 'tool_call', 'observation'].includes(item.type)) {
+    if (latestPrefix && !ids.has(item.source.entryId) && ['input', 'steering', 'peer_contribution', 'assistant', 'tool_call', 'observation'].includes(item.type)) {
       const order = await history.orderSources([item.source, latestPrefix], cut);
       if (order[0]?.entryId === item.source.entryId)
         throw new Error('Selected native protocol state requires its complete preceding source prefix.');

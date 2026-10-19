@@ -1,3 +1,4 @@
+import { parseSessionSubmissionOrigin } from '../session/submission-origin.js';
 import { hashJson } from '@agent-core/persistence';
 import { RequestTokenEstimator, type RequestEstimator } from '@agent-core/model';
 import { randomUUID } from 'node:crypto';
@@ -79,6 +80,7 @@ export interface PromptRuntimeControl {
 
 /** Typed material selected by the application and runtime before message framing. */
 export interface PromptMaterial {
+  readonly origin?: import('../session/contracts.js').SessionSubmissionOrigin;
   readonly id: string;
   readonly task: string;
   readonly runtimeControl?: Pick<PromptRuntimeControl, 'kind' | 'id'>;
@@ -179,6 +181,7 @@ export function createPromptMaterial(
   return Object.freeze({
     ...input,
     id: input.id ?? `material_${randomUUID()}`,
+    ...(input.origin === undefined ? {} : { origin: parseSessionSubmissionOrigin(input.origin) }),
     ...(input.runtimeControl ? { runtimeControl: Object.freeze({ ...input.runtimeControl }) } : {}),
     ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
     instructions: Object.freeze(input.instructions.map((item) => Object.freeze({ ...item }))),

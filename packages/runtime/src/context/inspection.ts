@@ -89,7 +89,7 @@ export async function contextSourceManifest(
       tail = next.cursor;
       complete = next.coverage === 'complete';
     }
-    if (item && ['input', 'steering', 'assistant', 'tool_call', 'observation'].includes(item.type)) {
+    if (item && ['input', 'steering', 'peer_contribution', 'assistant', 'tool_call', 'observation'].includes(item.type)) {
       const key = item.exchangeId ?? item.source.entryId;
       let group = groups.get(key);
       if (!group) {

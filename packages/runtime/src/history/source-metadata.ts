@@ -1,14 +1,17 @@
+import { historyInputAuthorship } from './metadata.js';
 import type { SessionBranchEntry } from '../session/contracts.js';
 import type { HistorySourceMetadata } from './contracts.js';
 import { assistantResponseKey } from '../run/contracts.js';
 
 export function historySourceFacts(entry: SessionBranchEntry): Omit<HistorySourceMetadata, 'source' | 'sourceBytes'> {
-  const description = entry.type === 'input' ? entry.task
+  const description = entry.type === 'peer_contribution' ? `Peer ${entry.contribution.sender.participantId}: ${entry.contribution.content}`
+    : entry.type === 'input' ? entry.task
     : entry.type === 'assistant' || entry.type === 'steering' ? entry.content
     : entry.type === 'observation' ? `${entry.toolName}: ${entry.summary}`
     : entry.type === 'tool_call' ? JSON.stringify(entry.call) : entry.type;
   return Object.freeze({
     type: entry.type,
+    ...(historyInputAuthorship(entry) ? { inputAuthorship: 'model' as const } : {}),
     description: description.slice(0, 200),
     ...('runId' in entry ? { runId: entry.runId } : {}),
     ...(entry.type === 'assistant' || entry.type === 'tool_call' || entry.type === 'observation'

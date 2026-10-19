@@ -9,3 +9,12 @@ A frame is limited to 8 MiB; the connection admits at most 32 concurrent request
 A request uses a string, number, or null correlation ID; notifications omit `id`. Duplicate in-flight request IDs are rejected. Malformed envelopes/JSON and invalid parameters use standard JSON-RPC errors; application failures use server errors. Batch notifications produce no response elements. No network listener is started.
 
 The process owns application lifetime. EOF and `application.shutdown` start application cleanup before waiting for in-flight handlers, so cancellation can release those handlers. Output draining has a bounded shutdown deadline. Neither disconnect nor timeout proves an external effect did not happen. Inspect the selected session, pending approvals and unresolved effects, and durable operation/run identities after restart.
+
+
+`collaborationRpcMethods` maps application operations to bounded participant inspection,
+user steering, explicit continuation, interrupt, cancellation and finite waits. Controls
+require exact participant/session/run targets and an expected correction epoch. The RPC
+mapping exposes no capability-grant or budget-owner mutation. Application adapters delegate
+to the canonical collaboration coordinator. `collaboration.read` accepts bounded paging;
+clients reload it on `collaboration.changed` or `delivery.gap` rather than treating delivery
+as lifecycle truth.

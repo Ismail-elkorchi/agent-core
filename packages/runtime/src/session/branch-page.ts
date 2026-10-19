@@ -1,8 +1,9 @@
+import { peerContributionText } from './peer-contribution.js';
 import { HistorySearchIndex } from '../history/search-index.js';
 import type { HistorySearchPosition } from '../history/contracts.js';
 import { hashJson } from '@agent-core/persistence';
 import { historySourceFacts } from '../history/source-metadata.js';
-import { historyToolName } from '../history/metadata.js';
+import { historyInputAuthorship, historyToolName } from '../history/metadata.js';
 import { entryIdentity } from '../history/ledger.js';
 import type {
   SessionSourceMetadata,
@@ -18,6 +19,7 @@ import type {
 } from './contracts.js';
 
 export interface BranchEntryPosition {
+  readonly inputAuthorship?: 'model';
   readonly depth: number;
   readonly ancestors: readonly string[];
   readonly context: SessionSourceMetadata['context'];
@@ -489,6 +491,7 @@ function branchMetadata(record: BranchEntryPosition) {
     ...(record.toolName ? { toolName: record.toolName } : {}),
     identity: record.identity,
     type: record.type,
+    ...(record.inputAuthorship ? { inputAuthorship: record.inputAuthorship } : {}),
     ...(record.runId ? { runId: record.runId } : {}),
     ...(record.source ? { source: record.source } : {}),
     ...(record.fromEntryId === undefined ? {} : { fromEntryId: record.fromEntryId }),
@@ -524,6 +527,7 @@ function branchExcerpt(text: string, match: number, queryLength: number): string
 
 function branchEntryText(entry: SessionBranchEntry): string {
   switch (entry.type) {
+    case 'peer_contribution': return peerContributionText(entry);
     case 'input':
       return entry.task;
     case 'assistant':
@@ -554,6 +558,7 @@ export function branchEntryMetadata(entry: SessionBranchEntry) {
     ...(toolName ? { toolName } : {}),
     identity: entryIdentity(entry),
     type: entry.type,
+    ...(historyInputAuthorship(entry) ? { inputAuthorship: 'model' as const } : {}),
     ...('runId' in entry ? { runId: entry.runId } : {}),
     ...(entry.source ? { source: entry.source } : {}),
     ...(entry.type === 'branch' ? { fromEntryId: entry.fromEntryId } : {}),

@@ -99,3 +99,36 @@ export { SessionToolCatalogSelectionStore } from './session/tool-catalog.js';
 export { programResultSchema } from './orchestration/program-result.js';
 
 export { parseNativeToolExposure, type NativeToolExposure } from './orchestration/native-tool-exposure.js';
+
+export { peerContributionFingerprint } from './session/peer-contribution.js';
+export type { PeerContributionInput } from './session/peer-contribution.js';
+export { ScopedShareService } from './collaboration/sharing.js';
+export type {
+  ScopedShareServiceOptions, PeerEndpoint, ScopedShareSource, ScopedShareGrant,
+  ScopedShareAuthorizationStage, ScopedShareMaterial, ScopedShareLimits
+} from './collaboration/sharing.js';
+
+export { PeerDeliveryService, PeerDeliveryAdmissionError, peerDeliveryEventCodec } from './collaboration/peer-delivery.js';
+export type {
+  PeerDeliveryReceipt, PeerDeliveryEvent, PeerDeliveryServiceOptions, PeerDeliveryAddress,
+  PeerDeliveryRead, PeerDeliveryListRequest, PeerDeliveryList
+} from './collaboration/peer-delivery.js';
+
+export type * from './collaboration/contracts.js';
+export { parseCollaborationPolicy } from './collaboration/contracts.js';
+export { CollaborationCoordinator } from './collaboration/coordinator.js';
+export {
+  EventCollaborationRepository, InMemoryCollaborationRepository,
+  CollaborationConflictError, collaborationEventCodec
+} from './collaboration/repository.js';
+export type {
+  CollaborationRepository, CollaborationEvent, CollaborationHostOwnership,
+  CollaborationHostRequest, CollaborationLifetimeLock
+} from './collaboration/repository.js';
+export { createCollaborationTools, createCollaborationToolHost } from './collaboration/tools.js';
+export type { CollaborationToolHost, CollaborationToolHostOptions, CollaborationProfile } from './collaboration/tools.js';
+
+export { createCollaborationPeerDelivery } from './collaboration/peer-host.js';
+export type { CollaborationPeerDeliveryOptions, CollaborationPeerSendInput } from './collaboration/peer-host.js';
+export { createParticipantArtifactRepository, ParticipantArtifactAccessError } from './collaboration/participant-artifacts.js';
+export type { ParticipantArtifactRepositoryOptions, ParticipantArtifactRepository } from './collaboration/participant-artifacts.js';

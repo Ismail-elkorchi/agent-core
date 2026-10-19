@@ -133,6 +133,13 @@ export type SessionSteeringEntry = BaseSessionEntry &
     readonly relationship?: SessionInputRelationship;
   }>;
 
+/** A recipient-local import, never user steering or a sender write to recipient state. */
+export type SessionPeerContributionEntry = BaseSessionEntry & Readonly<{
+  readonly type: 'peer_contribution';
+  readonly authorship: 'model';
+  readonly contribution: import('./peer-contribution.js').PeerContributionInput;
+}>;
+
 export type SessionAssistantEntry = BaseSessionEntry &
   AgentTurnIdentity &
   Readonly<{
@@ -243,6 +250,7 @@ export interface SessionRunFinalizationConfirmation extends SessionRunFinalizati
 export type SessionBranchEntry =
   | SessionInputEntry
   | SessionSteeringEntry
+  | SessionPeerContributionEntry
   | SessionAssistantEntry
   | SessionToolCallEntry
   | SessionObservationEntry
@@ -255,6 +263,7 @@ export type SessionBranchEntry =
 export type SessionConversationItem =
   | SessionInputEntry
   | SessionSteeringEntry
+  | SessionPeerContributionEntry
   | SessionAssistantEntry
   | SessionToolCallEntry
   | SessionObservationEntry;
@@ -274,7 +283,18 @@ export interface SessionInputRelationship {
     | undefined;
 }
 
+/** Captured by the host when another agent assigns work; never supplied by user RPC input. */
+export interface SessionSubmissionOrigin {
+  readonly kind: 'delegated_assignment';
+  readonly groupId: string;
+  readonly participantId: string;
+  readonly assignmentId: string;
+  readonly assignmentRevision: number;
+  readonly sender: { readonly sessionId: string; readonly participantId?: string; readonly runId?: string };
+}
+
 export interface SessionSubmissionInput {
+  readonly origin?: SessionSubmissionOrigin;
   readonly relationship?: SessionInputRelationship;
   readonly task: string;
   readonly images?: readonly import('./images.js').SessionImageInput[];
@@ -450,6 +470,7 @@ export interface SessionSourceMetadata {
   readonly sha256: string;
   readonly bytes: number;
   readonly type: SessionBranchEntry['type'];
+  readonly inputAuthorship?: 'model';
   readonly runId?: string;
   readonly source?: import('../history/contracts.js').HistoryEventSource;
   readonly fromEntryId?: string | null;
@@ -494,6 +515,8 @@ export interface SessionRepository {
   list(): Promise<readonly SessionSummary[]>;
   loadReplayState(session: SessionDescriptor, leafId?: string | null): Promise<SessionReplayState>;
   revision(session: SessionDescriptor): Promise<number>;
+  /** Latest durable user steering, correction, replacement, or queued replacement; zero before any. */
+  acceptedCorrectionRevision(session: SessionDescriptor): Promise<number>;
   currentModelSettings(session: SessionDescriptor): Promise<ModelSelection | undefined>;
   currentToolCatalogSelection(session: SessionDescriptor): Promise<import('@agent-core/tools').ToolCatalogSelectionState>;
   findToolCatalogSelection(session: SessionDescriptor, operationId: string): Promise<import('@agent-core/tools').ToolCatalogSelectionState | undefined>;
@@ -516,6 +539,7 @@ export interface SessionRepository {
     input: {
       runId: string;
       task: string;
+      origin?: SessionSubmissionOrigin;
       images?: SessionSubmissionInput['images'];
       instructions?: readonly AgentEffectiveInstruction[];
     }
@@ -530,6 +554,13 @@ export interface SessionRepository {
       originalInput?: SessionSubmissionInput;
     }
   ): Promise<SessionSteeringEntry>;
+  appendPeerContribution(
+    session: SessionDescriptor,
+    input: import('./peer-contribution.js').PeerContributionInput,
+    options?: { readonly withOwnership?: (<T>(operation: () => Promise<T>) => Promise<T>) | undefined }
+  ): Promise<SessionPeerContributionEntry>;
+  /** Exact durable recipient import lookup, including imports outside the current branch. */
+  findPeerContribution(session: SessionDescriptor, deliveryId: string): Promise<SessionPeerContributionEntry | undefined>;
   appendAssistant(
     session: SessionDescriptor,
     input: {

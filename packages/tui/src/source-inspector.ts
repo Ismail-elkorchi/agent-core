@@ -86,7 +86,7 @@ export type SourceInspectorMessage =
     }
   | { readonly type: 'inspector.notice'; readonly message: string };
 const source = (entry: ConversationEntry) =>
-  entry.kind === 'activity' || entry.kind === 'reference' ? conversationText(entry) : entry.text;
+  entry.kind === 'activity' || entry.kind === 'reference' || entry.kind === 'peer' || entry.kind === 'assignment' ? conversationText(entry) : entry.text;
 const label = (entry: ConversationEntry) =>
   `${entry.kind} · ${
     source(entry)

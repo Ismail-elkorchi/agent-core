@@ -79,6 +79,8 @@ export {
   sessionConversationId,
   type ConversationActivityEntry,
   type ConversationAssistantEntry,
+  type ConversationPeerEntry,
+  type ConversationAssignmentEntry,
   type ConversationEntry,
   type ConversationNoticeEntry,
   type ConversationReasoningEntry,
@@ -190,3 +192,5 @@ export type {
 export * from './conversation-view.js';
 
 export * from './chrome.js';
+
+export { collaborationPanel, type CollaborationOperations, type CollaborationPanelState, type CollaborationPanelMessage } from './collaboration.js';

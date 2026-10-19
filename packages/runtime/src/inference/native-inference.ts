@@ -122,6 +122,8 @@ export async function invokeNativeInference(
   const initialContext: NativeGenerationContext = {
     invocationId: input.invocationId,
     ownerId: input.ownerId,
+    ...(input.participantId === undefined ? {} : { participantId: input.participantId }),
+    ...(input.budgetScopeId === undefined ? {} : { budgetScopeId: input.budgetScopeId }),
     ...(input.runId ? { runId: input.runId } : {}),
     purpose: input.purpose,
     ...(input.parentInvocationId ? { parentInvocationId: input.parentInvocationId } : {}),
@@ -147,6 +149,8 @@ export async function invokeNativeInference(
       const context: NativeGenerationContext = {
         invocationId: `native-${hashJson({ parentInvocationId: input.invocationId, generationId })}`,
         ownerId: input.ownerId,
+        ...(input.participantId === undefined ? {} : { participantId: input.participantId }),
+        ...(input.budgetScopeId === undefined ? {} : { budgetScopeId: input.budgetScopeId }),
         ...(input.runId ? { runId: input.runId } : {}),
         parentInvocationId: input.invocationId,
         purpose: 'native_continuation',

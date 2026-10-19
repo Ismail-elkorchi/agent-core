@@ -1,3 +1,4 @@
+import { ownPeerContributionInput, samePeerContribution, decodePeerContributionEntry } from './peer-contribution.js';
 import { decodeSessionToolCatalogSelection, emptySessionToolCatalogSelection, toolCatalogSelectionOwner } from './tool-catalog.js';
 import { parseToolCatalogSelection, type ToolCatalogSelectionState } from '@agent-core/tools';
 import { createSessionRunFinalizationConfirmation } from './finalization-confirmation.js';
@@ -74,6 +75,7 @@ import { captureObservationInput } from './observation.js';
 import { ownSessionSteeringInput, sameSessionSteering } from './steering-input.js';
 import {
   createQueuedSubmissionUpdate,
+  isAcceptedUserCorrection,
   createSessionAdmission,
   sessionSubmission,
   initialSessionModelSelection,
@@ -82,6 +84,7 @@ import {
   assertSessionAdmissionConfiguration,
   createSessionSubmissionTransition,
   originalAcceptedInput,
+  materializedSessionInput,
   pendingSessionSubmissions
 } from './submission-lifecycle.js';
 
@@ -134,7 +137,7 @@ export class InMemorySessionRepository implements SessionRepository {
         ...(options.provider ? { provider: options.provider } : {}),
         ...(options.model ? { model: options.model } : {})
       });
-      const state = { header, branchEntries: [], finalizations: [], confirmations: [], submissionRecords: [], acceptedInputRevision: 0, retainedStateBytes: 0, stateIndexes: new Map<string,MemoryStateIndex>(), catalogIndexes: new Map<string, MemoryCatalogIndex>() };
+      const state = { header, branchEntries: [], finalizations: [], confirmations: [], submissionRecords: [], acceptedInputRevision: 0, acceptedCorrectionRevision: 0, retainedStateBytes: 0, peerDeliveries: new Map<string, import('./contracts.js').SessionPeerContributionEntry>(), stateIndexes: new Map<string,MemoryStateIndex>(), catalogIndexes: new Map<string, MemoryCatalogIndex>() };
       this.states.set(id, state);
       return sessionFromState(state);
     });
@@ -194,6 +197,9 @@ export class InMemorySessionRepository implements SessionRepository {
       const state = this.requireDescriptor(session);
       return state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length;
     });
+  }
+  acceptedCorrectionRevision(session: SessionDescriptor): Promise<number> {
+    return this.serial(() => this.requireDescriptor(session).acceptedCorrectionRevision);
   }
   currentModelSettings(session: SessionDescriptor): Promise<ModelSelection | undefined> {
     return this.serial(() => {
@@ -423,7 +429,7 @@ export class InMemorySessionRepository implements SessionRepository {
         runId: input.runId,
         task: input.task,
         ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
-        ...originalAcceptedInput(state.submissionRecords, input.runId),
+        ...materializedSessionInput(originalAcceptedInput(state.submissionRecords, input.runId), input),
         instructions: Object.freeze(
           (input.instructions ?? []).map((instruction) => Object.freeze({ ...instruction }))
         )
@@ -462,6 +468,26 @@ export class InMemorySessionRepository implements SessionRepository {
       });
       appendBranchRecord(state, entry);
       return entry;
+    });
+  }
+
+  findPeerContribution(session: SessionDescriptor, deliveryId: string) {
+    return this.serial(() => this.requireDescriptor(session).peerDeliveries.get(deliveryId));
+  }
+
+  appendPeerContribution(session: SessionDescriptor, input: Parameters<SessionRepository['appendPeerContribution']>[1], options: Parameters<SessionRepository['appendPeerContribution']>[2] = {}) {
+    const owned = ownPeerContributionInput(input);
+    if (owned.recipient.sessionId !== session.id) throw new Error('Peer contribution recipient session does not match.');
+    return this.serial(async () => {
+      const state = this.requireDescriptor(session);
+      const existing = state.peerDeliveries.get(owned.deliveryId);
+      if (existing?.type === 'peer_contribution') return samePeerContribution(existing, owned);
+      const publish = () => {
+        const entry = decodePeerContributionEntry({ ...baseEntry(branchLeaf(state.branchEntries)), type: 'peer_contribution', authorship: 'model', contribution: owned });
+        appendBranchRecord(state, entry);
+        return Promise.resolve(entry);
+      };
+      return options.withOwnership ? options.withOwnership(publish) : publish();
     });
   }
 
@@ -772,6 +798,7 @@ export class InMemorySessionRepository implements SessionRepository {
       const record = createSessionAdmission(state.submissionRecords, input);
       state.submissionRecords.push(record);
       state.acceptedInputRevision = state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length;
+      if (isAcceptedUserCorrection(record)) state.acceptedCorrectionRevision = state.acceptedInputRevision;
       const admitted = sessionSubmission(state.submissionRecords, record.submissionId);
       if (!admitted || (admitted.state !== 'claimed' && admitted.state !== 'queued'))
         throw new Error('Committed admission has no pending submission.');
@@ -832,7 +859,10 @@ export class InMemorySessionRepository implements SessionRepository {
       state.submissionRecords.push(
         createQueuedSubmissionUpdate(state.submissionRecords, submissionId, change)
       );
-      if (change.kind === 'replace') state.acceptedInputRevision = state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length;
+      if (change.kind === 'replace') {
+        state.acceptedInputRevision = state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length;
+        state.acceptedCorrectionRevision = state.acceptedInputRevision;
+      }
     });
   }
 
@@ -865,7 +895,9 @@ function sessionUpdatedAt(state: SessionState): string {
 
 interface SessionState {
   acceptedInputRevision: number;
+  acceptedCorrectionRevision: number;
   retainedStateBytes: number;
+  readonly peerDeliveries: Map<string, import('./contracts.js').SessionPeerContributionEntry>;
   readonly stateIndexes: Map<string,MemoryStateIndex>;
   readonly catalogIndexes: Map<string, MemoryCatalogIndex>;
   readonly header: SessionHeader;
@@ -904,7 +936,9 @@ function appendBranchRecord(state: SessionState, entry: SessionBranchEntry): voi
   const batch = stateBatch(entry);
   if (batch) state.retainedStateBytes += sessionStateBatchStorageBytes(batch);
   state.branchEntries.push(entry);
+  if (entry.type === 'peer_contribution') state.peerDeliveries.set(entry.contribution.deliveryId, entry);
   if (entry.type === 'input' || entry.type === 'steering') state.acceptedInputRevision = state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length;
+  if (isAcceptedUserCorrection(entry)) state.acceptedCorrectionRevision = state.acceptedInputRevision;
   memoryBranchSource(state.header.id, state.branchEntries);
 }
 
@@ -960,6 +994,7 @@ function sameSessionInput(
 ): boolean {
   return (
     existing.task === input.task &&
+    hashJson(existing.originalInput?.origin ?? null) === hashJson(input.origin ?? null) &&
     JSON.stringify(existing.images ?? []) === JSON.stringify(input.images ?? []) &&
     JSON.stringify(existing.instructions) === JSON.stringify(input.instructions ?? [])
   );

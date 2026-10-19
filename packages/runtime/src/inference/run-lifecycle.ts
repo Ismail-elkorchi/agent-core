@@ -51,6 +51,7 @@ import type { AgentRunProcedure } from '../run/control/contracts.js';
 import { providerWork } from '../run/control/contracts.js';
 import type { AgentRunAdvance, AgentRunDriver } from '../run/control/driver.js';
 import type { NativeSteeringCoordinator } from './native-steering.js';
+import type { ParticipantExecutionBinding } from '../collaboration/contracts.js';
 import {
   InferenceContextRejectedError,
   InferenceOutcomeUnknownError,
@@ -70,12 +71,16 @@ export type RunInferenceResult =
     }
   | { readonly kind: 'outcome_unknown'; readonly effectId: string };
 export interface RunInferenceInput {
+  readonly assertSources?: () => Promise<void>;
   readonly capturedHistoryCut?: HistorySourceCut | undefined;
   readonly service: InferenceService;
   readonly steering?: NativeSteeringCoordinator;
   readonly options: {
     readonly provider: ModelProvider;
     readonly inferenceOwnerId?: string;
+    readonly inferenceScope?: Readonly<{ participantId: string; budgetScopeId: string }>;
+    readonly participant?: ParticipantExecutionBinding;
+    readonly supervisor?: Readonly<{ groupId: string; withCurrent: <T>(operation: () => Promise<T>) => Promise<T> }>;
     readonly repositories: { readonly artifacts?: ArtifactRepository };
     readonly recordLogicalRequest?: (record: LogicalModelRequestRecord) => void | Promise<void>;
   };
@@ -200,6 +205,8 @@ export function createRunInferenceLifecycle(
           ? {}
           : { contextWindowTokens: turnRequest.snapshot.profile.limits.contextTokens })
       });
+      const start = async () => {
+      await input.assertSources?.();
       const exactRequest = recordableModelRequest(request);
       const parametersDigest = input.compiled.inputIdentity.replace(/^sha256:/u, '');
       const recovery = input.options.provider.requestRecovery
@@ -251,6 +258,9 @@ export function createRunInferenceLifecycle(
         stage: 'effect_pending',
         effect: started.state
       }));
+      };
+      const authority = input.options.participant ?? input.options.supervisor;
+      return authority ? authority.withCurrent(start) : start();
     },
     settle: async (responseWithPrivateState) => {
       await input.steering?.finishResponse();
@@ -469,6 +479,7 @@ export async function invokeRunInference(input: RunInferenceInput): Promise<RunI
     {
       invocationId: input.requestFingerprint.requestId,
       ownerId: input.options.inferenceOwnerId ?? input.turnRequest.runId,
+      ...input.options.inferenceScope,
       purpose: input.turnRequest.snapshot.record.contextRecovery ? 'context_recovery' : 'agent_step',
       runId: input.turnRequest.runId
     }

@@ -7,3 +7,5 @@ export type { JsonlInferenceRepositoryOptions } from './inference/repository-nod
 
 export { SessionHistoryIndexError, SessionHistorySourceError, SessionHistoryIndexPublicationError } from './session/history-index.js';
 export type { HistoryIndexRebuildOptions, HistoryIndexRecoveryOptions, HistoryIndexRecoveryProgress } from './session/history-index.js';
+
+export { JsonlCollaborationRepository } from './collaboration/repository-node.js';

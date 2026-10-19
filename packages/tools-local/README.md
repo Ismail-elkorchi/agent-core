@@ -34,3 +34,11 @@ Completed command polling reads retained protected output after live buffers exp
 Both host factories require `artifactReadMaxBytes` and compose the repository-backed `createReadArtifactTool` from `@agent-core/tools`. Artifact reading does not require local file authority when composed directly. Local artifact configuration covers image validation only.
 
 `readPendingTerminalReports` reads an owner-scoped, byte-bounded page of immutable public terminal metadata. Its monotonic cursor survives acknowledgement of earlier reports; acknowledged data is removed from the active index. `finalizationPending` describes terminal-record durability, while `handoffPending` describes unfinished acknowledgement (a durable release may already exist). Request preparation never writes a report inventory. Protected artifact references are excluded from this view.
+
+A `LocalCommandExecution` instance exclusively owns its process ledger for its
+lifetime. It acquires that ownership before reconciliation and releases it only
+after closing and settling its managed processes. A second live manager cannot
+reconcile or stop the first manager's processes. Share one manager among
+cooperating clients/participants, with separate resource-owner identities, and
+close it after the last attachment releases. This is process supervision and
+cooperative resource coordination, not sandbox isolation.

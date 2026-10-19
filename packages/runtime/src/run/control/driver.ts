@@ -232,6 +232,29 @@ export class AgentRunCoordinator {
   }
 
   async readTerminal(inspection: AgentRunInspection): Promise<AgentTerminalSnapshot> {
+    const record = await this.readTerminalRecord(inspection);
+    return record.event.terminal;
+  }
+
+  async readTerminalReference(inspection: AgentRunInspection) {
+    const record = await this.readTerminalRecord(inspection);
+    return Object.freeze({ runId: record.runId, eventId: record.eventId, sequence: record.sequence, hash: record.hash });
+  }
+
+  async readPartialResultReference(reference: import('@agent-core/persistence').EventReference, expectedRunId: string) {
+    return (await this.readPartialResult(reference, expectedRunId)).source;
+  }
+
+  async readPartialResult(reference: import('@agent-core/persistence').EventReference, expectedRunId: string) {
+    if (reference.runId !== expectedRunId) throw new Error('Partial result belongs to another run.');
+    const record = await this.events.readReference(reference);
+    if (record.event.type !== 'assistant.ended' && record.event.type !== 'assistant.interrupted')
+      throw new Error('Partial result must identify an original assistant contribution.');
+    return Object.freeze({ source: Object.freeze({ runId: record.runId, eventId: record.eventId, sequence: record.sequence, hash: record.hash }),
+      content: record.event.content, modelOutputStatus: record.event.modelOutput.status });
+  }
+
+  private async readTerminalRecord(inspection: AgentRunInspection) {
     const record = await this.events.latestOfType(inspection.state.runId, 'run.ended');
     if (
       inspection.state.phase.kind !== 'terminal' ||
@@ -239,7 +262,7 @@ export class AgentRunCoordinator {
       record.eventId !== inspection.state.phase.resultEventId
     )
       throw new Error(`Run ${inspection.state.runId} has no matching committed terminal result.`);
-    return record.event.terminal;
+    return { ...record, event: record.event };
   }
 
   /** Read reported diagnostics for uncertain calls by identity, without replaying history. */

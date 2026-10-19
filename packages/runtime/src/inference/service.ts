@@ -52,6 +52,8 @@ import {
 } from './native-inference.js';
 import type {
   InferenceBudget,
+  InferenceBudgetScopeBinding,
+  InferenceBudgetScopeState,
   InferenceEvent,
   InferenceIdentity,
   InferenceOwnerState,
@@ -132,6 +134,8 @@ export class InferenceOutcomeUnknownError extends Error {
 }
 export interface InferenceBudgetDiagnostic {
   readonly resource: 'invocations' | 'prompt_tokens' | 'completion_tokens' | 'known_cost';
+  readonly budgetScopeId?: string;
+  readonly participantId?: string;
   readonly ownerId: string;
   readonly invocationId: string;
   readonly inputIdentity: string;
@@ -161,7 +165,7 @@ export class InferenceBudgetExceededError extends Error {
         ? ` Candidate input reserves ${String(diagnostic.inputAccounting.reservation)} tokens from the finite model input bound because ${diagnostic.inputAccounting.unknownKinds.join(', ')} is uncounted; compiled accounting is ${String(diagnostic.inputAccounting.tokens)} tokens.`
         : '';
     super(
-      `Inference owner allowance exceeded (${diagnostic.resource}): ` +
+      `Inference ${diagnostic.budgetScopeId === undefined ? 'owner' : 'participant scope'} allowance exceeded (${diagnostic.resource}): ` +
       `${String(diagnostic.settled)} settled + ${String(diagnostic.outstanding)} outstanding reservations + ` +
       `${String(diagnostic.candidate)} candidate${replaced} = ${String(diagnostic.projected)}; ` +
       `limit ${String(diagnostic.limit)}${currency}.${bound}`
@@ -255,42 +259,83 @@ export class InferenceService {
   }
 
   private ownerBudget(state: InferenceOwnerState): InferenceBudget {
-    const recorded = state.latestInvocation?.start.limits;
+    const recorded = state.limits;
     if (recorded && this.options.budget !== undefined && hashJson(recorded) !== hashJson(this.options.budget))
       throw new Error('Inference owner budget policy changed after admission.');
     return recorded ?? this.options.budget ?? {};
+  }
+
+  /** Register one immutable participant allowance in the same journal as owner reservations. */
+  async registerBudgetScope(
+    input: InferenceBudgetScopeBinding & { readonly ownerId: string }
+  ): Promise<InferenceBudgetScopeState> {
+    const binding = Object.freeze({
+      ownerId: input.ownerId,
+      participantId: input.participantId,
+      scopeId: input.scopeId,
+      budget: parseInferenceBudget(input.budget)
+    });
+    if (![binding.ownerId, binding.participantId, binding.scopeId].every(value => typeof value === 'string' && value.trim()))
+      throw new Error('Inference owner, participant, and budget scope must be non-empty identifiers.');
+    for (;;) {
+      const state = await this.options.repository.load(binding.ownerId);
+      const limits = this.ownerBudget(state);
+      const existing = Object.values(state.budgetScopes).find(scope =>
+        scope.scopeId === binding.scopeId || scope.participantId === binding.participantId);
+      if (existing) {
+        if (existing.scopeId !== binding.scopeId || existing.participantId !== binding.participantId ||
+            hashJson(existing.budget) !== hashJson(binding.budget))
+          throw new Error('Inference participant budget scope or policy changed after registration.');
+        return existing;
+      }
+      if (await this.options.repository.append(binding.ownerId, {
+        ...binding, type: 'inference.scope_registered', format: 'agent-core.inference/2', limits
+      }, state.tail)) {
+        const registered = (await this.options.repository.load(binding.ownerId)).budgetScopes[binding.scopeId];
+        if (!registered) throw new Error('Inference scope registration did not persist.');
+        return registered;
+      }
+    }
+  }
+
+  private budgetScope(
+    state: InferenceOwnerState,
+    identity: Pick<InferenceIdentity, 'participantId' | 'budgetScopeId'>,
+    admitted = false
+  ): InferenceBudgetScopeState | undefined {
+    if (admitted && (!state.invocation || state.invocation.start.participantId !== identity.participantId ||
+        state.invocation.start.budgetScopeId !== identity.budgetScopeId))
+      throw new Error('Inference participant budget scope differs from its admitted invocation.');
+    const scope = identity.budgetScopeId === undefined || !Object.hasOwn(state.budgetScopes, identity.budgetScopeId)
+      ? undefined : state.budgetScopes[identity.budgetScopeId];
+    if (identity.budgetScopeId !== undefined && (!scope || scope.participantId !== identity.participantId))
+      throw new Error('Inference requires its registered participant budget scope.');
+    if (!scope && !admitted && Object.keys(state.budgetScopes).length > 0)
+      throw new Error('Inference participant budget scope cannot be omitted for this owner.');
+    return scope;
+  }
+
+  /** Read a participant's durable allowance without reserving or authorizing work. */
+  async inspectBudgetScopeAllowance(ownerId: string, scopeId: string) {
+    const state = await this.options.repository.load(ownerId);
+    this.ownerBudget(state);
+    const scope = Object.hasOwn(state.budgetScopes, scopeId) ? state.budgetScopes[scopeId] : undefined;
+    if (!scope) throw new Error('Inference participant budget scope is not registered.');
+    return Object.freeze({ ownerId, participantId: scope.participantId, budgetScopeId: scope.scopeId,
+      ...allowanceSnapshot(state.tail, scope.budget, scope.committed, scope.settledUsage) });
   }
 
   /** Read the existing owner ledger; this snapshot neither reserves nor authorizes work. */
   async inspectOwnerAllowance(ownerId: string) {
     const state = await this.options.repository.load(ownerId);
     const limits = this.ownerBudget(state);
-    const outstanding = {
-      invocations: state.committed.invocations - state.settledUsage.invocations,
-      promptTokens: state.committed.usage.promptTokens - state.settledUsage.usage.promptTokens,
-      completionTokens: state.committed.usage.completionTokens - state.settledUsage.usage.completionTokens,
-      unknownPricedTokens: state.committed.unknownPricedTokens - state.settledUsage.unknownPricedTokens,
-      knownCosts: Object.fromEntries(Object.entries(state.committed.knownCosts)
-        .map(([currency, amount]) => [currency, amount - (state.settledUsage.knownCosts[currency] ?? 0)]))
-    };
-    return Object.freeze({ ownerId, ledgerTail: state.tail, limits,
-      settled: state.settledUsage, outstanding: Object.freeze(outstanding),
-      remaining: Object.freeze({
-        ...(limits.maxInvocations === undefined ? {} : { invocations: Math.max(0, limits.maxInvocations - state.committed.invocations) }),
-        ...(limits.maxPromptTokens === undefined ? {} : { promptTokens: Math.max(0, limits.maxPromptTokens - state.committed.usage.promptTokens) }),
-        ...(limits.maxCompletionTokens === undefined ? {} : { completionTokens: Math.max(0, limits.maxCompletionTokens - state.committed.usage.completionTokens) }),
-        ...(limits.maxKnownCost === undefined ? {} : { knownCost: {
-          currency: limits.maxKnownCost.currency,
-          amount: Math.max(0, limits.maxKnownCost.amount - (state.committed.knownCosts[limits.maxKnownCost.currency] ?? 0))
-        } })
-      }),
-      meaning: 'Remaining allowance subtracts settled usage and outstanding exposure. Missing limits are unbounded by this owner policy. Known cost excludes unpriced usage; it is not a hard monetary ceiling. Actual admission is transactional and may differ after this ledger cut.'
-    });
+    return Object.freeze({ ownerId, budgetScopes: state.budgetScopes,
+      ...allowanceSnapshot(state.tail, limits, state.committed, state.settledUsage) });
   }
 
   /** The caller must durably fence dispatch and prove this invocation has never started. */
   async cancelBeforeDispatch(
-    identity: Pick<InferenceIdentity, 'ownerId' | 'invocationId' | 'runId'>,
+    identity: Pick<InferenceIdentity, 'ownerId' | 'invocationId' | 'runId' | 'participantId' | 'budgetScopeId'>,
     message: string
   ): Promise<void> {
     const { repository } = this.options;
@@ -299,6 +344,7 @@ export class InferenceService {
       const prior = state.invocation;
       if (prior?.start.runId !== (identity.runId ?? null))
         throw new Error('Inference cancellation does not match its admitted invocation.');
+      this.budgetScope(state, identity, true);
       if (prior.notSent) return;
       if (prior.settlement || prior.uncertain || prior.rejected || prior.extension)
         throw new Error('Inference admission cannot be released after dispatch evidence.');
@@ -535,7 +581,6 @@ export class InferenceService {
     const { repository, artifacts } = this.options;
     capturedHistoryCut = capturedHistoryCut === undefined ? undefined : historyCutSchema.parse(capturedHistoryCut);
     await this.admit(compiled, context.profile);
-    const reservation = inferenceReservation(compiled, context.profile, this.ownerBudget(await repository.load(context.ownerId)));
     const fingerprint = (
       await modelInputIdentity({
         identity: ownIdentity(context),
@@ -558,14 +603,18 @@ export class InferenceService {
         current.rejected
       )
         throw new Error('Native input extension requires an unresolved admitted generation.');
+      const scope = this.budgetScope(state, context, true);
+      const limits = this.ownerBudget(state);
+      const reservation = inferenceReservation(compiled, context.profile, [limits, ...(scope ? [scope.budget] : [])]);
       if (current.extension?.fingerprint === fingerprint) return;
-      assertBudget({
+      assertAdmissionBudgets({
         state,
         reservation,
         identity: context,
         compiled,
         profile: context.profile,
-        limits: this.ownerBudget(state),
+        limits,
+        ...(scope ? { scope } : {}),
         replacing: current.extension?.reservation ?? current.start.reservation
       });
       const requestRef = await artifacts.storeProtected({
@@ -574,6 +623,7 @@ export class InferenceService {
         content: new TextEncoder().encode(
           JSON.stringify({
             invocationId: context.invocationId,
+            ...(context.participantId === undefined ? {} : { participantId: context.participantId, budgetScopeId: context.budgetScopeId }),
             stateSelectionId,
             capturedHistoryCut,
             nativeDispatch: nativeDispatchProvenance(dispatch),
@@ -716,9 +766,10 @@ export class InferenceService {
     const { repository, artifacts } = this.options;
     (input.signal ?? input.request.signal)?.throwIfAborted();
     const identity = ownIdentity(input);
-    const existing = (
-      await repository.load(identity.ownerId, { invocationId: identity.invocationId })
-    ).invocation;
+    const state = await repository.load(identity.ownerId, { invocationId: identity.invocationId });
+    const existing = state.invocation;
+    this.ownerBudget(state);
+    this.budgetScope(state, identity, existing !== undefined);
     if (!existing) return undefined;
     if (
       existing.start.sourceFingerprint !==
@@ -734,8 +785,6 @@ export class InferenceService {
       throw new Error(
         `Inference ${identity.invocationId} was already admitted with different input or configuration.`
       );
-    if (this.options.budget !== undefined && hashJson(existing.start.limits) !== hashJson(this.options.budget))
-      throw new Error('Inference owner budget policy changed after admission.');
     if (input.profile || input.compiled) {
       const record = parseJsonObject(
         JSON.parse(
@@ -827,7 +876,6 @@ export class InferenceService {
         nativeDispatch: input.nativeDispatch ? nativeDispatchProvenance(input.nativeDispatch) : null
       })
     ).slice(7);
-    const reservation = inferenceReservation(compiled, profile, this.ownerBudget(await repository.load(identity.ownerId)));
     let start: Extract<InferenceEvent, { type: 'inference.started' }>;
     for (;;) {
       signal?.throwIfAborted();
@@ -835,6 +883,8 @@ export class InferenceService {
         invocationId: identity.invocationId
       });
       const existing = state.invocation;
+      const limits = this.ownerBudget(state);
+      const scope = this.budgetScope(state, identity, existing !== undefined);
       if (existing) {
         if (existing.start.fingerprint !== fingerprint)
           throw new Error(
@@ -871,8 +921,8 @@ export class InferenceService {
             'A prior invocation crossed its durable start boundary; replay requires provider outcome evidence.'
         );
       }
-      const limits = this.ownerBudget(state);
-      assertBudget({ state, reservation, limits, identity, compiled, profile });
+      const reservation = inferenceReservation(compiled, profile, [limits, ...(scope ? [scope.budget] : [])]);
+      assertAdmissionBudgets({ state, reservation, limits, identity, compiled, profile, ...(scope ? { scope } : {}) });
       const requestRef = await artifacts.storeProtected({
         label: `inference-${input.operation}-request`,
         mediaType: 'application/json',
@@ -880,6 +930,7 @@ export class InferenceService {
           JSON.stringify({
             invocationId: identity.invocationId,
             runId: identity.runId ?? null,
+            ...(identity.participantId === undefined ? {} : { participantId: identity.participantId, budgetScopeId: identity.budgetScopeId }),
             ...(this.presentations.has(compiled)
               ? { presentation: this.presentations.get(compiled) }
               : {}),
@@ -902,7 +953,7 @@ export class InferenceService {
         ...identity,
         runId: identity.runId ?? null,
         type: 'inference.started',
-        format: 'agent-core.inference/1',
+        format: 'agent-core.inference/2',
         operation: input.operation,
         fingerprint,
         sourceFingerprint,
@@ -1077,12 +1128,17 @@ function ownIdentity(input: InferenceIdentity): InferenceIdentity {
   if (
     !/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/u.test(input.invocationId) ||
     !input.ownerId.trim() ||
-    !input.purpose.trim()
+    !input.purpose.trim() ||
+    ((input.participantId === undefined) !== (input.budgetScopeId === undefined)) ||
+    (input.participantId !== undefined && !input.participantId.trim()) ||
+    (input.budgetScopeId !== undefined && !input.budgetScopeId.trim())
   )
     throw new Error('Inference identity and purpose must be non-empty identifiers.');
   return Object.freeze({
     invocationId: input.invocationId,
     ownerId: input.ownerId,
+    ...(input.participantId === undefined ? {} : { participantId: input.participantId }),
+    ...(input.budgetScopeId === undefined ? {} : { budgetScopeId: input.budgetScopeId }),
     ...(input.runId ? { runId: input.runId } : {}),
     purpose: input.purpose,
     ...(input.parentInvocationId ? { parentInvocationId: input.parentInvocationId } : {})
@@ -1108,10 +1164,10 @@ function assertCompiledProfile(compiled: CompiledModelRequest, profile: ModelPro
 function inferenceReservation(
   compiled: CompiledModelRequest,
   profile: ModelProfile,
-  budget: InferenceBudget
+  budgets: readonly InferenceBudget[]
 ): InferenceReservation {
   const accounting = compiled.accounting;
-  const needsInputBound = requiresInputBound(compiled, profile, budget);
+  const needsInputBound = budgets.some(budget => requiresInputBound(compiled, profile, budget));
   const promptTokens = needsInputBound
     ? requestAccountingInputBound(accounting)
     : requestAccountingInputTokens(accounting);
@@ -1146,7 +1202,7 @@ function requiresInputBound(
   );
 }
 
-function assertBudget(input: {
+interface AdmissionBudgetInput {
   readonly state: InferenceOwnerState;
   readonly reservation: InferenceReservation;
   readonly limits: InferenceBudget;
@@ -1154,10 +1210,18 @@ function assertBudget(input: {
   readonly compiled: CompiledModelRequest;
   readonly profile: ModelProfile;
   readonly replacing?: InferenceReservation;
-}): void {
+  readonly scope?: InferenceBudgetScopeState;
+}
+/** Both checks use exactly the owner tail committed by the next start/extension CAS. */
+function assertAdmissionBudgets(input: AdmissionBudgetInput): void {
+  assertBudget(input);
+  if (input.scope) assertBudget({ ...input,
+    state: { ...input.state, committed: input.scope.committed, settledUsage: input.scope.settledUsage },
+    limits: input.scope.budget, budgetScopeId: input.scope.scopeId
+  });
+}
+function assertBudget(input: AdmissionBudgetInput & { readonly budgetScopeId?: string }): void {
   const { state, reservation: next, limits, identity, compiled, profile, replacing } = input;
-  if (state.policyFingerprint !== undefined && state.policyFingerprint !== hashJson(limits))
-    throw new Error('Inference owner budget policy changed after admission.');
   const currency = limits.maxKnownCost?.currency;
   const checks: readonly {
     resource: InferenceBudgetDiagnostic['resource'];
@@ -1197,6 +1261,8 @@ function assertBudget(input: {
     if (check.limit === undefined || projected <= check.limit) continue;
     throw new InferenceBudgetExceededError({
       resource: check.resource,
+      ...(input.budgetScopeId === undefined ? {} : { budgetScopeId: input.budgetScopeId }),
+      ...(input.budgetScopeId === undefined || identity.participantId === undefined ? {} : { participantId: identity.participantId }),
       ownerId: identity.ownerId,
       invocationId: identity.invocationId,
       inputIdentity: compiled.inputIdentity,
@@ -1218,6 +1284,35 @@ function assertBudget(input: {
       }
     });
   }
+}
+
+function allowanceSnapshot(
+  tail: EventLedgerTail,
+  limits: InferenceBudget,
+  committed: InferenceOwnerState['committed'],
+  settled: InferenceOwnerState['settledUsage']
+) {
+  const outstanding = Object.freeze({
+    invocations: committed.invocations - settled.invocations,
+    promptTokens: committed.usage.promptTokens - settled.usage.promptTokens,
+    completionTokens: committed.usage.completionTokens - settled.usage.completionTokens,
+    unknownPricedTokens: committed.unknownPricedTokens - settled.unknownPricedTokens,
+    knownCosts: Object.freeze(Object.fromEntries(Object.entries(committed.knownCosts)
+      .map(([currency, amount]) => [currency, amount - (settled.knownCosts[currency] ?? 0)])))
+  });
+  return {
+    ledgerTail: tail, limits, settled, outstanding,
+    remaining: Object.freeze({
+      ...(limits.maxInvocations === undefined ? {} : { invocations: Math.max(0, limits.maxInvocations - committed.invocations) }),
+      ...(limits.maxPromptTokens === undefined ? {} : { promptTokens: Math.max(0, limits.maxPromptTokens - committed.usage.promptTokens) }),
+      ...(limits.maxCompletionTokens === undefined ? {} : { completionTokens: Math.max(0, limits.maxCompletionTokens - committed.usage.completionTokens) }),
+      ...(limits.maxKnownCost === undefined ? {} : { knownCost: Object.freeze({
+        currency: limits.maxKnownCost.currency,
+        amount: Math.max(0, limits.maxKnownCost.amount - (committed.knownCosts[limits.maxKnownCost.currency] ?? 0))
+      }) })
+    }),
+    meaning: 'Remaining allowance subtracts settled usage and outstanding exposure. Missing limits are unbounded by this policy. Known cost excludes unpriced usage; it is not a hard monetary ceiling. Actual admission is transactional and may differ after this ledger cut.'
+  };
 }
 
 function recordableSourceRequest(request: ModelRequest): Omit<ModelRequest, 'signal'> {

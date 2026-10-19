@@ -17,6 +17,8 @@ import {
 
 export type ConversationEntry =
   | ConversationUserEntry
+  | ConversationAssignmentEntry
+  | ConversationPeerEntry
   | ConversationAssistantEntry
   | ConversationReasoningEntry
   | ConversationActivityEntry
@@ -30,6 +32,20 @@ export interface ConversationUserEntry extends ConversationIdentity {
   readonly kind: 'user';
   readonly text: string;
   readonly images?: readonly import('@agent-core/runtime').SessionImageInput[];
+}
+export interface ConversationPeerEntry extends ConversationIdentity {
+  readonly id: string;
+  readonly kind: 'peer';
+  readonly participantId: string;
+  readonly sessionId: string;
+  readonly senderRunId: string;
+  readonly text: string;
+}
+export interface ConversationAssignmentEntry extends ConversationIdentity {
+  readonly id: string;
+  readonly kind: 'assignment';
+  readonly origin: NonNullable<import('@agent-core/runtime').SessionSubmissionInput['origin']>;
+  readonly text: string;
 }
 export interface ConversationAssistantEntry extends ConversationIdentity {
   readonly id: string;
@@ -97,6 +113,8 @@ function sessionEntries(
   const id = sessionConversationId(entry);
   switch (entry.type) {
     case 'input':
+      if (entry.originalInput?.origin !== undefined)
+        return [{ id, kind: 'assignment', origin: entry.originalInput.origin, text: entry.task }];
       return [
         {
           id,
@@ -107,6 +125,12 @@ function sessionEntries(
       ];
     case 'steering':
       return [{ id, kind: 'user', text: entry.content }];
+    case 'peer_contribution':
+      return [{
+        id, kind: 'peer', participantId: entry.contribution.sender.participantId,
+        sessionId: entry.contribution.sender.sessionId, senderRunId: entry.contribution.senderRunId,
+        text: entry.contribution.content
+      }];
     case 'assistant':
       return [
         ...reasoningEntries(entry.turnId, entry),
@@ -157,7 +181,9 @@ function progressEntries(
     case 'turn.started':
       return event.turnIndex !== 1 || entries.some((entry) => entry.id === `input:${runId}`)
         ? []
-        : [{ id: `input:${runId}`, kind: 'user', text: event.task }];
+        : event.origin === undefined
+          ? [{ id: `input:${runId}`, kind: 'user', text: event.task }]
+          : [{ id: `input:${runId}`, kind: 'assignment', origin: event.origin, text: event.task }];
     case 'assistant.delta':
       return assistant(event.turnId, event.accumulated, 'streaming');
     case 'assistant.reasoning':
@@ -275,6 +301,10 @@ export function conversationText(entry: ConversationEntry, expanded = true): str
       return `Recorded entry · ${String(entry.bytes)} bytes · open source to inspect`;
     case 'user':
       return `You\n${entry.text}`;
+    case 'peer':
+      return `Peer ${entry.participantId} · model-authored contribution · session ${entry.sessionId} · run ${entry.senderRunId}\n${entry.text}`;
+    case 'assignment':
+      return `Delegated assignment · model-authored · session ${entry.origin.sender.sessionId}\nAssignment ${entry.origin.assignmentId} revision ${String(entry.origin.assignmentRevision)}\n${entry.text}`;
     case 'assistant':
       return entry.text;
     case 'reasoning':

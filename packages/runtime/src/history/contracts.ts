@@ -143,6 +143,7 @@ export interface HistoryEntryPage {
 
 /** Small routing facts captured from originals, never a substitute for their bodies. */
 export interface HistorySourceMetadata {
+  readonly inputAuthorship?: 'model';
   readonly source: HistorySourceRef;
   readonly type: SessionBranchEntry['type'];
   readonly description: string;

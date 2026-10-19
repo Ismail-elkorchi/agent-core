@@ -37,6 +37,7 @@ export function createHistoryTools(options: {
           .enum([
             'input',
             'steering',
+            'peer_contribution',
             'assistant',
             'tool_call',
             'observation',

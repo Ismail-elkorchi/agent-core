@@ -10,7 +10,9 @@ test('shared transcript identifies raw reasoning, summaries, and interrupted ans
   const entries = [
     { id: 'raw', kind: 'reasoning', channel: 'reasoning', text: 'Original reasoning.' },
     { id: 'summary', kind: 'reasoning', channel: 'summary', text: 'Summary content.' },
-    { id: 'answer', kind: 'assistant', status: 'interrupted', text: 'Partial answer.' }
+    { id: 'answer', kind: 'assistant', status: 'interrupted', text: 'Partial answer.' },
+    { id: 'peer', kind: 'peer', participantId: 'reviewer', sessionId: 'review-session', senderRunId: 'review-run', text: 'Peer finding.' },
+    { id: 'assignment', kind: 'assignment', origin: { sender: { sessionId: 'supervisor' } }, text: 'Delegated task.' }
   ];
   const runtime = createTuiRuntime({ host: createMemoryTerminalHost({ terminalSize: { columns: 80, rows: 24 } }), app: defineTui({
     id: 'transcript-test',
@@ -26,6 +28,8 @@ test('shared transcript identifies raw reasoning, summaries, and interrupted ans
   assert.match(frame, /Reasoning\s*\n.*Original reasoning/);
   assert.match(frame, /Reasoning summary/);
   assert.match(frame, /Assistant · interrupted/);
+  assert.match(frame, /Peer reviewer · model-authored contribution/);
+  assert.match(frame, /Delegated assignment · model-authored · from supervisor/);
   const patch = '*** Update File: a.ts\n-old\n+new\n';
   assert.equal(patchSegments(patch).map((item) => item.text).join(''), patch);
 });

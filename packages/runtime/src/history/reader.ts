@@ -1,5 +1,6 @@
+import { peerContributionText } from '../session/peer-contribution.js';
 import { confirmCommittedSessionFinalization } from '../orchestration/finalization.js';
-import { historyToolName, matchesHistoryMetadata } from './metadata.js';
+import { historyInputAuthorship, historyMetadataRole, historyToolName, matchesHistoryMetadata } from './metadata.js';
 import {
   HistorySearchIndex,
   type IndexedHistorySource
@@ -124,8 +125,20 @@ export class HistoryReader {
       readonly session: SessionDescriptor;
       readonly events?: EventRepository<AgentEvent>;
       readonly artifacts?: ArtifactRepository;
+      readonly authorizePeerContribution?: (entry: import('../session/contracts.js').SessionPeerContributionEntry, stage: 'read' | 'admit') => Promise<void>;
     }
   ) {}
+
+  async assertPeerContributions(entries: readonly SessionBranchEntry[], stage: 'read' | 'admit'): Promise<void> {
+    for (const entry of entries) {
+      if (entry.type !== 'peer_contribution') continue;
+      if (!this.options.authorizePeerContribution) {
+        if (entry.contribution.shares.length) throw new Error('Shared peer material requires current host authorization.');
+        continue;
+      }
+      await this.options.authorizePeerContribution(entry, stage);
+    }
+  }
 
   async capture(): Promise<HistorySourceCut> {
     const snapshot = await this.options.repository.sourceSnapshot(this.options.session);
@@ -512,6 +525,7 @@ export class HistoryReader {
     );
     if (hashJson(entry) !== metadata.sha256)
       throw new Error('Session history source identity changed.');
+    await this.assertPeerContributions([entry], 'read');
     return entry;
   }
 
@@ -1150,7 +1164,7 @@ export class HistoryReader {
       sourceBytes += material.bytes;
       const entry = material.entry;
       if (entry.type !== 'input' && entry.type !== 'steering' && entry.type !== 'assistant' &&
-          entry.type !== 'observation' && entry.type !== 'tool_call')
+          entry.type !== 'observation' && entry.type !== 'tool_call' && entry.type !== 'peer_contribution')
         throw new Error('History excerpts require an original text contribution.');
       if (entry.type === 'assistant' && !entry.content)
         throw new Error('History excerpts require original textual content, not media or native state.');
@@ -1580,13 +1594,7 @@ export function sourceRef(sessionId: string, entry: SessionBranchEntry): History
   return source;
 }
 export function historyRole(entry: SessionBranchEntry): HistoryItem['role'] {
-  return entry.type === 'input' || entry.type === 'steering'
-    ? 'user'
-    : entry.type === 'assistant' || entry.type === 'tool_call'
-      ? 'assistant'
-      : entry.type === 'observation'
-        ? 'tool'
-        : 'control';
+  return historyMetadataRole({ type: entry.type, ...(historyInputAuthorship(entry) ? { inputAuthorship: 'model' } : {}) });
 }
 function historyItem(sessionId: string, entry: SessionBranchEntry, maxBytes: number): HistoryItem {
   const text = publicText(entry);
@@ -1595,7 +1603,7 @@ function historyItem(sessionId: string, entry: SessionBranchEntry, maxBytes: num
     source: sourceRef(sessionId, entry),
     type: entry.type,
     role: historyRole(entry),
-    ...(entry.type === 'context_transition' && entry.sessionState
+    ...((entry.type === 'context_transition' && entry.sessionState) || entry.type === 'peer_contribution' || historyInputAuthorship(entry)
       ? { generated: true as const }
       : {}),
     ...('runId' in entry ? { runId: entry.runId } : {}),
@@ -1609,6 +1617,7 @@ function historyItem(sessionId: string, entry: SessionBranchEntry, maxBytes: num
 
 function publicText(entry: SessionBranchEntry): string {
   switch (entry.type) {
+    case 'peer_contribution': return peerContributionText(entry);
     case 'input':
       return entry.originalInput ? JSON.stringify(entry.originalInput) : entry.task;
     case 'steering':
@@ -1654,7 +1663,7 @@ function publicText(entry: SessionBranchEntry): string {
 }
 function matchesMetadata(entry: SessionBranchEntry, filter?: HistoryFilter): boolean {
   const toolName = historyToolName(entry);
-  return matchesHistoryMetadata({ ...entry, ...(toolName ? { toolName } : {}) }, filter);
+  return matchesHistoryMetadata({ ...entry, ...(historyInputAuthorship(entry) ? { inputAuthorship: 'model' } : {}), ...(toolName ? { toolName } : {}) }, filter);
 }
 function matches(entry: SessionBranchEntry, filter?: HistoryFilter): boolean {
   if (!matchesMetadata(entry, filter)) return false;

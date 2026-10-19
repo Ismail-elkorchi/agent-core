@@ -106,6 +106,14 @@ try {
     maxBuffer: 20 * 1024 * 1024
   });
 
+  // Exercise collaboration only through documented exports in the installed archives.
+  for (const name of ['collaboration-provider.mjs', 'collaboration-consumer.mjs', 'collaboration-consumer.ts']) {
+    const source = await readFile(path.join(root, 'tests', 'fixtures', name), 'utf8');
+    assertNoDistImports(source, name);
+    await writeFile(path.join(consumer, name), source);
+  }
+  await exec(process.execPath, ['collaboration-consumer.mjs'], { cwd: consumer });
+
   // Exercise the packed worker URL, WASM dependency, and explicit Node adapter exports.
   await writeFile(path.join(consumer, 'optional-tools.mjs'), String.raw`
 import assert from 'node:assert/strict';
@@ -406,7 +414,7 @@ void [result, configurationRevision, recursive, reference, catalog, http, stdio,
     const config = `tsconfig-${String(exactOptionalPropertyTypes)}.json`;
     await writeFile(
       path.join(consumer, config),
-      `${JSON.stringify({ compilerOptions: { target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext', types: ['node'], strict: true, skipLibCheck: false, exactOptionalPropertyTypes, noEmit: true }, files: ['consumer.ts', 'optional-tools.ts'] }, null, 2)}\n`
+      `${JSON.stringify({ compilerOptions: { target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext', types: ['node'], strict: true, skipLibCheck: false, exactOptionalPropertyTypes, noEmit: true }, files: ['consumer.ts', 'optional-tools.ts', 'collaboration-consumer.ts'] }, null, 2)}\n`
     );
     await exec(process.execPath, [tscCli, '-p', config, '--pretty', 'false'], {
       cwd: consumer,

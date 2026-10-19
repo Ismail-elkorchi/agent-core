@@ -34,3 +34,11 @@ explicitly disowning processes is not. Editors inherit the real foreground
 terminal without starting a detached session. Cancellation waits for the owned
 wrapper/editor tree to exit before releasing the terminal or deleting its draft.
 POSIX cancellation requires standard `ps`; Windows uses `taskkill /T /F`.
+
+
+`collaborationPanel` is another ordinary child definition. It retains only the currently
+inspected bounded participant page and user draft; it does not schedule participants or
+infer completion. Actions carry the selected participant's exact session/run/epoch to
+application operations. Refresh the mounted child when authoritative collaboration changes
+or delivery reports a gap. Peer transcript entries use a separate `peer` presentation kind
+with model authorship and sender session/run attribution, never the user's role.

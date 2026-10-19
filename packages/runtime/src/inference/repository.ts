@@ -30,13 +30,27 @@ export interface InferenceIdentity {
   readonly ownerId: string;
   readonly runId?: string;
   readonly parentInvocationId?: string;
+  readonly participantId?: string;
+  readonly budgetScopeId?: string;
   readonly purpose: string;
 }
+/** A participant's immutable allowance within the aggregate inference owner. */
+export interface InferenceBudgetScopeBinding {
+  readonly participantId: string;
+  readonly scopeId: string;
+  readonly budget: InferenceBudget;
+}
 export type InferenceEvent =
+  | (InferenceBudgetScopeBinding & {
+      readonly type: 'inference.scope_registered';
+      readonly format: 'agent-core.inference/2';
+      readonly ownerId: string;
+      readonly limits: InferenceBudget;
+    })
   | (Omit<InferenceIdentity, 'runId'> & {
       readonly runId: string | null;
       readonly type: 'inference.started';
-      readonly format: 'agent-core.inference/1';
+      readonly format: 'agent-core.inference/2';
       readonly operation: 'generation' | 'native_generation';
       readonly fingerprint: string;
       readonly sourceFingerprint: string;
@@ -90,6 +104,19 @@ export const inferenceEventCodec: RuntimeCodec<InferenceEvent> = {
 };
 function decodeInferenceEvent(value: unknown): InferenceEvent {
   const event = parseJsonObject(value);
+  if (event.type === 'inference.scope_registered') {
+    exact(event, ['type', 'format', 'ownerId', 'participantId', 'scopeId', 'budget', 'limits']);
+    assertInferenceFormat(event.format);
+    return Object.freeze({
+      type: 'inference.scope_registered',
+      format: 'agent-core.inference/2',
+      ownerId: text(event.ownerId, 'ownerId'),
+      participantId: text(event.participantId, 'participantId'),
+      scopeId: text(event.scopeId, 'scopeId'),
+      budget: parseInferenceBudget(event.budget),
+      limits: parseInferenceBudget(event.limits)
+    });
+  }
   const invocationId = text(event.invocationId, 'invocationId');
   const permit = text(event.permit, 'permit');
   if (event.type === 'inference.started') {
@@ -101,6 +128,8 @@ function decodeInferenceEvent(value: unknown): InferenceEvent {
       'ownerId',
       'runId',
       'parentInvocationId',
+      'participantId',
+      'budgetScopeId',
       'purpose',
       'fingerprint',
       'sourceFingerprint',
@@ -109,10 +138,9 @@ function decodeInferenceEvent(value: unknown): InferenceEvent {
       'limits',
       'permit'
     ]);
-    if (event.format !== 'agent-core.inference/1')
-      throw new Error(
-        'Incompatible inference format; start a new owner without deleting prior state.'
-      );
+    assertInferenceFormat(event.format);
+    if ((event.participantId === undefined) !== (event.budgetScopeId === undefined))
+      throw new Error('Inference participant and budget scope must be provided together.');
     const reservation = parseJsonObject(event.reservation);
     exact(reservation, ['promptTokens', 'completionTokens', 'cost']);
     const limits = parseJsonObject(event.limits);
@@ -124,7 +152,7 @@ function decodeInferenceEvent(value: unknown): InferenceEvent {
       throw new Error('Invalid inference operation.');
     return Object.freeze({
       type: 'inference.started',
-      format: 'agent-core.inference/1',
+      format: 'agent-core.inference/2',
       operation: event.operation,
       invocationId,
       permit,
@@ -136,6 +164,10 @@ function decodeInferenceEvent(value: unknown): InferenceEvent {
               event.runId,
               'runId (required; obsolete inference records need their original application)'
             ),
+      ...(event.participantId === undefined ? {} : {
+        participantId: text(event.participantId, 'participantId'),
+        budgetScopeId: text(event.budgetScopeId, 'budgetScopeId')
+      }),
       purpose: text(event.purpose, 'purpose'),
       fingerprint: text(event.fingerprint, 'fingerprint'),
       sourceFingerprint: text(event.sourceFingerprint, 'sourceFingerprint'),
@@ -226,6 +258,10 @@ function decodeInferenceEvent(value: unknown): InferenceEvent {
   }
   throw new Error('Invalid inference event kind.');
 }
+function assertInferenceFormat(value: JsonValue | undefined): void {
+  if (value !== 'agent-core.inference/2')
+    throw new Error('Incompatible inference format; start a new owner without deleting prior state.');
+}
 export function parseInferenceBudget(value: unknown): InferenceBudget {
   const limits = parseJsonObject(value);
   exact(limits, ['maxInvocations', 'maxPromptTokens', 'maxCompletionTokens', 'maxKnownCost']);
@@ -310,9 +346,16 @@ export interface InferenceUsageTotals {
   readonly knownCosts: Readonly<Record<string, number>>;
   readonly unknownPricedTokens: number;
 }
+export interface InferenceBudgetScopeState extends InferenceBudgetScopeBinding {
+  /** Settled consumption plus outstanding reservations for this participant. */
+  readonly committed: InferenceUsageTotals;
+  readonly settledUsage: InferenceUsageTotals;
+}
 export interface InferenceOwnerState {
   readonly tail: EventLedgerTail;
   readonly policyFingerprint?: string;
+  readonly limits?: InferenceBudget;
+  readonly budgetScopes: Readonly<Record<string, InferenceBudgetScopeState>>;
   /** Settled consumption plus outstanding reservations. */
   readonly committed: InferenceUsageTotals;
   readonly invocation?: InferenceInvocation;
@@ -330,6 +373,8 @@ interface OwnerIndex {
   latestInvocationId?: string;
   tail: EventLedgerTail;
   policyFingerprint?: string;
+  limits?: InferenceBudget;
+  readonly budgetScopes: Map<string, InferenceBudgetScopeState>;
   committed: InferenceUsageTotals;
   settled: InferenceUsageTotals;
   readonly invocations: Map<string, InferenceInvocation>;
@@ -370,6 +415,7 @@ export class EventInferenceRepository implements InferenceRepository {
       tail: { sequence: -1, driverGeneration: 0 },
       committed: emptyInferenceUsage(),
       settled: emptyInferenceUsage(),
+      budgetScopes: new Map(),
       invocations: new Map(),
       runs: new Map()
     };
@@ -413,6 +459,8 @@ export class EventInferenceRepository implements InferenceRepository {
     return Object.freeze({
       tail,
       ...(index.policyFingerprint ? { policyFingerprint: index.policyFingerprint } : {}),
+      ...(index.limits ? { limits: index.limits } : {}),
+      budgetScopes: Object.freeze(Object.fromEntries(index.budgetScopes)),
       committed: index.committed,
       ...(latestInvocation ? { latestInvocation } : {}),
       ...(invocation ? { invocation } : {}),
@@ -424,6 +472,21 @@ export class EventInferenceRepository implements InferenceRepository {
   }
 
   private apply(index: OwnerIndex, ownerId: string, event: InferenceEvent): void {
+    if (event.type === 'inference.scope_registered') {
+      const policy = hashJson(event.limits);
+      if (event.ownerId !== ownerId ||
+          (index.policyFingerprint !== undefined && index.policyFingerprint !== policy) ||
+          index.budgetScopes.has(event.scopeId) ||
+          [...index.budgetScopes.values()].some(scope => scope.participantId === event.participantId))
+        throw new Error('Contradictory inference participant scope or owner policy.');
+      index.policyFingerprint = policy;
+      index.limits = event.limits;
+      index.budgetScopes.set(event.scopeId, Object.freeze({
+        participantId: event.participantId, scopeId: event.scopeId, budget: event.budget,
+        committed: emptyInferenceUsage(), settledUsage: emptyInferenceUsage()
+      }));
+      return;
+    }
     const prior = index.invocations.get(event.invocationId);
     let next: InferenceInvocation;
     if (event.type === 'inference.started') {
@@ -434,7 +497,12 @@ export class EventInferenceRepository implements InferenceRepository {
         (index.policyFingerprint !== undefined && index.policyFingerprint !== policy)
       )
         throw new Error('Contradictory inference admission or owner policy.');
+      const scope = event.budgetScopeId === undefined ? undefined : index.budgetScopes.get(event.budgetScopeId);
+      if ((index.budgetScopes.size > 0 && !scope) ||
+          (event.budgetScopeId !== undefined && (!scope || scope.participantId !== event.participantId)))
+        throw new Error('Inference admission requires its registered participant budget scope.');
       index.policyFingerprint = policy;
+      index.limits = event.limits;
       next = Object.freeze({ start: event });
       index.latestInvocationId = event.invocationId;
     } else {
@@ -479,13 +547,28 @@ export class EventInferenceRepository implements InferenceRepository {
     }
     if (prior && !prior.notSent) index.committed = accountInvocation(index.committed, prior, -1);
     if (!next.notSent) index.committed = accountInvocation(index.committed, next, 1);
+    const scopeId = next.start.budgetScopeId;
+    if (scopeId !== undefined) {
+      const scope = index.budgetScopes.get(scopeId);
+      if (!scope) throw new Error('Inference invocation lost its participant budget scope.');
+      let committed = scope.committed;
+      if (prior && !prior.notSent) committed = accountInvocation(committed, prior, -1);
+      if (!next.notSent) committed = accountInvocation(committed, next, 1);
+      index.budgetScopes.set(scopeId, Object.freeze({ ...scope, committed,
+        settledUsage: event.type === 'inference.settled'
+          ? addInferenceUsage(scope.settledUsage, event.usage, event.cost, 1)
+          : scope.settledUsage
+      }));
+    }
     index.invocations.set(event.invocationId, next);
   }
   async append(ownerId: string, event: InferenceEvent, tail: EventLedgerTail): Promise<boolean> {
     const result = await this.events.appendConditional(ownerKey(ownerId), event, {
       expectedTail: tail,
       driverGeneration: tail.driverGeneration,
-      idempotencyKey: `${event.invocationId}:${event.type}${event.type === 'inference.extended' ? `:${String(event.revision)}` : ''}`,
+      idempotencyKey: event.type === 'inference.scope_registered'
+        ? `scope_registration:${hashJson({ scopeId: event.scopeId, participantId: event.participantId })}`
+        : `invocation:${event.invocationId}:${event.type}${event.type === 'inference.extended' ? `:${String(event.revision)}` : ''}`,
       actor: 'runtime'
     });
     if (

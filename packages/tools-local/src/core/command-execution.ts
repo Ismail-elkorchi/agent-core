@@ -1,4 +1,5 @@
 import { parseJsonObject } from '@agent-core/json';
+import { tryAcquirePersistenceFileLock, type PersistenceFileLockOwnership } from '@agent-core/persistence/node';
 import {
   type ArtifactRepository,
   type ProtectedArtifactRef,
@@ -33,7 +34,7 @@ import {
   type ToolResourceLease
 } from '@agent-core/tools';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, readdir, rename, rm, rmdir } from 'node:fs/promises';
+import { mkdir, open, readFile, readdir, realpath, rename, rm, rmdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
@@ -190,6 +191,12 @@ export class LocalCommandExecution implements CommandExecution {
     >
   >;
   private readonly ready: Promise<void>;
+  private ledgerOwner: PersistenceFileLockOwnership | undefined;
+  private closeCompletion: Promise<void> | undefined;
+  private closing = false;
+  private closed = false;
+  private readonly closeSignal = new AbortController();
+  private readonly starting = new Set<Promise<CommandStartResult>>();
   private reconciliation: CommandReconciliationResult = Object.freeze({ resolved: [], unresolved: [] });
   private reconciliationWork: Promise<void> = Promise.resolve();
   private reservedCapturedBytes = 0;
@@ -231,7 +238,7 @@ export class LocalCommandExecution implements CommandExecution {
         'maxPendingOutputBytes'
       )
     };
-    this.ready = this.refreshReconciliation().then(() => undefined);
+    this.ready = this.initialize();
     adoptCommandExecution(this);
   }
 
@@ -256,11 +263,14 @@ export class LocalCommandExecution implements CommandExecution {
     if (owned?.authority !== this)
       throw new TypeError('Command reservation does not belong to the local command authority.');
     const adopted = owned.start();
-    try {
-      return await this.startInDirectory(adopted.request, options, adopted.path);
-    } finally {
-      await owned.release();
-    }
+    const signal = options.signal ? AbortSignal.any([options.signal, this.closeSignal.signal]) : this.closeSignal.signal;
+    const starting = (async () => {
+      try { return await this.startInDirectory(adopted.request, { ...options, signal }, adopted.path); }
+      finally { await owned.release(); }
+    })();
+    this.starting.add(starting);
+    try { return await starting; }
+    finally { this.starting.delete(starting); }
   }
 
   private async startInDirectory(
@@ -269,6 +279,8 @@ export class LocalCommandExecution implements CommandExecution {
     workingDirectory: string
   ): Promise<CommandStartResult> {
     await this.ready;
+    if (this.closing) return { kind: 'not_started', diagnostic: 'Command authority is closing.' };
+    await this.ledgerOwner?.assertOwned();
     options.signal?.throwIfAborted();
     if (this.reconciliation.unresolved.length > 0)
       return { kind: 'not_started', diagnostic: 'Process lifetime is unresolved for this command authority. Inspect Processes and reconcile the blocking records before starting a command.' };
@@ -532,6 +544,7 @@ export class LocalCommandExecution implements CommandExecution {
     requester?: CommandExecutionOwner
   ): Promise<void> {
     await this.ready;
+    await this.assertLedgerOwned();
     const record = await this.requireRunningProcess(processId, requester);
     await new Promise<void>((resolve, reject) =>
       record.tree.child.stdin.write(text, (error) => {
@@ -543,6 +556,7 @@ export class LocalCommandExecution implements CommandExecution {
 
   async closeInput(processId: string, requester?: CommandExecutionOwner): Promise<void> {
     await this.ready;
+    await this.assertLedgerOwned();
     if (!this.active.has(processId) && !this.completed.has(processId)) {
       await this.query(processId, 0, 0, 0, requester);
       return;
@@ -564,6 +578,7 @@ export class LocalCommandExecution implements CommandExecution {
     observationSignal?: AbortSignal
   ): Promise<CommandExecutionResult> {
     await this.ready;
+    await this.assertLedgerOwned();
     if (!this.active.has(processId) && !this.completed.has(processId))
       return this.query(processId, 4_000, 0, 0, requester);
     const record = this.requireProcess(processId);
@@ -584,6 +599,7 @@ export class LocalCommandExecution implements CommandExecution {
   /** Stop active owned processes and return every terminal process not yet durably reported. */
   async disposeOwner(ownerId: string): Promise<readonly CommandExecutionReport[]> {
     await this.ready;
+    await this.assertLedgerOwned();
     const active = [...this.active.values()].filter((record) => record.owner.ownerId === ownerId);
     for (const record of active) await this.terminate(record.id);
     return this.unreportedTerminalProcesses(ownerId);
@@ -701,6 +717,7 @@ export class LocalCommandExecution implements CommandExecution {
   /** Call only after resource.released persistence succeeds or another durable handoff exists. */
   async acknowledgeTerminalReport(processId: string): Promise<void> {
     await this.ready;
+    await this.assertLedgerOwned();
     const record = this.completed.get(processId);
     if (record && !(await this.readTerminalRecord(processId)))
       await this.persistTerminalRecord(record, await this.finalArtifacts(record));
@@ -721,19 +738,24 @@ export class LocalCommandExecution implements CommandExecution {
     }
   }
 
-  async reconcile(): Promise<CommandReconciliationResult> {
+  async reconcile(ownerId?: string): Promise<CommandReconciliationResult> {
     await this.ready;
-    await this.deliverRecoveredReports();
+    await this.assertLedgerOwned();
+    await this.deliverRecoveredReports(ownerId);
     return this.reconciliation;
   }
   async retryReconciliation(): Promise<CommandReconciliationResult> {
     await this.ready;
+    await this.assertLedgerOwned();
+    if (this.closing) throw new Error('Command authority is closing.');
     const result = await this.reconciliationOperation(() => this.refreshReconciliation());
     await this.deliverRecoveredReports();
     return result;
   }
   async acknowledgeUnresolved(acceptances: readonly CommandUncertaintyAcceptance[]): Promise<void> {
     await this.ready;
+    await this.assertLedgerOwned();
+    if (this.closing) throw new Error('Command authority is closing.');
     await this.reconciliationOperation(async () => {
       const current = await this.refreshReconciliation();
       for (const { processId, revision } of acceptances) {
@@ -753,10 +775,20 @@ export class LocalCommandExecution implements CommandExecution {
       await this.refreshReconciliation();
     });
   }
-  async close(): Promise<void> {
-    await this.ready;
-    for (const record of [...this.active.values()]) await this.terminate(record.id);
-    for (const processId of [...this.completed.keys()]) await this.expire(processId);
+  close(): Promise<void> {
+    this.closing = true;
+    this.closeSignal.abort(new Error('Command authority is closing.'));
+    this.closeCompletion ??= (async () => {
+      await this.ready;
+      await this.reconciliationWork;
+      await Promise.allSettled([...this.starting]);
+      for (const record of [...this.active.values()]) await this.terminate(record.id);
+      for (const processId of [...this.completed.keys()]) await this.expire(processId);
+      this.closed = true;
+      await this.ledgerOwner?.release();
+      this.ledgerOwner = undefined;
+    })().catch((error: unknown) => { this.closeCompletion = undefined; throw error; });
+    return this.closeCompletion;
   }
   async listProcesses(): Promise<readonly CommandProcess[]> {
     await this.ready;
@@ -1032,7 +1064,21 @@ export class LocalCommandExecution implements CommandExecution {
     }
   }
 
-  private async deliverRecoveredReports(): Promise<void> {
+  private async deliverRecoveredReports(ownerId?: string): Promise<void> {
+    if (ownerId !== undefined) {
+      let after: string | undefined;
+      for (;;) {
+        const page = await this.readPendingTerminalReports({ ownerId, ...(after === undefined ? {} : { after }), limit: 64, maxBytes: 65_536 });
+        const processIds = [...page.reports.map(report => report.processId), ...(page.oversized ? [page.oversized.processId] : [])];
+        for (const processId of processIds) {
+          const completed = this.completed.get(processId);
+          const report = completed ? await this.finish(completed) : this.recovered.get(processId);
+          if (report) await this.handoffTerminalReport(report);
+        }
+        if (page.complete) return;
+        after = page.next;
+      }
+    }
     for (const record of this.completed.values()) {
       if (record.terminalReported) continue;
       const report = await this.finish(record);
@@ -1177,9 +1223,26 @@ export class LocalCommandExecution implements CommandExecution {
     return result;
   }
 
+  private async assertLedgerOwned(): Promise<void> {
+    if (this.closed || (this.options.ledgerDirectory && !this.ledgerOwner)) throw new Error('Command authority is closed.');
+    await this.ledgerOwner?.assertOwned();
+  }
+
   private async refreshReconciliation(): Promise<CommandReconciliationResult> {
+    await this.assertLedgerOwned();
     this.reconciliation = await this.reconcileLedger();
     return this.reconciliation;
+  }
+
+  private async initialize(): Promise<void> {
+    if (this.options.ledgerDirectory) {
+      await mkdir(this.options.ledgerDirectory, { recursive: true, mode: 0o700 });
+      const ledgerDirectory = await realpath(this.options.ledgerDirectory);
+      this.ledgerOwner = await tryAcquirePersistenceFileLock(`${ledgerDirectory}.manager`);
+      if (!this.ledgerOwner) throw new Error('Command execution ledger is owned by another live manager.');
+    }
+    try { await this.refreshReconciliation(); }
+    catch (error) { await this.ledgerOwner?.release(); this.ledgerOwner = undefined; throw error; }
   }
 
   private async reconcileLedger(): Promise<CommandReconciliationResult> {
@@ -1340,6 +1403,7 @@ export class LocalCommandExecution implements CommandExecution {
   }
 
   private async persistJsonRecord(target: string, value: unknown): Promise<void> {
+    await this.assertLedgerOwned();
     await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
     const temporary = `${target}.${randomUUID()}.tmp`;
     const handle = await open(temporary, 'wx', 0o600);
@@ -1349,7 +1413,8 @@ export class LocalCommandExecution implements CommandExecution {
     } finally {
       await handle.close();
     }
-    await rename(temporary, target);
+    try { await this.assertLedgerOwned(); await rename(temporary, target); }
+    catch (error) { await rm(temporary, { force: true }); throw error; }
   }
 
   private async persistLedger(entry: ProcessLedgerEntry): Promise<void> {
@@ -1358,6 +1423,7 @@ export class LocalCommandExecution implements CommandExecution {
 
   private async removeLedger(processId: string): Promise<void> {
     if (!this.options.ledgerDirectory) return;
+    await this.assertLedgerOwned();
     const ledgerPath = this.ledgerPath(processId);
     if (this.options.removeLedgerRecord) await this.options.removeLedgerRecord(ledgerPath);
     else await rm(ledgerPath, { force: true });
@@ -1464,6 +1530,7 @@ export class LocalCommandExecution implements CommandExecution {
 
   private async removeSupervisorFiles(processId: string): Promise<void> {
     if (!this.options.ledgerDirectory) return;
+    await this.assertLedgerOwned();
     await rm(this.supervisorAuthenticationPath(processId), { force: true });
     await rm(this.supervisorStatePath(processId), { force: true });
     if (process.platform !== 'win32') {

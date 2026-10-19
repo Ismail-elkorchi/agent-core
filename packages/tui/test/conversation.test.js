@@ -194,3 +194,30 @@ test('tool presentation bounds previews without modifying original input or losi
   assert.match(completed.details.find(item => item.id === 'output').content, /applied/);
   assert.match(completed.details.find(item => item.id === 'presentation-diagnostic').content, /display failed/);
 });
+
+test('peer contributions retain model authorship and exact sender attribution apart from user steering', () => {
+  const contribution = projectSessionEntry({
+    type: 'peer_contribution', id: 'peer-entry', authorship: 'model',
+    contribution: { sender: { participantId: 'reviewer', sessionId: 'review-session' }, senderRunId: 'review-run', content: 'Check the error handling.' }
+  });
+  assert.deepEqual(contribution, [{
+    id: 'session:peer-entry', kind: 'peer', participantId: 'reviewer', sessionId: 'review-session', senderRunId: 'review-run', text: 'Check the error handling.'
+  }]);
+  const steering = projectSessionEntry({ type: 'steering', id: 'user-entry', runId: 'run', content: 'Change the requirement.' });
+  assert.equal(steering[0].kind, 'user');
+  assert.notEqual(contribution[0].kind, steering[0].kind);
+});
+
+test('delegated assignments remain model-authored when a participant session is inspected', () => {
+  const origin = { kind: 'delegated_assignment', groupId: 'group', participantId: 'worker',
+    assignmentId: 'assignment', assignmentRevision: 2, sender: { sessionId: 'supervisor' } };
+  const [entry] = projectSessionEntry({ type: 'input', id: 'input', runId: 'child-run', task: 'Review this change.',
+    originalInput: { task: 'Review this change.', origin } });
+  assert.equal(entry.kind, 'assignment');
+  assert.deepEqual(entry.origin, origin);
+  assert.equal(entry.text, 'Review this change.');
+  const [live] = projectProgress({ runId: 'child-run', event: { ...turn, type: 'turn.started',
+    origin, task: 'Review this change.' } }, []);
+  assert.equal(live.kind, 'assignment');
+  assert.deepEqual(live.origin, origin);
+});

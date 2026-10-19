@@ -1,3 +1,5 @@
+import { materializedSessionInput } from './submission-lifecycle.js';
+import { ownPeerContributionInput, samePeerContribution, decodePeerContributionEntry } from './peer-contribution.js';
 import { decodeSessionToolCatalogSelection } from './tool-catalog.js';
 import { parseToolCatalogSelection, type ToolCatalogSelectionState } from '@agent-core/tools';
 import { createSessionRunFinalizationConfirmation, decodeSessionRunFinalizationConfirmation } from './finalization-confirmation.js';
@@ -165,6 +167,9 @@ export class JsonlSessionRepository implements SessionRepository {
 
   async revision(session: SessionDescriptor): Promise<number> {
     return (await this.branchIndex(session.id).checked(session)).sourceRevision;
+  }
+  async acceptedCorrectionRevision(session: SessionDescriptor): Promise<number> {
+    return (await this.branchIndex(session.id).checked(session)).acceptedCorrectionRevision;
   }
   async currentModelSettings(session: SessionDescriptor): Promise<ModelSelection | undefined> {
     const entry = await this.branchIndex(session.id).currentModelSettings(session);
@@ -453,7 +458,7 @@ export class JsonlSessionRepository implements SessionRepository {
             runId: input.runId,
             task: input.task,
             ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
-            ...await this.branchIndex(sessionId).acceptedInput(session, input.runId),
+            ...materializedSessionInput(await this.branchIndex(sessionId).acceptedInput(session, input.runId), input),
             instructions: Object.freeze(
               (input.instructions ?? []).map((instruction) => Object.freeze({ ...instruction }))
             )
@@ -495,6 +500,28 @@ export class JsonlSessionRepository implements SessionRepository {
         }
       )
     );
+  }
+
+  async findPeerContribution(session: SessionDescriptor, deliveryId: string) {
+    const entry = await this.branchIndex(session.id).find(session, `peer:${hashJson(deliveryId)}`);
+    return entry?.type === 'peer_contribution' ? entry : undefined;
+  }
+
+  appendPeerContribution(session: SessionDescriptor, input: Parameters<SessionRepository['appendPeerContribution']>[1], options: Parameters<SessionRepository['appendPeerContribution']>[2] = {}) {
+    const owned = ownPeerContributionInput(input);
+    if (owned.recipient.sessionId !== session.id) throw new Error('Peer contribution recipient session does not match.');
+    return this.enqueue(session.id, () => this.withSessionLock(session.id, async () => {
+      const state = await this.branchIndex(session.id).descriptor(session.header.binding);
+      assertDescriptor(session, state);
+      const existing = await this.branchIndex(session.id).find(session, `peer:${hashJson(owned.deliveryId)}`);
+      if (existing?.type === 'peer_contribution') return samePeerContribution(existing, owned);
+      const publish = async () => {
+        const entry = decodePeerContributionEntry({ ...baseEntry(state.leafId), type: 'peer_contribution', authorship: 'model', contribution: owned });
+        await this.appendRecord(session.id, state, entry);
+        return entry;
+      };
+      return options.withOwnership ? options.withOwnership(publish) : publish();
+    }));
   }
 
   appendAssistant(
@@ -1013,6 +1040,7 @@ function parseBranchEntry(value: JsonValue): SessionBranchEntry {
       ...(source === undefined ? {} : { source: historyEventSourceSchema.parse(source) })
     });
   }
+  if (value.type === 'peer_contribution') return decodePeerContributionEntry(value);
   if (value.type === 'context_transition') return decodeContextTransitionEntry(value);
   if (value.type === 'session_state_batch') return decodeSessionStateBatchEntry(value);
   if (value.type === 'tool_catalog_selection') return decodeSessionToolCatalogSelection(value);
@@ -1160,6 +1188,7 @@ function sameSessionInput(
 ): boolean {
   return (
     existing.task === input.task &&
+    hashJson(existing.originalInput?.origin ?? null) === hashJson(input.origin ?? null) &&
     JSON.stringify(existing.images ?? []) === JSON.stringify(input.images ?? []) &&
     JSON.stringify(existing.instructions) === JSON.stringify(input.instructions ?? [])
   );
@@ -1640,6 +1669,7 @@ function encodeSubmissionReasoning(
 function encodeSubmissionInput(input: SessionSubmissionInput): JsonObject {
   return Object.freeze({
     task: input.task,
+    ...(input.origin === undefined ? {} : { origin: parseJsonValue(input.origin) }),
     ...(input.images === undefined ? {} : { images: parseJsonValue(input.images) }),
     ...(input.relationship ? { relationship: parseJsonValue(input.relationship) } : {}),
     ...(input.instructions === undefined

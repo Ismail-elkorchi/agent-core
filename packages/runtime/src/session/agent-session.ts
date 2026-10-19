@@ -1,3 +1,4 @@
+import { parseSessionSubmissionOrigin } from './submission-origin.js';
 import { hashJson, type ArtifactRepository } from '@agent-core/persistence';
 import {
   assertModelRequestSupported,
@@ -121,6 +122,11 @@ export interface AgentSessionOptions {
   readonly maximumQueuedInputs?: number;
   /** Manual scheduling leaves admitted input durable until its application starts it. */
   readonly scheduling?: 'automatic' | 'manual';
+  /** Serialize durable user-input admission with the host's participant effect-start authority.
+   * The guard surrounds only the repository write, never runtime dispatch or completion.
+   * Accepted input remains authoritative even if the guard loses its return acknowledgement.
+   */
+  readonly withSubmissionAdmission?: <T>(operation: () => Promise<T>) => Promise<T>;
 }
 
 export class AgentSession {
@@ -252,25 +258,26 @@ export class AgentSession {
           throw new Error(
             'Steering accepts instruction text. Send attachments as a follow-up input.'
           );
-        if (!this.active) return { kind: 'rejected', reason: 'no_active_run' };
+        const active = this.active;
+        if (!active) return { kind: 'rejected', reason: 'no_active_run' };
         if (
           options.expectedRunId !== undefined &&
-          options.expectedRunId !== this.active.control.runId
+          options.expectedRunId !== active.control.runId
         )
           return { kind: 'rejected', reason: 'run_mismatch' };
-        await this.options.repository.appendSteering(this.options.descriptor, {
-          runId: this.active.control.runId,
+        await this.withSubmissionAdmission(() => this.options.repository.appendSteering(this.options.descriptor, {
+          runId: active.control.runId,
           content: task,
           deliveryId: submissionId,
           originalInput: submissionInput(input),
           ...(options.relationship ? { relationship: options.relationship } : {})
-        });
-        this.active.control.injectSteering({ instruction: task, deliveryId: submissionId });
+        }));
+        active.control.injectSteering({ instruction: task, deliveryId: submissionId });
         return {
           kind: 'steered',
           submissionId,
-          runId: this.active.control.runId,
-          completion: this.active.pending.completion
+          runId: active.control.runId,
+          completion: active.pending.completion
         };
       }
       if (input.signal !== undefined)
@@ -289,14 +296,14 @@ export class AgentSession {
       const claimId = randomUUID();
       let admitted: SessionPendingSubmission;
       try {
-        admitted = await this.options.repository.admitSubmission(this.options.descriptor, {
-        submissionId,
-        runId: input.runId ?? randomUUID(),
-        input: { ...submissionInput(input), ...(options.relationship ? { relationship: options.relationship } : {}) },
-        configuration: this.configuration,
-        maximumQueuedInputs: this.maximumQueuedInputs,
-        ...(immediate ? { claimId } : {})
-        });
+        admitted = await this.withSubmissionAdmission(() => this.options.repository.admitSubmission(this.options.descriptor, {
+          submissionId,
+          runId: input.runId ?? randomUUID(),
+          input: { ...submissionInput(input), ...(options.relationship ? { relationship: options.relationship } : {}) },
+          configuration: this.configuration,
+          maximumQueuedInputs: this.maximumQueuedInputs,
+          ...(immediate ? { claimId } : {})
+        }));
       } catch (error) {
         if (immediate) await this.releaseExecution();
         throw error;
@@ -410,11 +417,11 @@ export class AgentSession {
         change.kind === 'replace'
           ? { ...change, input: ownSessionSubmissionInput(change.input) }
           : change;
-      await this.options.repository.updateQueuedSubmission(
+      await this.withSubmissionAdmission(() => this.options.repository.updateQueuedSubmission(
         this.options.descriptor,
         submissionId,
         owned
-      );
+      ));
       if (owned.kind === 'replace' && pending) this.handles.set(submissionId, { ...pending, input: owned.input });
       else if (owned.kind === 'cancel') {
         this.handles.delete(submissionId);
@@ -1051,6 +1058,10 @@ export class AgentSession {
     await this.claimAndLaunchNext();
   }
 
+  private withSubmissionAdmission<T>(operation: () => Promise<T>): Promise<T> {
+    return this.options.withSubmissionAdmission?.(operation) ?? operation();
+  }
+
   private emit(event: AgentSessionEvent): void {
     this.events.publish(event);
   }
@@ -1141,6 +1152,7 @@ function pendingSubmission(
   void completion.catch(() => undefined);
   const ownedInput: AgentRunInput = Object.freeze({
     task: input.task,
+    ...(input.origin === undefined ? {} : { origin: parseSessionSubmissionOrigin(input.origin) }),
     ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
     runId,
     ...(input.instructions === undefined
@@ -1176,6 +1188,7 @@ function pendingSubmission(
 function submissionInput(input: AgentRunInput): SessionSubmissionInput {
   return Object.freeze({
     task: input.task,
+    ...(input.origin === undefined ? {} : { origin: parseSessionSubmissionOrigin(input.origin) }),
     ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
     ...(input.instructions === undefined ? {} : { instructions: input.instructions }),
     ...(input.contextItems === undefined ? {} : { contextItems: input.contextItems })

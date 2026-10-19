@@ -1,3 +1,4 @@
+import { presentSubmittedTask } from '../session/submission-origin.js';
 import {
   accountModelRequest,
   RequestTokenEstimator,
@@ -31,6 +32,7 @@ export type {
 } from './prompt-material.js';
 
 export interface ModelRequestAssemblyInput {
+  readonly origin?: import('../session/contracts.js').SessionSubmissionOrigin;
   readonly runId?: string;
   readonly window: ModelWindow;
   readonly task: string;
@@ -100,6 +102,7 @@ export class ModelRequestAssembler {
     const notices = deliverPromptContext(input.capacityNotice ? [input.capacityNotice] : [], this.estimator);
     const material = createPromptMaterial({
       task: input.task,
+      ...(input.origin === undefined ? {} : { origin: input.origin }),
       ...(input.images === undefined ? {} : { images: input.images }),
       instructions: input.instructions,
       context: context.items,
@@ -151,6 +154,7 @@ export class ModelRequestAssembler {
               {
                 id: material.id,
                 task: material.task,
+                ...(material.origin === undefined ? {} : { origin: material.origin }),
                 ...(material.images ? { images: material.images } : {}),
                 instructions: material.instructions.filter((item) => item.role === 'user'),
                 context: [],
@@ -279,7 +283,7 @@ export async function compilePromptMaterial(
     instructionMessages.push(Object.freeze({ role: options.authorityRole ?? 'developer', content: guides.join('\n\n') }));
   const taskMessage: ModelInputItem = Object.freeze({
     role: 'user',
-    content: material.task,
+    content: presentSubmittedTask(material.task, material.origin),
     ...(material.images === undefined
       ? {}
       : {

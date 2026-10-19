@@ -1,3 +1,4 @@
+import { parseSessionSubmissionOrigin } from '../../session/submission-origin.js';
 import {
   decodeContextAdmissionConflict,
   type ContextAdmissionConflict
@@ -27,6 +28,7 @@ export type {
 } from './tool-state.js';
 
 export interface AgentRunStateInput {
+  readonly origin?: import('../../session/contracts.js').SessionSubmissionOrigin;
   readonly task: string;
   readonly images?: readonly import('../../session/images.js').SessionImageInput[];
   readonly instructions: readonly string[];
@@ -435,9 +437,10 @@ export function decodeAgentRunState(value: unknown): AgentRunState {
 
 export function decodeAgentRunStateInput(value: unknown): AgentRunStateInput {
   const input = object(value, 'run input');
-  exact(input, ['task', 'instructions', 'contextItems', 'images']);
+  exact(input, ['task', 'origin', 'instructions', 'contextItems', 'images']);
   return Object.freeze({
     task: nonempty(input.task, 'task'),
+    ...(input.origin === undefined ? {} : { origin: parseSessionSubmissionOrigin(input.origin) }),
     ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
     instructions: stringArray(input.instructions, 'instructions'),
     contextItems: Object.freeze(

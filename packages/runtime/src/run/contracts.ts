@@ -163,6 +163,7 @@ export interface ObservationAccess {
 }
 
 export type AgentLimitKind =
+  | 'inference_invocations'
   | 'model_turns'
   | 'total_tool_calls'
   | 'elapsed_time'
@@ -592,6 +593,7 @@ export function terminalSnapshotFingerprint(snapshot: AgentTerminalSnapshot): st
   return canonicalJsonString(snapshot);
 }
 const AGENT_LIMIT_KINDS: readonly AgentLimitKind[] = [
+  'inference_invocations',
   'model_turns',
   'total_tool_calls',
   'elapsed_time',

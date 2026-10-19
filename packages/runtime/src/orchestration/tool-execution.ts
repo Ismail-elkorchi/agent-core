@@ -85,6 +85,8 @@ export interface ToolExecutionInput {
   readonly authorizer?: ToolAuthorizer;
   readonly contextPrerequisite?: ToolContextPrerequisite;
   readonly resourceLeases?: ResourceLeaseCoordinator;
+  /** Host ownership/correction fence held only through the durable start boundary. */
+  readonly withStartBoundary?: <T>(operation: () => Promise<T>) => Promise<T>;
   readonly modelWindow: Pick<ModelWindow, 'recordToolResult'>;
   readonly observationStore: Pick<
     ObservationStore,
@@ -369,7 +371,8 @@ async function planAndAuthorizeCall(
   const result = await planToolCall(
     call,
     sourceTools(input, phase, call),
-    planningContext(input, phase, callIndex, call),
+    { ...planningContext(input, phase, callIndex, call),
+      ...(ready.approved ? { recordedCanonicalInput: ready.approved.approval.input } : {}) },
     async (request) => {
       const prerequisite = await input.contextPrerequisite?.(request);
       return prerequisite
@@ -624,6 +627,7 @@ async function startCall(
       await releaseToolCallPlan(plan);
       return { completion: Promise.resolve({ outcome: 'owned', committed }) };
     }
+    const start = async () => {
     const started = startExternalEffect(
       callState.effect,
       callState.effect.ticket,
@@ -645,6 +649,10 @@ async function startCall(
       callState.effect.intent.effectId
     );
     invocation = await startToolCallPlan(plan, started.state);
+    };
+    if (input.withStartBoundary) await input.withStartBoundary(start);
+    else await start();
+    if (!invocation) throw new Error('Tool invocation was not established at its start boundary.');
     const identity = attemptIdentity(phase, callIndex, call, callState.toolAttempt);
     await input.append(
       {
@@ -827,7 +835,8 @@ async function requireMatchingPlan(
   const result = await planToolCall(
     call,
     sourceTools(input, phase, call),
-    planningContext(input, phase, callIndex, call, state.toolAttempt)
+    { ...planningContext(input, phase, callIndex, call, state.toolAttempt),
+      recordedCanonicalInput: state.plan.canonicalInput }
   );
   if (!result.ok)
     throw new Error(

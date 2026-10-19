@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { canonicalJsonString, parseJsonObject } from '@agent-core/json';
+import { withPersistenceFileLock } from './repositories.js';
 import {
   ArtifactIntegrityError,
   artifactIdentity,
@@ -46,22 +47,6 @@ export class LocalArtifactRepository implements ArtifactRepository {
     const sha256 = hashArtifactBytes(bytes);
     const artifactId = artifactIdentity(sha256, mediaType, protectedPath ? 'protected' : 'public');
     const target = this.confinedPath(artifactId);
-    await fs.mkdir(path.dirname(target), { recursive: true, ...(protectedPath ? { mode: 0o700 } : {}) });
-    if (protectedPath) await fs.chmod(path.dirname(target), 0o700);
-    const temporary = path.join(path.dirname(target), `tmp-${artifactId}-${randomUUID()}.tmp`);
-    const handle = await fs.open(temporary, 'wx', protectedPath ? 0o600 : 0o644);
-    try {
-      await handle.writeFile(bytes);
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    try { await fs.rename(temporary, target); }
-    catch (error) {
-      if (!['EEXIST', 'ENOTEMPTY', 'EPERM'].includes(nodeCode(error) ?? '')) throw error;
-      await verifyFile(target, sha256, bytes.byteLength, artifactId);
-    } finally { await fs.rm(temporary, { force: true }); }
-    await verifyFile(target, sha256, bytes.byteLength, artifactId);
     const ref = freezeArtifactRef({
       artifactId,
       sha256,
@@ -71,24 +56,51 @@ export class LocalArtifactRepository implements ArtifactRepository {
       label: safeArtifactLabel(input.label),
       ...(input.description ? { description: input.description } : {})
     });
-    if (protectedPath) await fs.chmod(target, 0o600);
-    const metadataPath = `${target}.ref.json`;
-    const metadataTemporary = `${metadataPath}.${randomUUID()}.tmp`;
-    try {
-      const metadata = await fs.open(metadataTemporary, 'wx', protectedPath ? 0o600 : 0o644);
-      try {
-        await metadata.writeFile(canonicalJsonString({ format: 'agent-core-artifact-v1', ref }));
-        await metadata.sync();
-      } finally { await metadata.close(); }
-      try { await fs.link(metadataTemporary, metadataPath); }
-      catch (error) { if (nodeCode(error) !== 'EEXIST') throw error; }
-      await this.assertStoredIdentity(ref);
-      if (process.platform !== 'win32') {
-        const directory = await fs.open(path.dirname(target), 'r');
-        try { await directory.sync(); } finally { await directory.close(); }
+    if (await this.readReference(artifactId)) {
+      await this.readVerified(ref);
+      await syncArtifactDirectory(target);
+      return ref;
+    }
+    await fs.mkdir(path.dirname(target), { recursive: true, ...(protectedPath ? { mode: 0o700 } : {}) });
+    if (protectedPath) await fs.chmod(path.dirname(target), 0o700);
+    // Only first publication needs ownership. A descriptor commits an immutable
+    // body, so subsequent stores and all readers can remain lock-free.
+    return withPersistenceFileLock(path.join(this.rootDir, '.locks', artifactId), 5_000, async (assertOwned) => {
+      if (await this.readReference(artifactId)) {
+        await this.readVerified(ref);
+        await syncArtifactDirectory(target);
+        return ref;
       }
-    } finally { await fs.rm(metadataTemporary, { force: true }); }
-    return ref;
+      const temporary = path.join(path.dirname(target), `tmp-${artifactId}-${randomUUID()}.tmp`);
+      try {
+        const handle = await fs.open(temporary, 'wx', protectedPath ? 0o600 : 0o644);
+        try { await handle.writeFile(bytes); await handle.sync(); }
+        finally { await handle.close(); }
+        await assertOwned();
+        // Never replace an existing body, including one left by an interrupted
+        // publication. Verify that orphan before committing its descriptor.
+        try { await fs.link(temporary, target); }
+        catch (error) { if (nodeCode(error) !== 'EEXIST') throw error; }
+      } finally { await fs.rm(temporary, { force: true }); }
+      // Removing the temporary hard link changes ctime. Finish it under the
+      // publication lock before any caller can obtain a committed reference.
+      await verifyFile(target, sha256, bytes.byteLength, artifactId);
+      const metadataPath = `${target}.ref.json`;
+      const metadataTemporary = `${metadataPath}.${randomUUID()}.tmp`;
+      try {
+        const metadata = await fs.open(metadataTemporary, 'wx', protectedPath ? 0o600 : 0o644);
+        try {
+          await metadata.writeFile(canonicalJsonString({ format: 'agent-core-artifact-v1', ref }));
+          await metadata.sync();
+        } finally { await metadata.close(); }
+        await assertOwned();
+        try { await fs.link(metadataTemporary, metadataPath); }
+        catch (error) { if (nodeCode(error) !== 'EEXIST') throw error; }
+        await this.assertStoredIdentity(ref);
+        await syncArtifactDirectory(target);
+      } finally { await fs.rm(metadataTemporary, { force: true }); }
+      return ref;
+    });
   }
 
   storeText(label: string, content: string, description?: string): Promise<PublicArtifactRef> {
@@ -218,6 +230,13 @@ export class LocalArtifactRepository implements ArtifactRepository {
 async function verifyFile(filePath: string, sha256: string, size: number, artifactId: string): Promise<void> {
   const bytes = new Uint8Array(await fs.readFile(filePath));
   if (bytes.byteLength !== size || hashArtifactBytes(bytes) !== sha256) throw new ArtifactIntegrityError(artifactId, `Existing artifact does not match ${artifactId}.`);
+}
+async function syncArtifactDirectory(filePath: string): Promise<void> {
+  // A repeated store can observe the descriptor before its publisher's fsync.
+  // Preserve store durability without changing the committed body's identity.
+  if (process.platform === 'win32') return;
+  const directory = await fs.open(path.dirname(filePath), 'r');
+  try { await directory.sync(); } finally { await directory.close(); }
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function nodeCode(error: unknown): string | undefined { return isRecord(error) && typeof error.code === 'string' ? error.code : undefined; }

@@ -65,7 +65,13 @@ export function conversationEntryView<Message extends ComponentMessage>(
       onTransition: () => options.onToggle(entry.id)
     });
   const segments: InlineContent =
-    entry.kind === 'assistant'
+    entry.kind === 'assignment'
+      ? [{ kind: 'text', text: `Delegated assignment · model-authored · from ${entry.origin.sender.sessionId}\n`, style: { bold: true } },
+          { kind: 'text', text: entry.text }]
+      : entry.kind === 'peer'
+      ? [{ kind: 'text', text: `Peer ${entry.participantId} · model-authored contribution\n`, style: { bold: true } },
+          ...options.markdown(entry.id, entry.text).render(options.width).segments]
+      : entry.kind === 'assistant'
       ? [
           {
             kind: 'text',

@@ -20,7 +20,11 @@ export interface InputRpcOperations {
 }
 
 export function inputRpcMethods(operations: InputRpcOperations) {
-  const input = z.unknown().transform(ownSessionSubmissionInput);
+  const input = z.unknown().transform(value => {
+    if (value !== null && typeof value === 'object' && 'origin' in value)
+      throw new Error('Submission origin is assigned by the host.');
+    return ownSessionSubmissionInput(value);
+  });
   const id = z.string().min(1);
   const follow = operations.follow?.bind(operations);
   const steer = operations.steer?.bind(operations);

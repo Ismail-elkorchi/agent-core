@@ -1,3 +1,4 @@
+import { parseSessionSubmissionOrigin } from './submission-origin.js';
 import { decodeContextAdmissionConflict } from '../run/context-admission.js';
 import { parseJsonObject } from '@agent-core/json';
 import { parseModelSelection, type ModelSelection, type ModelReasoningRequest } from '@agent-core/model';
@@ -7,6 +8,9 @@ import { sourceSchema } from '../history/schema.js';
 import { ownPromptContextInputs } from '../inference/prompt-material.js';
 import type {
   SessionInputRelationship,
+  SessionBranchEntry,
+  SessionRunFinalization,
+  SessionRunFinalizationConfirmation,
   SessionAdmittedSubmission,
   SessionRepository,
   SessionPendingSubmission,
@@ -49,12 +53,13 @@ export function ownSessionSubmissionInput(value: unknown): SessionSubmissionInpu
     throw new Error('Session context items must be an array.');
   if (
     Object.keys(input).some(
-      (key) => !['task', 'instructions', 'contextItems', 'relationship', 'images'].includes(key)
+      (key) => !['task', 'origin', 'instructions', 'contextItems', 'relationship', 'images'].includes(key)
     )
   )
     throw new Error('Unsupported session submission input field.');
   return Object.freeze({
     task: input.task,
+    ...(input.origin === undefined ? {} : { origin: parseSessionSubmissionOrigin(input.origin) }),
     ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
     ...(input.relationship === undefined
       ? {}
@@ -605,4 +610,27 @@ export function initialSessionModelSelection(
     ...(configuration.temperature === undefined ? {} : { temperature: configuration.temperature }),
     ...(configuration.reasoning === undefined ? {} : { reasoning: configuration.reasoning })
   });
+}
+
+/** Only accepted user corrections fence participant work; materialized run input is not a new correction. */
+export function isAcceptedUserCorrection(
+  record: SessionBranchEntry | SessionSubmissionRecord | SessionRunFinalization | SessionRunFinalizationConfirmation
+): boolean {
+  return (record.type === 'steering' && record.originalInput?.origin === undefined) ||
+    (record.type === 'submission.revised' && record.input.origin === undefined) ||
+    (record.type === 'submission.admitted' && record.input.origin === undefined &&
+      (record.input.relationship?.kind === 'correct' || record.input.relationship?.kind === 'replace'));
+}
+
+/** Bind the materialized run input to the provenance already accepted by its session. */
+export function materializedSessionInput(
+  accepted: { readonly originalInput?: SessionSubmissionInput },
+  input: Parameters<SessionRepository['appendInput']>[1]
+): { readonly originalInput?: SessionSubmissionInput } {
+  const origin = input.origin === undefined ? undefined : parseSessionSubmissionOrigin(input.origin);
+  if (accepted.originalInput && hashJson(accepted.originalInput.origin ?? null) !== hashJson(origin ?? null))
+    throw new Error('Run input origin differs from its accepted session submission.');
+  if (accepted.originalInput) return accepted;
+  return origin === undefined ? {} : { originalInput: ownSessionSubmissionInput({ task: input.task, origin,
+    ...(input.images === undefined ? {} : { images: input.images }) }) };
 }

@@ -98,8 +98,14 @@ export async function planToolCall(
       throw new ToolInvocationAuthorityError('Tool invocation caller changed after authorization.');
   };
   const lifetime = new PlanningLifetime();
-  const planningContext: ToolCanonicalizationContext = Object.freeze({ ...context, lifetime });
   try {
+    const planningContext: ToolCanonicalizationContext = Object.freeze({ ...context, lifetime,
+      ...(context.recordedCanonicalInput === undefined ? {} : {
+        recordedCanonicalInput: parseJsonValue(context.recordedCanonicalInput, {
+          maxDepth: 32, maxCollectionEntries: 20_000, maxStringBytes: 4_000_000, maxTotalBytes: 8_000_000
+        })
+      })
+    });
     const decoded = tool.decodeInput(call.input);
     if (!decoded.ok) return { ok: false, observation: decoded.observation };
     const canonicalized = await abortableToolBoundary(context.signal, () =>
