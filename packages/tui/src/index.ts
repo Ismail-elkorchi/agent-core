@@ -194,3 +194,5 @@ export * from './conversation-view.js';
 export * from './chrome.js';
 
 export { collaborationPanel, type CollaborationOperations, type CollaborationPanelState, type CollaborationPanelMessage } from './collaboration.js';
+
+export { materialPanel, type MaterialOperations, type MaterialPanelState, type MaterialPanelMessage } from './material.js';

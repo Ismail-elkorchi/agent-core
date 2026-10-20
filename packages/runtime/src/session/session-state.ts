@@ -4,6 +4,7 @@ import { decodeUtf8, decodeOwnedArtifactRef, hashJson, PersistenceConflictError,
 import * as z from 'zod';
 import type { HistorySourceCut, HistorySourceRef } from '../history/contracts.js';
 import { historyCutSchema, sourceSchema } from '../history/schema.js';
+import { materialOwnerSchema, qualifiedMaterialRefSchema, materialSubjectSchema, materialArtifactSourceSchema, materialArtifactSourceInputSchema, materialSubjectInputSchema, type MaterialOwner, type MaterialProvenance } from '../material/contracts.js';
 
 // In Unicode mode paired surrogates are one astral code point; only lone halves match.
 const wellFormedStateTextSchema = z.string().refine(value => !/[\uD800-\uDFFF]/u.test(value),
@@ -37,11 +38,12 @@ export interface SessionStateItemRef {
   readonly revisionId: string;
   readonly range?: { readonly offset: number; readonly bytes: number } | undefined;
 }
-export interface SessionStateItemContent {
+export interface SessionStateItemContent extends MaterialProvenance {
   readonly text: string;
   readonly sources?: readonly HistorySourceRef[] | undefined;
 }
-export interface SessionStateItemRevision {
+export interface SessionStateItemRevision extends MaterialProvenance {
+  readonly owner: MaterialOwner;
   readonly contentRef: ProtectedArtifactRef;
   readonly sources?: readonly HistorySourceRef[] | undefined;
   readonly itemId: string;
@@ -68,6 +70,7 @@ export type SessionStateOperation =
       readonly edits: readonly { readonly offset: number; readonly bytes: number; readonly text: string }[] }
   | { readonly kind: 'remove'; readonly itemId: string; readonly expectedRevisionId: string };
 export interface SessionStateBatch {
+  readonly owner: MaterialOwner;
   readonly idempotencyKey: string;
   readonly branchId: string;
   readonly inference: SessionStateInference;
@@ -115,17 +118,25 @@ export const sessionStateReadSchema = sessionStateItemRefSchema.unwrap().extend(
   maxBytes: z.int().min(1).max(SESSION_STATE_RETRIEVAL_LIMITS.maxBytes).optional()
 }).readonly();
 export const sessionStateItemContentSchema = z.strictObject({
+  artifactSources: z.array(materialArtifactSourceSchema).max(256).readonly().optional(), subject: materialSubjectSchema.optional(), dependencies: z.array(qualifiedMaterialRefSchema).max(256).readonly().optional(),
   text: wellFormedStateTextSchema.min(1), sources: z.array(sourceSchema).max(256).readonly().optional()
 }).readonly();
 const expected = { itemId: id, expectedRevisionId: id };
-export const sessionStateOperationSchema = z.discriminatedUnion('kind', [
-  sessionStateItemContentSchema.unwrap().extend({ kind: z.literal('create') }),
-  sessionStateItemContentSchema.unwrap().extend({ kind: z.literal('replace'), ...expected }),
+const sessionStateItemContentInputSchema = sessionStateItemContentSchema.unwrap().extend({artifactSources:z.array(materialArtifactSourceInputSchema).max(256).readonly().optional(),subject:materialSubjectInputSchema.optional()});
+export const sessionStateOperationInputSchema = z.discriminatedUnion('kind', [
+  sessionStateItemContentInputSchema.extend({ kind: z.literal('create') }),
+  sessionStateItemContentInputSchema.extend({ kind: z.literal('replace'), ...expected }),
   z.strictObject({ kind: z.literal('edit'), ...expected, edits: z.array(z.strictObject({
     offset: z.int().nonnegative(), bytes: z.int().nonnegative(), text: wellFormedStateTextSchema
   }).readonly()).min(1).max(256).readonly() }).readonly(),
   z.strictObject({ kind: z.literal('remove'), ...expected }).readonly()
 ]);
+export const sessionStateOperationSchema = sessionStateOperationInputSchema.transform((value):SessionStateOperation=>{
+  if(value.kind!=='create'&&value.kind!=='replace')return value;
+  const {artifactSources,subject,...rest}=value;
+  return Object.freeze({...rest,...(subject===undefined?{}:{subject:materialSubjectSchema.parse(subject)}),
+    ...(artifactSources?{artifactSources:Object.freeze(artifactSources.map(ref=>materialArtifactSourceSchema.parse(ref)))}:{})});
+});
 const protectedRef = z.unknown().transform(value => {
   const ref = decodeOwnedArtifactRef(parseJsonObject(value));
   if (ref.visibility !== 'protected') throw new Error('Session-state inference references must be protected.');
@@ -133,10 +144,11 @@ const protectedRef = z.unknown().transform(value => {
 });
 export const sessionStateInferenceSchema = z.strictObject({ ownerId: id, invocationId: id, requestRef: protectedRef }).readonly();
 export const sessionStateBatchSchema = z.strictObject({
-  idempotencyKey: id, branchId: id, inference: sessionStateInferenceSchema,
+  owner: materialOwnerSchema, idempotencyKey: id, branchId: id, inference: sessionStateInferenceSchema,
   capturedHistoryCut: historyCutSchema, operations: z.array(sessionStateOperationSchema).min(1).max(256).readonly()
 }).readonly();
 export const sessionStateItemRevisionSchema = z.strictObject({
+  owner: materialOwnerSchema, artifactSources: z.array(materialArtifactSourceSchema).max(256).readonly().optional(), subject: materialSubjectSchema.optional(), dependencies: z.array(qualifiedMaterialRefSchema).max(256).readonly().optional(),
   itemId: id, revisionId: id, previousRevisionId: id.nullable(), deleted: z.boolean(), contentRef: protectedRef,
   sources: z.array(sourceSchema).max(256).readonly().optional(), contentSha256: z.string().regex(/^[a-f0-9]{64}$/u),
   preview: sessionStatePreviewSchema.optional(),
@@ -204,11 +216,12 @@ export async function validateSessionStateCommit(
     const previous = await current(revision.itemId);
     if (revision.previousRevisionId === null) {
       if (previous) throw new PersistenceConflictError('Session-state create identity already exists.');
-      if (revision.itemId !== sessionStateItemIdentity(owned.branchId, owned.fingerprint, index))
+      if (revision.itemId !== sessionStateItemIdentity(owned.owner, owned.fingerprint, index))
         throw new Error('Session-state item identity was not generated by this batch.');
     } else assertSessionStateItemRevision(previous, revision.previousRevisionId, revision.itemId);
     if ((revision.preview !== undefined && (revision.deleted || Buffer.byteLength(revision.preview) > revision.contentBytes)) ||
         revision.contentBytes !== revision.contentRef.size || revision.contentSha256 !== revision.contentRef.sha256 ||
+        hashJson(revision.owner) !== hashJson(owned.owner) ||
         hashJson(revision.inference) !== hashJson(owned.inference) ||
         hashJson(revision.capturedHistoryCut) !== hashJson(owned.capturedHistoryCut))
       throw new Error('Session-state revision metadata disagrees with its immutable content or attribution.');
@@ -229,13 +242,13 @@ export function sessionStateLimitError(resource: string, limit: number, observed
 export function sessionStateRevisionIdentity(fingerprint: string, index: number): string {
   return `state-revision-${hashJson({ fingerprint, index })}`;
 }
-export function sessionStateItemIdentity(branchId: string, fingerprint: string, index: number): string {
-  return `state-item-${hashJson({ branchId, fingerprint, index })}`;
+export function sessionStateItemIdentity(owner: MaterialOwner, fingerprint: string, index: number): string {
+  return `state-item-${hashJson({ owner, fingerprint, index })}`;
 }
 export function plannedSessionStateRefs(batch: SessionStateBatch): readonly (SessionStateItemRef & { readonly deleted: boolean })[] {
   const fingerprint = hashJson(batch);
   return batch.operations.map((operation, index) => ({
-    itemId: operation.kind === 'create' ? sessionStateItemIdentity(batch.branchId, fingerprint, index) : operation.itemId,
+    itemId: operation.kind === 'create' ? sessionStateItemIdentity(batch.owner, fingerprint, index) : operation.itemId,
     revisionId: sessionStateRevisionIdentity(fingerprint, index), deleted: operation.kind === 'remove'
   }));
 }

@@ -132,3 +132,11 @@ export { createCollaborationPeerDelivery } from './collaboration/peer-host.js';
 export type { CollaborationPeerDeliveryOptions, CollaborationPeerSendInput } from './collaboration/peer-host.js';
 export { createParticipantArtifactRepository, ParticipantArtifactAccessError } from './collaboration/participant-artifacts.js';
 export type { ParticipantArtifactRepositoryOptions, ParticipantArtifactRepository } from './collaboration/participant-artifacts.js';
+
+export type * from './intentions/contracts.js';
+export { HostWakeService } from './intentions/service.js';
+export { EventIntentionRepository, InMemoryIntentionRepository, intentionEventCodec } from './intentions/repository.js';
+export type { IntentionEvent, IntentionLock } from './intentions/repository.js';
+
+export * from './material/index.js';
+export { sessionStatePageSchema } from './session/session-state.js';

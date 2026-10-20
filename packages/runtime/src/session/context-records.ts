@@ -153,6 +153,8 @@ export function decodeContextTransitionEntry(value: unknown): SessionContextTran
     idempotencyKey: entry.transition.idempotencyKey,
     selection: {
       retained: entry.window.selection.retained,
+      ...(entry.window.selection.materials ? { materials: entry.window.selection.materials } : {}),
+      ...(entry.window.selection.skills ? { skills: entry.window.selection.skills } : {}),
       ...(entry.window.selection.sessionState ? { sessionState: entry.window.selection.sessionState } : {}),
       ...(entry.window.selection.artifacts ? { artifacts: entry.window.selection.artifacts } : {}),
       ...(entry.window.selection.excerpts ? { excerpts: entry.window.selection.excerpts } : {}),

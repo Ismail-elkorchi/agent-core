@@ -63,6 +63,11 @@ import type {
 import { InMemoryInferenceRepository, parseInferenceBudget } from './repository.js';
 import { calculateInferenceCost, type InferenceCost } from './usage-cost.js';
 
+/** Inference alone can prove a transport was not sent after owning execution preparation. */
+export interface InferenceLifecycle<TResult> extends EffectLifecycle<TResult, ModelResponse> {
+  notSent(cause: InferenceNotSentError): Promise<TResult>;
+}
+
 export interface InferenceServiceOptions {
   readonly provider: ModelProvider;
   readonly repository: InferenceRepository;
@@ -72,6 +77,7 @@ export interface InferenceServiceOptions {
   readonly admitRequest?: (request: CompiledModelRequest) => void | Promise<void>;
 }
 export interface GovernedInferenceInput extends InferenceIdentity, ModelCompilationOptions {
+  readonly withDispatchAuthority?: <T>(operation: () => Promise<T>) => Promise<T>;
   readonly stateSelectionId?: string | null;
   readonly capturedHistoryCut?: HistorySourceCut | undefined;
   readonly request: ModelRequest;
@@ -198,6 +204,7 @@ interface DurableOperation<T extends { readonly usage?: ModelUsage }> {
   readonly dispatch: () => Promise<T>;
   readonly decode: (value: unknown) => T;
   readonly startAuthority?: () => Promise<void>;
+  readonly withDispatchAuthority?: <TValue>(operation: () => Promise<TValue>) => Promise<TValue>;
   readonly canRejectContext?: () => boolean;
 }
 
@@ -482,15 +489,16 @@ export class InferenceService {
 
   async invokeWithLifecycle<TResult>(
     input: InferenceInvocation,
-    lifecycle: EffectLifecycle<TResult, ModelResponse>,
+    lifecycle: InferenceLifecycle<TResult>,
     identity: InferenceIdentity
   ): Promise<TResult> {
-    const dispatch = { started: false };
+    const dispatch = { started: false, startAttempted: false };
     let result: InferenceResult;
     try {
       result = await this.invokeDurably(
         {
           ...identity,
+          ...(input.withDispatchAuthority ? { withDispatchAuthority: input.withDispatchAuthority } : {}),
           stateSelectionId: input.stateSelectionId ?? null,
           capturedHistoryCut: input.capturedHistoryCut,
           request: input.request,
@@ -505,11 +513,13 @@ export class InferenceService {
           ...(input.onStreamEvent ? { onStreamEvent: input.onStreamEvent } : {})
         },
         async () => {
+          dispatch.startAttempted = true;
           await lifecycle.start();
           dispatch.started = true;
         }
       );
     } catch (cause) {
+      if (cause instanceof InferenceNotSentError && dispatch.startAttempted) return lifecycle.notSent(cause);
       if (!dispatch.started) throw cause;
       return lifecycle.uncertain(cause);
     }
@@ -521,6 +531,9 @@ export class InferenceService {
   }
 
   async invokeNative(input: NativeInferenceInput) {
+    const presentation = this.presentationFor(input.compiled);
+    if (presentation?.materialDependencies?.length || presentation?.skillReferences?.length)
+      throw new Error('Revocable material requires a governed request launch; native continuous transport does not expose a held dispatch fence.');
     return invokeNativeInference(
       {
         gateway: this.gateway,
@@ -700,6 +713,7 @@ export class InferenceService {
         compiled,
         ...(signal ? { signal } : {}),
         ...(startAuthority ? { startAuthority } : {}),
+        ...(input.withDispatchAuthority ? { withDispatchAuthority: input.withDispatchAuthority } : {}),
         canRejectContext: () => !sawOutput,
         dispatch: () => {
           dispatchPromise = this.gateway.invoke({
@@ -1096,7 +1110,6 @@ export class InferenceService {
       try {
         signal?.throwIfAborted();
         await this.admit(compiled, profile);
-        await input.startAuthority?.();
         signal?.throwIfAborted();
       } catch (cause) {
         const message = cause instanceof Error ? cause.message : String(cause);
@@ -1104,9 +1117,57 @@ export class InferenceService {
         throw new InferenceNotSentError(identity.invocationId, message, { cause });
       }
     };
-    const operation = executeEffectLifecycle({ start: authorize, settle, uncertain }, () => {
+    let pending: Promise<T> | undefined;
+    let authorityFailure: Error | undefined;
+    const heldAuthority = async (operation: () => Promise<void>): Promise<void> => {
+      if (!input.withDispatchAuthority) return operation();
+      const lease: { active: boolean; called: boolean; violation?: Error } = { active: true, called: false };
+      try {
+        await input.withDispatchAuthority(() => {
+          if (!lease.active || lease.called) {
+            lease.violation = new Error(!lease.active ? 'Dispatch authority callback outlived its held lease.' : 'Dispatch authority callback must be invoked exactly once.');
+            return Promise.reject(lease.violation);
+          }
+          lease.called = true;
+          return operation();
+        });
+      } finally { lease.active = false; }
+      if (lease.violation) throw lease.violation;
+      if (!lease.called) throw new Error('Dispatch authority did not invoke its callback.');
+    };
+    const launch = () => {
+      signal?.throwIfAborted();
+      if (dispatchStarted) throw new Error('Inference transport was already launched.');
       dispatchStarted = true;
-      return input.dispatch();
+      try { pending = input.dispatch(); } catch (cause) { pending = Promise.reject(cause instanceof Error ? cause : new Error(String(cause))); }
+      // Transport may reject before the held authority callback releases its locks.
+      void pending.catch(() => undefined);
+      return Promise.resolve(undefined);
+    };
+    const startDispatch = async () => {
+      const presentation = this.presentationFor(compiled);
+      const requiresGuard = (presentation?.materialDependencies?.length ?? 0) > 0 || (presentation?.skillReferences?.length ?? 0) > 0;
+      try {
+        // Host admission may read session state; complete it before acquiring source locks.
+        // The held authority then validates exact dependencies again immediately before send.
+        await authorize();
+        if (requiresGuard && !input.withDispatchAuthority)
+          throw new Error('Revocable request material requires a held dispatch authority.');
+        // Check before issuing owning execution authority, then recheck after its asynchronous preparation.
+        await heldAuthority(() => Promise.resolve());
+        await input.startAuthority?.();
+        await heldAuthority(launch);
+      } catch (cause) {
+        if (dispatchStarted) { authorityFailure = cause instanceof Error ? cause : new Error(String(cause)); return; }
+        const message = cause instanceof Error ? cause.message : String(cause);
+        await this.cancelBeforeDispatch(identity, message);
+        throw new InferenceNotSentError(identity.invocationId, message, { cause });
+      }
+    };
+    const operation = executeEffectLifecycle({ start: startDispatch, settle, uncertain }, () => {
+      if (authorityFailure) return Promise.reject(authorityFailure);
+      if (!pending) throw new Error('Inference dispatch did not launch.');
+      return pending;
     });
     if (!signal) return operation;
     return new Promise<DurableResult<T>>((resolve, reject) => {

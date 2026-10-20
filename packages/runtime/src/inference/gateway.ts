@@ -18,6 +18,7 @@ import { requestWindowForModel } from '../orchestration/model-request.js';
 import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
 
 export interface InferenceInvocation {
+  readonly withDispatchAuthority?: <T>(operation: () => Promise<T>) => Promise<T>;
   readonly stateSelectionId?: string | null;
   readonly capturedHistoryCut?: HistorySourceCut | undefined;
   readonly transport?: ModelTransportOptions;

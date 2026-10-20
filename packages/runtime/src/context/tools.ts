@@ -1,9 +1,13 @@
+import { MaterialAccessError, materialOwnerSchema, qualifiedMaterialRefSchema } from '../material/contracts.js';
+import { skillReferenceSchema, skillSelectionReferencesSchema, skillDiscoveryRequestSchema, skillScopeDiscoveryRequestSchema, skillResourceReadRequestSchema, skillLoadRequestSchema } from '@agent-core/skills';
 import { contextOperationalInspectionPageSchema } from '../session/operational.js';
 import { grantContextControlTool } from './recovery.js';
 import { ContextInspectionSizeError, MAX_MANIFEST_BYTES, contextInspectionStartCursor, contextInspectionCursor, contextInspectionSchema } from './inspection.js';
 import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import {
   defaultToolModelContent,
+  invalidToolInputObservation,
+  updateToolObservation,
   artifactRefSchema,
   artifactScope,
   ToolInputError,
@@ -18,7 +22,7 @@ import { historyCutSchema, sourceSchema, sourceExcerptSchema } from '../history/
 import { scopedTool, scopePath, invocationIdentity } from '../history/tool-support.js';
 import { contextTransitionRequestSchema } from './schema.js';
 import { hashJson, decodeOwnedArtifactRef, PersistenceConflictError, type ArtifactRepository } from '@agent-core/persistence';
-import { SESSION_STATE_GUIDANCE, sessionStatePageSchema, sessionStateReadSchema, sessionStateSearchSchema, sessionStateOperationSchema, sessionStateItemRefSchema, plannedSessionStateRefs } from '../session/session-state.js';
+import { SESSION_STATE_GUIDANCE, sessionStatePageSchema, sessionStateReadSchema, sessionStateSearchSchema, sessionStateOperationSchema, sessionStateOperationInputSchema, sessionStateItemRefSchema, plannedSessionStateRefs } from '../session/session-state.js';
 import type { HistorySourceExcerpt } from '../history/contracts.js';
 import type { ContextService } from './service.js';
 const jsonOutputSchema: z.ZodType<JsonValue> = z.json();
@@ -36,6 +40,8 @@ export function contextToolDefinitions(options: {
     add: sources.optional(), release: sources.optional(), recentFrom: sourceSchema.optional(),
     excerpts: z.array(sourceExcerptSchema).max(10000).readonly().optional(),
     sessionState: z.array(sessionStateItemRefSchema).max(10000).readonly().optional(),
+    materials: z.array(qualifiedMaterialRefSchema).max(256).readonly().optional(),
+    skills: skillSelectionReferencesSchema.optional(),
     artifacts: z.array(z.discriminatedUnion('representation', [
       z.strictObject({ artifact: artifactRefSchema, representation: z.literal('reference') }),
       z.strictObject({ artifact: artifactRefSchema, representation: z.literal('text'),
@@ -43,7 +49,7 @@ export function contextToolDefinitions(options: {
     ])).max(10000).readonly().optional()
   };
   const transition = z.strictObject(selectionShape);
-  const save = z.strictObject({ operations: z.array(sessionStateOperationSchema).min(1).max(256).readonly() });
+  const save = z.strictObject({ owner: materialOwnerSchema.optional(), operations: z.array(sessionStateOperationInputSchema).min(1).max(256).readonly() });
   const combined = z.strictObject({ ...selectionShape, operations: save.shape.operations,
     activateSaved: z.boolean().default(true) });
   const canonicalize = async (value: z.output<typeof transition> & { operations?: z.output<typeof save>['operations']; activateSaved?: boolean }, planning: ToolCanonicalizationContext) => {
@@ -54,8 +60,8 @@ export function contextToolDefinitions(options: {
       throw new Error('Context branch changed after the originating inference.');
     const window = await options.context.history.selectedContext(cut);
     const identity = invocationIdentity(planning);
-    const batch = value.operations ? { idempotencyKey: identity, branchId: origin.branchId,
-      capturedHistoryCut: origin.capturedHistoryCut, inference: origin.inference, operations: value.operations } : undefined;
+    const batch = value.operations ? { owner: { kind: 'session' as const, sessionId: origin.sessionId, branchId: origin.branchId }, idempotencyKey: identity, branchId: origin.branchId,
+      capturedHistoryCut: origin.capturedHistoryCut, inference: origin.inference, operations: value.operations.map(operation => sessionStateOperationSchema.parse(operation)) } : undefined;
     const changed = batch ? plannedSessionStateRefs(batch) : undefined;
     const { artifacts, ...sourceChange } = value;
     const selection = await options.context.selectSources(cut, { ...sourceChange, ...(artifacts ? { artifacts: artifacts.map(value => {
@@ -79,7 +85,9 @@ export function contextToolDefinitions(options: {
     if (committed) return { kind: 'result', execution: { state: 'settled' },
       scope: { resources: [scopePath('context', value.cut.sessionId, value.cut.branchId)], coverage: 'complete' },
       summary: 'Context view committed after admission.', output: { status: 'committed', windowId: committed.window.windowId } };
-    const staged = value.batch ? await options.context.stageSessionState(value.batch).catch(stateToolFailure) : undefined;
+    let staged;
+    try { staged = value.batch ? await options.context.stageSessionState(value.batch) : undefined; }
+    catch (error) { return stateToolRejection(error, `${prefix}_save_and_activate`); }
     const invocation = execution.invocation;
     if (!invocation) throw new Error('Context operation requires an invocation.');
     const { runId, turnId, requestAttempt, toolBatchId, callIndex, toolAttempt } = invocation;
@@ -103,23 +111,59 @@ export function contextToolDefinitions(options: {
       : 'Activate exact existing item revisions and historical sources without saving state.'} retain replaces optional original sources; add/release edits complete exchanges. Active accepted inputs remain protected. renewal deliberately starts a new provider continuation. outputReservation proposes an ordinary output-token allowance for this window, only within explicit host policy; omission retains the current choice. It changes neither continuing-work budgets nor host ceilings. A scheduled result is pending until the exact next request is admitted.`,
     schema: atomic ? combined : transition,
     outputSchema: jsonOutputSchema,
-    effectEnvelope: { accesses: [{ mode: 'read', scope: 'session_state' }, { mode: 'read', scope: 'artifacts' }, { mode: 'write', scope: 'context' }, ...(atomic ? [{ mode: 'write' as const, scope: 'session_state' }] : [])],
+    effectEnvelope: { accesses: [{ mode: 'read', scope: 'session_state' }, { mode: 'read', scope: 'materials' }, { mode: 'read', scope: 'skills' }, { mode: 'read', scope: 'artifacts' }, { mode: 'write', scope: 'context' }, ...(atomic ? [{ mode: 'write' as const, scope: 'session_state' }] : [])],
       lockScopes: atomic ? ['context', 'session_state'] : ['context'] },
     canonicalizeInput: canonicalize,
     deriveEffects(value) {
       const contextScope = scopePath('context', value.cut.sessionId, value.cut.branchId);
       const scopes = [contextScope, ...(atomic ? [scopePath('session_state', value.cut.sessionId, value.cut.branchId)] : [])];
-      return { accesses: [...scopes.map(scope => ({ mode: 'write' as const, scope })),
+      const accesses = [...scopes.map(scope => ({ mode: 'write' as const, scope })),
         ...(value.selection.sessionState?.length || value.batch?.operations.some(operation => operation.kind === 'edit')
           ? [{ mode: 'read' as const, scope: scopePath('session_state', value.cut.sessionId, value.cut.branchId) }] : []),
-        ...(value.selection.artifacts ?? []).map(item => ({ mode: 'read' as const, scope: artifactScope(item.artifact.artifactId) }))], lockScopes: scopes,
+        ...(value.selection.materials ?? []).map(item => ({ mode: 'read' as const, scope: `materials/${encodeURIComponent(JSON.stringify(item.owner))}` })),
+        ...(value.selection.skills ?? []).map(item => ({ mode: 'read' as const, scope: `skills/${encodeURIComponent(item.scopeId)}` })),
+        ...(value.selection.artifacts ?? []).map(item => ({ mode: 'read' as const, scope: artifactScope(item.artifact.artifactId) }))];
+      return { accesses: [...new Map(accesses.map(access => [`${access.mode}:${access.scope}`, access])).values()], lockScopes: scopes,
         recovery: { kind: 'buffered_mutation' as const, transactionId: value.identity,
           reconcilerId: `agent-core.context-${atomic ? 'save-and-activate' : 'transition'}.v2`, authority: contextScope } };
     },
     invoke: observe,
     async recover(value, _effect, execution) { return { status: 'settled', observation: await observe(value, execution) }; }
   });
+  const materialScope = (owner: z.output<typeof materialOwnerSchema>) => `materials/${encodeURIComponent(JSON.stringify(owner))}`;
+  const materials = options.context.materials, skills = options.context.skills;
+  const materialTools = [
+    scopedTool({ name: `${prefix}_material_scopes`, description: 'Discover only host-granted material scopes with bounded metadata and complete output accounting. Subjects and audiences are separate; no global session directory is exposed.',
+      schema: sessionStatePageSchema, mode: 'read', root: 'materials',
+      canonicalize(value) { return Promise.resolve({ value, scope: 'materials' }); },
+      async invoke(value) { return options.context.listMaterialScopes(sessionStatePageSchema.parse(value)); } })
+  ];
+  const canonicalizeStateRead = async (value: JsonObject) => {
+    const cut = await options.context.history.capture();
+    const owner = materialOwnerSchema.parse(value.owner ?? { kind: 'session', sessionId: cut.sessionId, branchId: cut.branchId });
+    await materials.authorizeOwner(owner);
+    return { value: parseJsonObject({ ...value, owner, cut }), scope: owner.kind === 'session' ? scopePath('session_state', owner.sessionId, owner.branchId) : materialScope(owner) };
+  };
+  const skillTools = skills ? [
+    scopedTool({ name: `${prefix}_skill_scopes`, description: 'Discover authorized skill source bindings with bounded metadata. Denied source identities are never returned. Does not read packages, activate instructions, install helpers or grant execution permission.',
+      schema: skillScopeDiscoveryRequestSchema, mode: 'read', root: 'skills',
+      canonicalize(value) { return Promise.resolve({ value, scope: 'skills' }); },
+      async invoke(value, execution) { return skills.discoverScopes(skillScopeDiscoveryRequestSchema.parse(value), execution.signal); } }),
+    scopedTool({ name: `${prefix}_skill_discover`, description: 'Read bounded skill descriptions in a granted scope. Discovery never runs scripts, installs packages or activates instructions. Select exact references through context_transition skills.',
+      schema: skillDiscoveryRequestSchema, mode: 'read', root: 'skills',
+      canonicalize(value) { const query = skillDiscoveryRequestSchema.parse(value); return Promise.resolve({ value: parseJsonObject(query), scope: `skills/${encodeURIComponent(query.scopeId)}` }); },
+      async invoke(value, execution) { return skills.discover(skillDiscoveryRequestSchema.parse(value), execution.signal); } }),
+    scopedTool({ name: `${prefix}_skill_read`, description: 'Read one exact skill instruction body and immutable resource manifest. Content is reference material, never permission to execute requested tools. Does not activate it.',
+      schema: skillLoadRequestSchema, mode: 'read', root: 'skills',
+      async canonicalize(value) { const ref = skillReferenceSchema.parse(value.ref); await skills.assertAvailable([ref]); return { value, scope: `skills/${encodeURIComponent(ref.scopeId)}` }; },
+      async invoke(value, execution) { return skills.loadSelection([skillReferenceSchema.parse(value.ref)], { ...(typeof value.maxBytes === 'number' ? { maxBytes: value.maxBytes } : {}), ...(execution.signal ? { signal: execution.signal } : {}) }); } }),
+    scopedTool({ name: `${prefix}_skill_resource_read`, description: 'Read an exact bounded skill resource range as data only. Scripts are never executed by this operation.',
+      schema: skillResourceReadRequestSchema, mode: 'read', root: 'skills',
+      async canonicalize(value) { const ref = skillReferenceSchema.parse(value.ref); await skills.assertAvailable([ref]); return { value, scope: `skills/${encodeURIComponent(ref.scopeId)}` }; },
+      async invoke(value, execution) { const query = skillResourceReadRequestSchema.parse(value); const resource = await skills.readResource(query.ref, query.path, { offset: query.offset, length: query.length }, execution.signal); const { bytes, ...metadata } = resource; return { ...metadata, encoding: 'base64', content: Buffer.from(bytes).toString('base64') }; } })
+  ] : [];
   const readTools = [
+    ...materialTools, ...skillTools,
     scopedTool({
       name: `${prefix}_inspect`,
       description:
@@ -217,59 +261,75 @@ export function contextToolDefinitions(options: {
       }
     }),
     scopedTool({
-      name: `${prefix}_state_list`, description: 'List stored narrative item metadata with bounded leading-text previews, or exact currently selected revision references, without loading bodies. Set view=selected for the active view; default stored lists current item heads. Continue with the returned cut-pinned cursor.',
-      schema: sessionStatePageSchema.extend({ view: z.enum(['stored', 'selected']).default('stored') }),
-      mode: 'read', root: 'session_state',
-      async canonicalize(value) { const cut = await options.context.history.capture(); return { value: parseJsonObject({ ...value, cut }), scope: scopePath('session_state', cut.sessionId, cut.branchId) }; },
-      async invoke(value) { const cut = historyCutSchema.parse(value.cut); await options.context.history.validateCut(cut);
-        return parseJsonValue(await (value.view === 'selected' ? (request: Parameters<ContextService['listSessionState']>[0]) => options.context.listSelectedSessionState(request, cut) : (request: Parameters<ContextService['listSessionState']>[0]) => options.context.listSessionState(request, cut))({
-          ...(typeof value.cursor === 'string' ? { cursor: value.cursor } : {}),
-          ...(typeof value.limit === 'number' ? { limit: value.limit } : {}),
-          ...(typeof value.maxBytes === 'number' ? { maxBytes: value.maxBytes } : {}) })); }
-    }),
-    scopedTool({
-      name: `${prefix}_state_search`, description: 'Search current stored narrative text literally with bounded scanning and output. Returns only the first occurrence per item, with exact UTF-8 match and excerpt ranges directly usable for reads and selection. Partial results carry a query-pinned cursor. An unsearched oversized item needs a larger scan allowance; absence of a match is not complete coverage.',
-      schema: sessionStateSearchSchema,
-      mode: 'read', root: 'session_state',
-      async canonicalize(value) { const cut = await options.context.history.capture(); return { value: parseJsonObject({ ...value, authorizedCut: cut }), scope: scopePath('session_state', cut.sessionId, cut.branchId) }; },
+      name: `${prefix}_state_list`, description: 'List stored narrative metadata with bounded previews in one authorized owner, or current session selected revisions with view=selected. Omitted owner means the current session. Shared results include exact qualified references for read and transition materials. Cursors pin snapshot and authority; use context_inspect for the whole active selection.',
+      schema: sessionStatePageSchema.extend({ owner: materialOwnerSchema.optional(), view: z.enum(['stored', 'selected']).default('stored') }),
+      mode: 'read', root: ['session_state', 'materials'],
+      canonicalize: canonicalizeStateRead,
       async invoke(value) {
-        if (typeof value.query !== 'string') throw new ToolInputError('State search requires a string query.');
-        return parseJsonValue(await options.context.searchSessionState({ query: value.query, cut: historyCutSchema.parse(value.authorizedCut),
-        ...(typeof value.cursor === 'string' ? { cursor: value.cursor } : {}), ...(typeof value.limit === 'number' ? { limit: value.limit } : {}),
-        ...(typeof value.maxBytes === 'number' ? { maxBytes: value.maxBytes } : {}), ...(typeof value.maxScannedBytes === 'number' ? { maxScannedBytes: value.maxScannedBytes } : {}) })); }
+        const owner = materialOwnerSchema.parse(value.owner), cut = historyCutSchema.parse(value.cut);
+        const page = sessionStatePageSchema.parse({ cursor: value.cursor, limit: value.limit, maxBytes: value.maxBytes });
+        if (owner.kind === 'scope') {
+          if (value.view === 'selected') throw new ToolInputError('Use context_inspect for selected shared material; view=selected is a session-local inventory.');
+          return options.context.listMaterials(owner, page);
+        }
+        return value.view === 'selected' ? options.context.listSelectedSessionState(page, cut) : options.context.listSessionState(page, cut);
+      }
     }),
     scopedTool({
-      name: `${prefix}_state_read`, description: 'Read one exact narrative item revision, optionally an exact UTF-8 byte range. Optional maxBytes bounds the complete JSON result including text, references and citations; an oversized exact result is refused, never truncated. Does not activate it.',
-      schema: sessionStateReadSchema, mode: 'read', root: 'session_state',
+      name: `${prefix}_state_search`, description: 'Search stored narrative text literally in one authorized owner; omitted owner means the current session. Scan and complete output budgets apply. Results include exact revision/UTF-8 ranges; shared references include owner. Partial coverage never proves absence. Cursors bind query, snapshot and authority.',
+      schema: sessionStateSearchSchema.extend({ owner: materialOwnerSchema.optional() }),
+      mode: 'read', root: ['session_state', 'materials'],
+      canonicalize: canonicalizeStateRead,
+      async invoke(value) {
+        const owner = materialOwnerSchema.parse(value.owner);
+        const query = sessionStateSearchSchema.parse({ query: value.query, cursor: value.cursor, limit: value.limit, maxBytes: value.maxBytes, maxScannedBytes: value.maxScannedBytes });
+        return owner.kind === 'scope' ? options.context.searchMaterials(owner, query) : options.context.searchSessionState({ ...query, cut: historyCutSchema.parse(value.cut) });
+      }
+    }),
+    scopedTool({
+      name: `${prefix}_state_read`, description: 'Read one exact authorized narrative revision, optionally an exact UTF-8 byte range. Omitted owner means the current session. maxBytes bounds the complete JSON result including attribution and citations; oversized exact results are refused, never truncated. Reading does not activate it.',
+      schema: sessionStateReadSchema.unwrap().extend({ owner: materialOwnerSchema.optional() }), mode: 'read', root: ['session_state', 'materials'],
       async canonicalize(value) {
-        const { maxBytes, ...ref } = value;
-        const cut = await options.context.history.capture();
-        return { value: parseJsonObject({ ref, cut, ...(maxBytes === undefined ? {} : { maxBytes }) }), scope: scopePath('session_state', cut.sessionId, cut.branchId) };
+        const canonical = await canonicalizeStateRead(value);
+        const { maxBytes, ...ref } = sessionStateReadSchema.parse({ itemId: value.itemId, revisionId: value.revisionId, ...(value.range === undefined ? {} : { range: value.range }), ...(value.maxBytes === undefined ? {} : { maxBytes: value.maxBytes }) });
+        return { ...canonical, value: parseJsonObject({ owner: canonical.value.owner, cut: canonical.value.cut, ref, ...(maxBytes === undefined ? {} : { maxBytes }) }) };
       },
-      async invoke(value) { return parseJsonValue(await options.context.readSessionState(sessionStateItemRefSchema.parse(value.ref),
-        historyCutSchema.parse(value.cut), typeof value.maxBytes === 'number' ? value.maxBytes : undefined)); }
+      async invoke(value) {
+        const owner = materialOwnerSchema.parse(value.owner);
+        const ref = sessionStateItemRefSchema.parse(value.ref), maxBytes = typeof value.maxBytes === 'number' ? value.maxBytes : undefined;
+        return owner.kind === 'scope' ? options.context.readMaterial({ owner, ...ref }, maxBytes) : options.context.readSessionState(ref, historyCutSchema.parse(value.cut), maxBytes);
+      }
     }),
   ];
+  const observeStateSave = async (value: Parameters<ContextService['saveSessionState']>[0]): Promise<ToolObservationInput<JsonValue>> => {
+    try {
+      const receipt = await options.context.saveSessionState(value);
+      return { kind: 'result', execution: { state: 'settled' },
+        scope: { resources: [value.owner.kind === 'scope' ? materialScope(value.owner) : scopePath('session_state', value.owner.sessionId, value.owner.branchId)], coverage: 'complete' },
+        summary: 'Narrative changes durably saved; the active view is unchanged.', output: parseJsonValue(receipt) };
+    } catch (error) {
+      // The service has reconciled the exact receipt before returning a typed transactional rejection.
+      return stateToolRejection(error, `${prefix}_state_save`);
+    }
+  };
   const stateTool = defineTool({
       name: `${prefix}_state_save`, implementationId: 'agent-core.session-state-save.v1',
       description: `${SESSION_STATE_GUIDANCE} Durably save a conditional atomic batch of create, replace, UTF-8 range edit, or remove operations. Does not compile or activate any model request. Runtime assigns item and revision identities and returns them in the durable receipt.`,
       schema: save,
       outputSchema: jsonOutputSchema,
-      effectEnvelope: { accesses: [{ mode: 'write', scope: 'session_state' }, { mode: 'read', scope: 'session_state' }], lockScopes: ['session_state'] },
+      effectEnvelope: { accesses: [{ mode: 'write', scope: 'session_state' }, { mode: 'read', scope: 'session_state' }, { mode: 'write', scope: 'materials' }, { mode: 'read', scope: 'materials' }], lockScopes: ['session_state', 'materials'] },
       async canonicalizeInput(value, planning) {
         if (!planning.invocation) throw new Error('State saving requires an originating inference.');
         const origin = await options.context.sessionStateOrigin(planning.invocation);
-        return { idempotencyKey: invocationIdentity(planning), branchId: origin.branchId,
-          capturedHistoryCut: origin.capturedHistoryCut, inference: origin.inference, operations: value.operations };
+        return { owner: value.owner ?? { kind: 'session' as const, sessionId: origin.sessionId, branchId: origin.branchId }, idempotencyKey: invocationIdentity(planning), branchId: origin.branchId,
+          capturedHistoryCut: origin.capturedHistoryCut, inference: origin.inference, operations: value.operations.map(operation => sessionStateOperationSchema.parse(operation)) };
       },
-      deriveEffects(value) { const scope = scopePath('session_state', value.capturedHistoryCut.sessionId, value.branchId);
+      deriveEffects(value) { const scope = value.owner.kind === 'scope' ? `materials/${encodeURIComponent(JSON.stringify(value.owner))}` : scopePath('session_state', value.capturedHistoryCut.sessionId, value.branchId);
         return { accesses: [{ mode: 'write' as const, scope }, ...(value.operations.some(operation => operation.kind === 'edit') ? [{ mode: 'read' as const, scope }] : [])], lockScopes: [scope],
           recovery: { kind: 'buffered_mutation' as const, transactionId: value.idempotencyKey,
             reconcilerId: 'agent-core.session-state-save.v1', authority: scope } }; },
-      async invoke(value) { const receipt = await options.context.saveSessionState(value).catch(stateToolFailure); return { kind: 'result' as const,
-        execution: { state: 'settled' as const }, scope: { resources: [scopePath('session_state', value.capturedHistoryCut.sessionId, value.branchId)], coverage: 'complete' as const }, summary: 'Narrative changes durably saved; the active view is unchanged.', output: parseJsonValue(receipt) }; },
-      async recover(value) { const receipt = await options.context.saveSessionState(value).catch(stateToolFailure); return { status: 'settled' as const,
-        observation: { kind: 'result' as const, execution: { state: 'settled' as const }, scope: { resources: [scopePath('session_state', value.capturedHistoryCut.sessionId, value.branchId)], coverage: 'complete' as const }, summary: 'Narrative changes durably saved.', output: parseJsonValue(receipt) } }; }
+      invoke: observeStateSave,
+      async recover(value) { return { status: 'settled' as const, observation: await observeStateSave(value) }; }
     });
   return Object.freeze([
     ...readTools.map(tool => grantContextControlTool(tool, 'read')),
@@ -334,8 +394,9 @@ function inspectionPresentation(result: JsonObject): string {
   });
 }
 
-function stateToolFailure(error: unknown): never {
-  if (error instanceof PersistenceConflictError && 'details' in error)
-    throw new ToolInputError(error.message, parseJsonObject(error.details));
+function stateToolRejection(error: unknown, toolName: string): ToolObservationInput<JsonValue> {
+  if (error instanceof PersistenceConflictError || error instanceof MaterialAccessError)
+    return updateToolObservation(invalidToolInputObservation(toolName, error.message,
+      'details' in error ? parseJsonObject(error.details) : {}), { execution: { state: 'not_started' } });
   throw error;
 }

@@ -57,6 +57,9 @@
     },
     {
       "path": "packages/tools-web"
+    },
+    {
+      "path": "packages/skills"
     }
   ]
 }

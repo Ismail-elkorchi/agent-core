@@ -548,7 +548,8 @@ for (const publication of ['normal', 'lost_receipt', 'rejected', 'append_noop_fr
     const frames = [];
     const sockets = [];
     const frameSockets = [];
-    let freshRequests = 0;
+    const emittedCalls = [];
+    let fullRequests = 0;
     const body1 = 'Retain the rationale.';
     const body2 = 'Retain the corrected rationale.';
     let currentStateRef;
@@ -561,24 +562,26 @@ for (const publication of ['normal', 'lost_receipt', 'rejected', 'append_noop_fr
         const socket = new Socket((body, ws) => {
           frames.push(body);
           frameSockets.push(ws);
-          const fresh = !body.previous_response_id;
-          if (fresh) freshRequests++;
-          const id = publication === 'append_noop_fresh' ? `continuation-${frames.length}` : fresh ? `r${freshRequests}` : `ack${freshRequests}`;
-          const ordinaryOutput = !fresh || freshRequests === 3 || (publication === 'rejected' && freshRequests > 1)
-            ? message(fresh ? 'Finished.' : 'Selection requested.')
+          // A guarded full replay is still an ordinary successor on its existing
+          // session. Native result-only acknowledgments are separate generations.
+          const full = !body.previous_response_id;
+          if (full) fullRequests++;
+          const id = publication === 'append_noop_fresh' ? `continuation-${frames.length}` : full ? `r${fullRequests}` : `ack${fullRequests}`;
+          const ordinaryOutput = !full || fullRequests === 3 || (publication === 'rejected' && fullRequests > 1)
+            ? message(full ? 'Finished.' : 'Selection requested.')
             : [{ ...call(id + '-state', 'context_save_and_activate'), arguments: JSON.stringify({
               reason: 'Revise useful understanding.', renewal: true,
-              operations: stateOperations(freshRequests === 1 ? body1 : body2)
+              operations: stateOperations(fullRequests === 1 ? body1 : body2)
             }) }];
-          const turn = frames.length;
           const output = publication !== 'append_noop_fresh' ? ordinaryOutput
-            : [1, 3, 5, 7].includes(turn)
-              ? [{ ...call(id + '-state', [3, 7].includes(turn) ? 'context_transition' : 'context_save_and_activate'), arguments: JSON.stringify({
+            : full && fullRequests <= 4
+              ? [{ ...call(id + '-state', [2, 4].includes(fullRequests) ? 'context_transition' : 'context_save_and_activate'), arguments: JSON.stringify({
                   reason: 'Preserve transport until deliberate renewal.',
-                  ...([3, 7].includes(turn) ? {} : { operations: stateOperations(turn === 1 ? body1 : body2) }),
-                  ...(turn === 7 ? { renewal: true } : {})
+                  ...([2, 4].includes(fullRequests) ? {} : { operations: stateOperations(fullRequests === 1 ? body1 : body2) }),
+                  ...(fullRequests === 4 ? { renewal: true } : {})
                 }) }]
-              : message(turn === 9 ? 'Finished.' : 'Selection requested.');
+              : message(full ? 'Finished.' : 'Selection requested.');
+          for (const item of output) if (item.type === 'function_call') emittedCalls.push({ frame: frames.length - 1, call: item });
           ws.feed({ type: 'response.created', response: { id,
             ...(body.previous_response_id ? { previous_response_id: body.previous_response_id } : {}) } },
             { type: 'response.completed', response: response(id, output) });
@@ -601,13 +604,15 @@ for (const publication of ['normal', 'lost_receipt', 'rejected', 'append_noop_fr
       }
       return entry;
     };
+    const inferenceRepository = new InMemoryInferenceRepository();
+    const inferenceAudit = recordInferenceEvents(inferenceRepository);
     const inference = new InferenceService({
       provider,
       ...(publication === 'rejected' ? { admitRequest: compiled => {
         if (compiled.logicalRequest.messages.some(item => item.role === 'user' && item.content.includes(body1)))
           throw new Error('Reject the exact native state successor');
       } } : {}),
-      repository: new InMemoryInferenceRepository(),
+      repository: inferenceRepository,
       artifacts
     });
     const result = await new AgentRuntime({
@@ -652,29 +657,44 @@ for (const publication of ['normal', 'lost_receipt', 'rejected', 'append_noop_fr
     assert.notEqual(originalRef.revisionId, correctedRef.revisionId);
     assert.equal((await context.readSessionState(originalRef)).text, body1, 'Replacing the active item preserves immutable historical understanding');
     assert.equal((await context.listSessionState()).items.length, 1);
+    for (const emitted of emittedCalls) {
+      const successor = frames[emitted.frame + 1];
+      assert.ok(successor, 'Every settled call must reach a successor');
+      assert.equal(successor.input.filter(item => item.type === 'function_call_output' && item.call_id === emitted.call.call_id).length, 1,
+        'Native and guarded successors must preserve each original result exactly once');
+    }
+    const starts = inferenceAudit.filter(({ event }) => event.type === 'inference.started').map(({ event }) => event);
+    assert.deepEqual(starts.map(event => event.operation), ['native_generation', 'native_generation',
+      ...Array.from({ length: publication === 'append_noop_fresh' ? 4 : 2 }, () => 'generation')],
+    'Only the initial result exchange may use native continuous dispatch; retained state requires guarded generations');
+    for (const started of starts.slice(2)) {
+      const admitted = await inference.admittedInput(result.terminal.runId, started.invocationId);
+      assert.ok(admitted.presentation.materialDependencies?.length, 'Every state-bearing successor retains revocation dependencies');
+    }
     if (publication === 'append_noop_fresh') {
-      assert.equal(frames.length, 9);
+      assert.equal(frames.length, 6);
       assert.equal(sockets.length, 2, 'Append and no-op retain the actual native socket; only explicit renewal replaces it.');
-      assert.ok(frameSockets.slice(0, 8).every(socket => socket === sockets[0]));
-      assert.equal(frameSockets[8], sockets[1]);
+      assert.ok(frameSockets.slice(0, 5).every(socket => socket === sockets[0]));
+      assert.equal(frameSockets[5], sockets[1]);
       const transitions = branch.filter(entry => entry.type === 'context_transition');
       assert.deepEqual(transitions.map(entry => entry.transition.strategy), ['append', 'append', 'fresh']);
       assert.deepEqual(transitions.map(entry => entry.transition.cause), ['state_update', 'state_update', 'explicit_renewal']);
       assert.equal(transitions.at(-1).sessionState, undefined);
-      for (const index of [1, 3, 5, 7]) {
-        assert.ok(frames[index].previous_response_id, 'Native result delivery keeps its response lineage.');
-        assert.ok(frames[index].input.some(item => item.type === 'function_call_output'));
-      }
+      assert.ok(frames[1].previous_response_id, 'The initial native result delivery keeps its response lineage.');
+      assert.ok(frames.slice(2).every(frame => frame.previous_response_id === undefined),
+        'State-bearing requests use guarded full replay even while keeping the same session');
       assert.ok(JSON.stringify(frames[2]).includes(body1));
-      assert.ok(JSON.stringify(frames[6]).includes(body2));
-      assert.equal(frames[8].previous_response_id, undefined);
-      assert.ok(!JSON.stringify(frames[8]).includes('context-selection-replacement'));
+      assert.ok(JSON.stringify(frames[4]).includes(body2));
+      assert.ok(!JSON.stringify(frames[5]).includes('context-selection-replacement'));
     } else {
-      assert.equal(frames.length, 5);
+      assert.equal(frames.length, 4);
       assert.equal(sockets.length, 3, 'Each explicitly requested fresh renewal opens a fresh provider session');
+      assert.equal(frameSockets[0], frameSockets[1]);
+      assert.notEqual(frameSockets[1], frameSockets[2]);
+      assert.notEqual(frameSockets[2], frameSockets[3]);
     }
     for (const [index, text] of (publication === 'append_noop_fresh' ? [] : [body1, body2]).entries()) {
-      const wire = frames[(index + 1) * 2];
+      const wire = frames[index + 2];
       assert.equal(wire.previous_response_id, undefined);
       assert.equal(wire.input.filter(item => item.role === 'user' && JSON.stringify(item).includes(text)).length, 1);
       assert.ok(wire.input.findIndex(item => item.role === 'user' && JSON.stringify(item).includes(text)) <

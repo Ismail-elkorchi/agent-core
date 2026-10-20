@@ -1,4 +1,6 @@
 import type { HistorySourceCut, HistorySourceRef, HistorySourceExcerpt, HistorySourceMetadata } from '../history/contracts.js';
+import type { QualifiedMaterialRef } from '../material/contracts.js';
+import type { SkillReference } from '@agent-core/skills';
 import type { SessionStateBatchCommit, SessionStateItemRef } from '../session/session-state.js';
 
 export type ContextArtifactSelection =
@@ -7,6 +9,8 @@ export type ContextArtifactSelection =
       readonly range?: { readonly offset: number; readonly bytes: number } | undefined };
 
 export interface ContextSourceSelection {
+  readonly materials?: readonly QualifiedMaterialRef[] | undefined;
+  readonly skills?: readonly SkillReference[] | undefined;
   readonly sessionState?: readonly SessionStateItemRef[] | undefined;
   readonly artifacts?: readonly ContextArtifactSelection[] | undefined;
   /** Exact historical text evidence, not conversational or native protocol replay. */

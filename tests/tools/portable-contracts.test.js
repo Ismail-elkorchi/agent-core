@@ -41,7 +41,9 @@ test('input default normalization preserves schema-shaped literal data exactly',
   const schema = z.strictObject({ value: z.json().default(literal),
     marker: z.string() }).meta({ examples: [literal] });
   const tool = defineTool(options({ schema }));
-  assert.deepEqual(tool.jsonSchema.properties.value.default, literal);
+  const valueContract = tool.jsonSchema.properties.value.$ref
+    ? tool.jsonSchema.$defs[tool.jsonSchema.properties.value.$ref.split('/').at(-1)] : tool.jsonSchema.properties.value;
+  assert.deepEqual(valueContract.default, literal);
   assert.deepEqual(tool.jsonSchema.examples, [literal]);
   assert.deepEqual(tool.jsonSchema.required, ['marker']);
   assert.deepEqual(tool.decodeInput({ kind: 'json', value: { marker: 'present' } }).input.value, literal);

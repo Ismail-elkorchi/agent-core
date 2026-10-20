@@ -15,6 +15,7 @@ import {
 } from '@agent-core/model';
 import { randomUUID } from 'node:crypto';
 import type { AdmittedModelInput } from './input.js';
+import type { MaterialUseDependency } from '../material/contracts.js';
 import type { EventReference } from '@agent-core/persistence';
 
 export interface ModelWindowMessages {
@@ -92,6 +93,7 @@ export class ModelWindow {
   private boundInput:
     | {
         readonly input: AdmittedModelInput;
+        readonly materialDependencies?: readonly MaterialUseDependency[];
         readonly prior: ModelInputItem[];
         readonly current: ModelInputItem[];
       }
@@ -105,8 +107,21 @@ export class ModelWindow {
     this.boundInput = { input, prior: [], current: [] };
   }
 
+  /** Bind current branch authority without altering the original admitted input or wire prefix. */
+  bindContinuationMaterialAuthority(dependencies: readonly MaterialUseDependency[]): void {
+    const bound = this.boundInput;
+    if (!bound) throw new Error('No admitted continuation owns these material dependencies.');
+    const identities = (values: readonly MaterialUseDependency[]) => [...new Set(values.map(value => canonicalJsonString(
+      value.ref.owner.kind === 'session' ? { ...value, grantRevision: null,
+        ref: { ...value.ref, owner: { kind: 'session', sessionId: value.ref.owner.sessionId } } } : value)))].sort();
+    if (canonicalJsonString(identities(bound.input.presentation.materialDependencies ?? [])) !== canonicalJsonString(identities(dependencies)))
+      throw new Error('Continuation authority cannot change exact material dependencies or source stamps.');
+    this.boundInput = { ...bound, materialDependencies: Object.freeze([...dependencies]) };
+  }
+
   continuation(): {
     readonly input: AdmittedModelInput;
+    readonly materialDependencies?: readonly MaterialUseDependency[];
     readonly prior: readonly ModelInputItem[];
     readonly current: readonly ModelInputItem[];
   } | undefined {
@@ -250,7 +265,7 @@ export class ModelWindow {
     for (const [source, item] of window.priorItems) this.priorItems.set(source, item);
     this.admittedInput = window.admittedInput;
     this.boundInput = window.boundInput
-      ? { input: window.boundInput.input, prior: [...window.boundInput.prior], current: [...window.boundInput.current] }
+      ? { ...window.boundInput, prior: [...window.boundInput.prior], current: [...window.boundInput.current] }
       : undefined;
   }
 

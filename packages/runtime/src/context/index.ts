@@ -13,3 +13,5 @@ export { contextSelectionSchema, contextTransitionRequestSchema } from './schema
 
 export { DEFAULT_CONTEXT_CONTROL_POLICY, CONTEXT_CONTROL_POLICY_BOUNDS, parseContextControlPolicy, parseOutputReservationPolicy, resolveOutputReservation, grantContextControlTool } from './recovery.js';
 export type { ContextControlPolicy, ContextControlRole, OutputReservationPolicy } from './recovery.js';
+
+export { collectOptionalContext, parseAgentContextPolicy, DEFAULT_AGENT_CONTEXT_POLICY } from './recall.js';

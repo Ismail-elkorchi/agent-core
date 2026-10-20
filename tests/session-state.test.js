@@ -161,7 +161,7 @@ test('UTF-8 item edits preserve exact unedited bytes and reject overlap or split
     history: f.history, assertStateWrite: async () => {}, policy: { maxSourceBytes: 8192 } });
   const cut = await f.history.capture();
   const requestRef = await f.artifacts.storeProtected({ label: 'inference', content: Buffer.from('{}') });
-  const batch = (idempotencyKey, operations) => ({ idempotencyKey, branchId: cut.branchId,
+  const batch = (idempotencyKey, operations) => ({ idempotencyKey, owner: { kind: 'session', sessionId: cut.sessionId, branchId: cut.branchId }, branchId: cut.branchId,
     capturedHistoryCut: cut, inference: { ownerId: 'owner', invocationId: 'inference', requestRef }, operations });
   const saved = await context.saveSessionState(batch('original', [{ kind: 'create', text: 'A文😀Z' }]));
   const ref = saved.revisions[0];

@@ -1,3 +1,6 @@
+import type { MaterialAuthorityBoundary } from '../material/contracts.js';
+import { MaterialAccessError } from '../material/contracts.js';
+import { assertLocalMaterialOwner, assertLocalMaterialBoundaries, localMaterialRevocationKey } from './material-revocation.js';
 import { emptySessionToolCatalogSelection, toolCatalogSelectionOwner } from './tool-catalog.js';
 import type { ToolCatalogSelectionState } from '@agent-core/tools';
 import { createProjectionSnapshot, type SessionIndexState } from './projection-snapshot-node.js';
@@ -36,9 +39,9 @@ const locatorSchema = z.strictObject({offset: integer, bytes: z.number().int().p
 type Locator = z.infer<typeof locatorSchema>;
 const stampSchema = z.strictObject({size: integer, mtimeMs: z.number(), ctimeMs: z.number()});
 const rootSchema = z.strictObject({
-  format: z.literal('agent-core.session-projection/13'), generation: id, lineage: z.uuid(), header: z.unknown(),
+  format: z.literal('agent-core.session-projection/14'), generation: id, lineage: z.uuid(), header: z.unknown(),
   summary: z.strictObject({id, timestamp: id, updatedAt: id, preview: z.string().max(160).optional(), provider: id.optional(), model: id.optional(), bindingSchemaId: id, bindingSchemaVersion: z.number().int().positive(), bindingSha256: hash}),
-  tree: hash.nullable(), confirmedRunsRoot: hash.nullable(), leafId: id.nullable(), sourceRevision: integer, acceptedInputRevision: integer, acceptedCorrectionRevision: integer, retainedStateBytes: integer, indexedRecords: integer,
+  tree: hash.nullable(), confirmedRunsRoot: hash.nullable(), leafId: id.nullable(), sourceRevision: integer, acceptedInputRevision: integer, acceptedCorrectionRevision: integer, materialRevocationRevision:integer, retainedStateBytes: integer, indexedRecords: integer,
   headerBytes: z.number().int().positive().max(16 * 1024 * 1024), completeBytes: integer, lineCount: integer, marker: z.string(), stamp: stampSchema,
   queueFirst: id.nullable(), queueLast: id.nullable(), occupied: id.nullable(), queuedCount: integer, capacity: integer.nullable()
 });
@@ -47,14 +50,14 @@ const statePointerSchema = z.strictObject({entryId:id,itemId:id,revisionId:id,co
 const positionSchema = locatorSchema.extend({
   depth: integer, ancestors: z.array(id).max(53), branchId: id,
   lookupRoot: hash.nullable(), inheritedHeadsRoot: hash.nullable(), activeRunsRoot: hash.nullable(), finalizedRunsRoot: hash.nullable(), unconfirmedRunsRoot: hash.nullable(), confirmedRunsRoot: hash.nullable(),
-  parentId: id.nullable(), identity: id, type: z.enum(['input','steering','peer_contribution','assistant','tool_call','observation','branch','model_settings','context_transition','session_state_batch','tool_catalog_selection']),
-  inputAuthorship: z.literal('model').optional(),
+  parentId: id.nullable(), identity: id, type: z.enum(['input','steering','peer_contribution','assistant','tool_call','observation','branch','model_settings','context_transition','session_state_batch','session_material_revocation','tool_catalog_selection']),
+  inputAuthorship: z.enum(['model', 'host']).optional(),
   timestamp: id, runId: id.optional(), toolName: id.optional(), source: historyEventSourceSchema.optional(),
   fromEntryId: id.nullable().optional(), historyPosition: historyCutSchema.optional(),
   stateHeadsRoot: hash.nullable(), stateRevisionsRoot: hash.nullable(), latestInputDepth: z.number().int().min(-1), modelSourceId: id.nullable(), contextId: id.nullable(),
   context: z.strictObject({
-    type: z.enum(['input','steering','peer_contribution','assistant','tool_call','observation','branch','model_settings','context_transition','session_state_batch','tool_catalog_selection']),
-    inputAuthorship: z.literal('model').optional(),
+    type: z.enum(['input','steering','peer_contribution','assistant','tool_call','observation','branch','model_settings','context_transition','session_state_batch','session_material_revocation','tool_catalog_selection']),
+    inputAuthorship: z.enum(['model', 'host']).optional(),
     description: z.string().max(400), runId: id.optional(), exchangeId: id.optional(),
     callIndex: integer.optional(), toolBatchId: id.optional(), expectedCalls: integer.optional(),
     prefixBound: z.boolean().optional(), contextRecovery: z.literal(true).optional()
@@ -62,7 +65,7 @@ const positionSchema = locatorSchema.extend({
 });
 type Position = BranchEntryPosition & Locator & SessionIndexState & {readonly stateHeadsRoot: string | null; readonly stateRevisionsRoot: string | null; readonly latestInputDepth: number; readonly modelSourceId: string | null; readonly contextId: string | null;};
 const submissionSchema = z.strictObject({
-  submissionId: id, runId: id, state: z.enum(['queued','claimed','suspended','completed','failed','cancelled']),
+  submissionId: id, runId: id, hostWake: z.boolean(), state: z.enum(['queued','claimed','suspended','completed','failed','cancelled']),
   claimId: id.optional(), previous: id.nullable(), next: id.nullable(), admission: locatorSchema, input: locatorSchema, latest: locatorSchema
 });
 type Submission = z.infer<typeof submissionSchema>;
@@ -326,13 +329,15 @@ export class JsonlBranchIndex {
   async currentStateItem(session: SessionDescriptor, itemId: string, leafId?: string | null) {
     return this.query(session, async root => {
       const leaf = await this.statePosition(root,leafId);
-      return this.stateItem(root,await this.tree.get(leaf?.stateHeadsRoot ?? null,itemId));
+      const item=await this.stateItem(root,await this.tree.get(leaf?.stateHeadsRoot ?? null,itemId));
+      return item&&await this.main(root).get(root.tree,`material-revoked:${localMaterialRevocationKey(item)}`)===undefined?item:undefined;
     });
   }
   async readStateItem(session: SessionDescriptor, input: Parameters<SessionRepository['readSessionStateItem']>[1], leafId?: string | null) {
     const ref = sessionStateItemRefSchema.parse(input);
     return this.query(session, async root => {
       const leaf = await this.statePosition(root,leafId);
+      if(await this.main(root).get(root.tree,`material-revoked:${localMaterialRevocationKey(ref)}`)!==undefined)throw new MaterialAccessError();
       const item = await this.stateItem(root,await this.tree.get(leaf?.stateRevisionsRoot ?? null,ref.revisionId));
       if (item?.itemId !== ref.itemId) throw new Error('Session-state revision is unavailable on this branch.');
       if (ref.range && ref.range.offset + ref.range.bytes > item.contentBytes) throw new Error('Session-state range exceeds its immutable revision.');
@@ -343,6 +348,7 @@ export class JsonlBranchIndex {
     const {limit,maxBytes} = statePageLimits(request);
     const cursor = decodeStatePageCursor(session.id,request);
     return this.query(session, async root => {
+      if(cursor&&cursor.revocationRevision!==root.materialRevocationRevision)throw new MaterialAccessError('Session-state cursor revocation boundary changed.');
       const selected = cursor ? cursor.leafId : request.leafId === undefined ? root.leafId : request.leafId;
       const leaf = await this.statePosition(root,selected);
       const items: import('./session-state.js').SessionStateItemMetadata[] = [];
@@ -353,16 +359,39 @@ export class JsonlBranchIndex {
         const [key,value] = current.value;
         const pointer = statePointerSchema.parse(value);
         visited++;
-        if (pointer.deleted) {after = key;current = await iterator.next();continue;}
+        if (pointer.deleted||await this.main(root).get(root.tree,`material-revoked:${localMaterialRevocationKey(pointer)}`)!==undefined) {after = key;current = await iterator.next();continue;}
         const metadata = {itemId:pointer.itemId,revisionId:pointer.revisionId,contentBytes:pointer.contentBytes,contentSha256:pointer.contentSha256,...(pointer.preview === undefined ? {} : {preview:pointer.preview})};
         if (items.length >= limit) {partial = true;break;}
         const next = await iterator.next();
-        try {if (statePageResult(session.id,selected,[...items,metadata],!next.done,key,maxBytes).items.length <= items.length) {partial = true;break;}}
+        try {if (statePageResult(session.id,selected,[...items,metadata],!next.done,key,maxBytes,root.materialRevocationRevision).items.length <= items.length) {partial = true;break;}}
         catch (error) {if (items.length === 0) throw error;partial = true;break;}
         items.push(Object.freeze(metadata));after = key;current = next;
       }
       partial ||= !current.done;
-      return statePageResult(session.id,selected,items,partial,after,maxBytes);
+      return statePageResult(session.id,selected,items,partial,after,maxBytes,root.materialRevocationRevision);
+    });
+  }
+  materialRevocationRevision(session:SessionDescriptor,owner:import('../material/contracts.js').MaterialOwner):Promise<number> {
+    assertLocalMaterialOwner(session.id,owner);return this.query(session,root=>Promise.resolve(root.materialRevocationRevision));
+  }
+  isMaterialRevoked(session:SessionDescriptor,ref:import('../material/contracts.js').QualifiedMaterialRef):Promise<boolean> {
+    assertLocalMaterialOwner(session.id,ref.owner);return this.query(session,async root=>await this.main(root).get(root.tree,`material-revoked:${localMaterialRevocationKey(ref)}`)!==undefined);
+  }
+  findMaterialRevocation(session:SessionDescriptor,operationId:string):Promise<import('./contracts.js').SessionMaterialRevocationEntry|undefined> {
+    return this.query(session,async root=>{const value=await this.main(root).get(root.tree,`material-revocation:${operationId}`);if(value===undefined)return undefined;const pointer=z.strictObject({entryId:id}).parse(value);const record=await this.branchRecord(await this.locate(root,`entry:${pointer.entryId}`),pointer.entryId,root);if(record.type!=='session_material_revocation')throw new Error('Invalid material revocation index.');return record;});
+  }
+  validateMaterialBoundaries(session:SessionDescriptor,boundaries:readonly MaterialAuthorityBoundary[]):Promise<void> {
+    return this.query(session,async root=>{const leaf=await this.statePosition(root);assertLocalMaterialBoundaries(session.id,root.materialRevocationRevision,boundaries,leaf?.branchId??session.id);});
+  }
+  async validateMaterialSource(session: SessionDescriptor, cut: import('../history/contracts.js').HistorySourceCut): Promise<void> {
+    return this.query(session, async root => {
+      const snapshot = await this.snapshot(session);
+      if (cut.sessionId !== this.sessionId || cut.branchId !== snapshot.branchId || cut.sourceRevision > root.sourceRevision || cut.sourceRevision < root.acceptedInputRevision ||
+          (cut.throughEntryId !== null && !await snapshot.index.byId.has(cut.throughEntryId)))
+        throw new PersistenceConflictError('Accepted input or producing branch changed before material publication.');
+      const captured = await this.statePosition(root, cut.throughEntryId);
+      const leaf = await this.statePosition(root);
+      if ((leaf?.latestInputDepth ?? -1) > (captured?.depth ?? -1)) throw new PersistenceConflictError('Accepted input changed before material publication.');
     });
   }
   async validateState(session: SessionDescriptor, batch: SessionStateBatchCommit): Promise<void> {
@@ -376,15 +405,17 @@ export class JsonlBranchIndex {
       readPosition:async entryId => {const value = await this.main(root).get(root.tree,`entry:${entryId}`); return value === undefined ? undefined : this.positionValue(value);},
       read:async entryId => this.branchRecord(await this.locate(root,`entry:${entryId}`),entryId,root)};
     const navigation = await branchNavigation(source,{sessionId:this.sessionId,leafId:root.leafId,leafHash:leaf?.hash ?? null});
-    if (cut.sessionId !== this.sessionId || batch.branchId !== branchId || cut.branchId !== branchId || cut.sourceRevision > root.sourceRevision || cut.sourceRevision < root.acceptedInputRevision ||
+    if (batch.owner.kind !== 'session' || batch.owner.sessionId !== this.sessionId || batch.owner.branchId !== branchId || cut.sessionId !== this.sessionId || batch.branchId !== branchId || cut.branchId !== branchId || cut.sourceRevision > root.sourceRevision || cut.sourceRevision < root.acceptedInputRevision ||
         (cut.throughEntryId !== null && !(await navigation.contains(cut.throughEntryId))) || (leaf?.latestInputDepth ?? -1) > (captured?.depth ?? -1))
       throw new PersistenceConflictError('Session-state source cut changed branch or accepted input.');
     if (await this.tree.get(leaf?.lookupRoot ?? null,`state-batch:${batch.idempotencyKey}`) !== undefined)
       throw new PersistenceConflictError('Session-state batch is already committed.');
+    for(const revision of batch.revisions)if(revision.previousRevisionId&&await this.main(root).get(root.tree,`material-revoked:${localMaterialRevocationKey({itemId:revision.itemId,revisionId:revision.previousRevisionId})}`)!==undefined)throw new MaterialAccessError();
     await validateSessionStateCommit(batch,async itemId => this.stateItem(root,await this.tree.get(leaf?.stateHeadsRoot ?? null,itemId)),root.retainedStateBytes);
   }
   async validateContext(session: SessionDescriptor, input: ContextTransitionCommit): Promise<void> {
     return this.query(session, async root => {
+      for(const ref of input.window.selection.sessionState??[])if(await this.main(root).get(root.tree,`material-revoked:${localMaterialRevocationKey(ref)}`)!==undefined)throw new MaterialAccessError();
       const positions = new Map<string, Position>();
       const readPosition = async (entryId: string) => {
         const cached = positions.get(entryId);
@@ -664,11 +695,11 @@ export class JsonlBranchIndex {
     await this.store.repairStorage();
     const stamp = await jsonlStorageStamp(this.filePath);
     const lineage = randomUUID();
-    const root: Root = {format: 'agent-core.session-projection/13', generation: randomUUID(), lineage, header, summary: {
+    const root: Root = {format: 'agent-core.session-projection/14', generation: randomUUID(), lineage, header, summary: {
       id: header.id, timestamp: header.timestamp, updatedAt: header.timestamp,
       ...(header.provider ? {provider: header.provider} : {}), ...(header.model ? {model: header.model} : {}),
       bindingSchemaId: header.binding.schemaId, bindingSchemaVersion: header.binding.schemaVersion, bindingSha256: header.binding.bindingSha256
-    }, tree: null, confirmedRunsRoot: null, queueFirst: null, queueLast: null, occupied: null, queuedCount: 0, capacity: null, leafId: null, sourceRevision: 0, acceptedInputRevision: 0, acceptedCorrectionRevision: 0, retainedStateBytes: 0, indexedRecords: 0, headerBytes: 0, completeBytes: 0, lineCount: 0, marker: '', stamp};
+    }, tree: null, confirmedRunsRoot: null, queueFirst: null, queueLast: null, occupied: null, queuedCount: 0, capacity: null, leafId: null, sourceRevision: 0, acceptedInputRevision: 0, acceptedCorrectionRevision: 0, materialRevocationRevision:0, retainedStateBytes: 0, indexedRecords: 0, headerBytes: 0, completeBytes: 0, lineCount: 0, marker: '', stamp};
     await this.store.commit(async () => {
       await this.scan(root, stamp, options);
       this.store.retireNamespaces(`main-${lineage}`);
@@ -735,6 +766,21 @@ export class JsonlBranchIndex {
     const changes = new Map<string, import('@agent-core/json').JsonObject>();
     const set = (key: string, value: unknown) => {changes.set(key, parseJsonObject(value));};
     const flush = async () => {if (changes.size > 0) root.tree = await this.main(root).setMany(root.tree, [...changes]);};
+    if(record.type==='session_material_revocation'){
+      assertLocalMaterialOwner(this.sessionId,record.owner);
+      const parent=record.parentId===null?undefined:this.positionValue(await this.main(root).get(root.tree,`entry:${record.parentId}`));
+      if(record.owner.branchId!==(parent?.branchId??this.sessionId))throw new Error('Session material revocation owner does not match its recorded branch.');
+      for(const ref of record.refs){
+        if(await this.main(root).get(root.tree,`material-revoked:${localMaterialRevocationKey(ref)}`)!==undefined)continue;
+        const value=await this.tree.get(parent?.stateRevisionsRoot??null,ref.revisionId);
+        if(value===undefined||statePointerSchema.parse(value).itemId!==ref.itemId)throw new Error('Session material revocation target is unavailable on its recorded branch.');
+      }
+      if(record.expectedRevision!==root.materialRevocationRevision||record.revision!==root.materialRevocationRevision+1)throw new Error('Session material revocation is not consecutive.');
+      if(await this.main(root).get(root.tree,`material-revocation:${record.operationId}`)!==undefined)throw new Error('Duplicate session material revocation.');
+      root.materialRevocationRevision=record.revision;
+      set(`material-revocation:${record.operationId}`,{entryId:record.id});
+      for(const ref of record.refs)set(`material-revoked:${localMaterialRevocationKey(ref)}`,{revoked:true});
+    }
     root.sourceRevision++;
     if (record.type === 'input' || record.type === 'steering' || record.type === 'submission.admitted' || record.type === 'submission.revised') root.acceptedInputRevision = root.sourceRevision;
     if (isAcceptedUserCorrection(record)) root.acceptedCorrectionRevision = root.sourceRevision;
@@ -749,13 +795,17 @@ export class JsonlBranchIndex {
           set('initial-model', parseModelSelection({provider: config.provider, model: config.model, ...(config.endpoint === undefined ? {} : {endpoint: config.endpoint}), ...(config.temperature === undefined ? {} : {temperature: config.temperature}), ...(config.reasoning === undefined ? {} : {reasoning: config.reasoning})}));
         }
         if (raw !== undefined || await this.main(root).get(root.tree, `submission-run:${record.runId}`) !== undefined) throw new Error('Duplicate submission identity.');
-        current = {submissionId: record.submissionId, runId: record.runId, state: record.claimId ? 'claimed' : 'queued',
+        current = {submissionId: record.submissionId, runId: record.runId, hostWake: record.trigger !== undefined, state: record.claimId ? 'claimed' : 'queued',
           ...(record.claimId ? {claimId: record.claimId} : {}), previous: null, next: null, admission: locator, input: locator, latest: locator};
         set(`submission-run:${record.runId}`, {submissionId: record.submissionId});
       } else {
         current = submissionSchema.parse(raw);
         if (current.runId !== record.runId) throw new Error('Submission identity changed.');
         if (record.type === 'submission.revised' || record.type === 'submission.cancelled') {
+          if (record.type === 'submission.revised') {
+            if (current.hostWake || record.input.origin?.kind === 'host_wake')
+              throw new Error('Host-wake payloads cannot be replaced through queue editing.');
+          }
           if (current.state !== 'queued') throw new Error('Only queued submissions can change.');
           current = {...current, latest: locator, ...(record.type === 'submission.revised' ? {input: locator} : {state: 'cancelled'})};
         } else {
@@ -898,6 +948,7 @@ export class JsonlBranchIndex {
     }
     if (record.type === 'context_transition') {
       for (const ref of record.window.selection.sessionState ?? []) {
+        if(await this.main(root).get(root.tree,`material-revoked:${localMaterialRevocationKey(ref)}`)!==undefined)throw new MaterialAccessError();
         const value = await this.tree.get(stateRevisionsRoot,ref.revisionId);
         assertStateSelection(ref,value === undefined ? undefined : statePointerSchema.parse(value));
       }

@@ -32,6 +32,8 @@ export type {
 } from './prompt-material.js';
 
 export interface ModelRequestAssemblyInput {
+  readonly materialDependencies?: RequestPresentation['materialDependencies'];
+  readonly skillReferences?: RequestPresentation['skillReferences'];
   readonly origin?: import('../session/contracts.js').SessionSubmissionOrigin;
   readonly runId?: string;
   readonly window: ModelWindow;
@@ -122,7 +124,13 @@ export class ModelRequestAssembler {
         authorityRole: input.modelProfile.capabilities.protocol?.roles.includes('developer') ? 'developer' : 'system'
       }
     );
+    const bound = input.window.continuation();
+    const materialDependencies = [...new Map([...(bound?.materialDependencies ?? bound?.input.presentation.materialDependencies ?? []), ...(input.materialDependencies ?? [])].map(value => [hashJson({ ...value, ref: { owner: value.ref.owner, itemId: value.ref.itemId, revisionId: value.ref.revisionId } }), value])).values()];
+    const skillReferences = [...new Map([...(bound?.input.presentation.skillReferences ?? []), ...(input.skillReferences ?? [])].map(value => [hashJson(value), value])).values()];
     const presentation: RequestPresentation = Object.freeze({
+      format: 'agent-core.request-presentation/1',
+      ...(materialDependencies.length ? { materialDependencies: Object.freeze(materialDependencies) } : {}),
+      ...(skillReferences.length ? { skillReferences: Object.freeze(skillReferences) } : {}),
       capacityNotice: contextPresentation('runtime-notice', material.capacityNotice ? [material.capacityNotice] : []),
       authority: hashJson(
         messages.filter((item) => item.role === 'system' || item.role === 'developer')
@@ -134,7 +142,6 @@ export class ModelRequestAssembler {
       ),
       context: contextPresentation('host-context', material.context)
     });
-    const bound = input.window.continuation();
     const continuationSource = bound
       ? {
           ...bound.input.request,

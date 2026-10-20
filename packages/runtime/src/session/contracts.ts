@@ -25,7 +25,7 @@ import type { SessionBinding, SessionBindingInput } from './binding.js';
 export type SessionHeader = Readonly<{
   readonly type: 'session';
   readonly version: 1;
-  readonly format: 'agent-core.session/7';
+  readonly format: 'agent-core.session/8';
   readonly sessionStateStorage: 'session';
   readonly id: string;
   readonly timestamp: string;
@@ -219,6 +219,8 @@ export type SessionToolCatalogSelectionEntry = BaseSessionEntry & Readonly<{
   readonly selection: import('@agent-core/tools').ToolCatalogSelection;
 }>;
 
+export type SessionMaterialRevocationEntry = BaseSessionEntry & import('../material/contracts.js').MaterialRevocation & {readonly type:'session_material_revocation';readonly revision:number};
+
 export type SessionStateBatchEntry = BaseSessionEntry & Readonly<{
   readonly type: 'session_state_batch';
   readonly batch: SessionStateBatchCommit;
@@ -258,6 +260,7 @@ export type SessionBranchEntry =
   | SessionModelSettingsEntry
   | SessionContextTransitionEntry
   | SessionStateBatchEntry
+  | SessionMaterialRevocationEntry
   | SessionToolCatalogSelectionEntry;
 
 export type SessionConversationItem =
@@ -284,13 +287,50 @@ export interface SessionInputRelationship {
 }
 
 /** Captured by the host when another agent assigns work; never supplied by user RPC input. */
-export interface SessionSubmissionOrigin {
+export interface SessionDelegatedAssignmentOrigin {
   readonly kind: 'delegated_assignment';
   readonly groupId: string;
   readonly participantId: string;
   readonly assignmentId: string;
   readonly assignmentRevision: number;
   readonly sender: { readonly sessionId: string; readonly participantId?: string; readonly runId?: string };
+}
+
+/** Host trigger evidence is neither a user instruction nor renewed authorization. */
+export interface SessionHostWakeOrigin {
+  readonly kind: 'host_wake';
+  readonly ownerId: string;
+  readonly intentionId: string;
+  readonly intentionRevision: number;
+  readonly triggerKey: string;
+  readonly authorizationRef: string;
+  readonly evidence: JsonObject;
+}
+export type SessionSubmissionOrigin = SessionDelegatedAssignmentOrigin | SessionHostWakeOrigin;
+
+export interface SessionSubmissionTrigger {
+  readonly key: string;
+  readonly payloadDigest: string;
+}
+export interface SessionTriggeredSubmissionReceipt extends SessionSubmissionTrigger {
+  readonly sessionId: string;
+  readonly submissionId: string;
+  readonly runId: string;
+  readonly admittedAt: string;
+}
+/** Prospective identity for host-owned staging; this is not an admission receipt. */
+export interface SessionTriggeredSubmissionStagingInput extends SessionSubmissionTrigger {
+  readonly sessionId: string;
+  readonly submissionId: string;
+  readonly runId: string;
+  readonly input: SessionSubmissionInput & { readonly origin: SessionHostWakeOrigin };
+  readonly configuration: SessionSubmissionConfiguration;
+}
+export interface SessionTriggeredSubmissionAdmission {
+  readonly key: string;
+  readonly input: SessionSubmissionInput & { readonly origin: SessionHostWakeOrigin };
+  readonly configuration: SessionSubmissionConfiguration;
+  readonly maximumQueuedInputs?: number;
 }
 
 export interface SessionSubmissionInput {
@@ -313,6 +353,7 @@ export interface SessionSubmissionConfiguration {
 
 export type SessionAdmittedSubmission = Readonly<{
   readonly type: 'submission.admitted';
+  readonly trigger?: SessionSubmissionTrigger;
   readonly maximumQueuedInputs: number;
   readonly claimId?: string;
   readonly submissionId: string;
@@ -470,7 +511,7 @@ export interface SessionSourceMetadata {
   readonly sha256: string;
   readonly bytes: number;
   readonly type: SessionBranchEntry['type'];
-  readonly inputAuthorship?: 'model';
+  readonly inputAuthorship?: 'model' | 'host';
   readonly runId?: string;
   readonly source?: import('../history/contracts.js').HistoryEventSource;
   readonly fromEntryId?: string | null;
@@ -519,6 +560,12 @@ export interface SessionRepository {
   revision(session: SessionDescriptor): Promise<number>;
   /** Latest durable user steering, correction, replacement, or queued replacement; zero before any. */
   acceptedCorrectionRevision(session: SessionDescriptor): Promise<number>;
+  /** Producing-lifetime guard, acquired before any target material lock. The callback must not call this repository. */
+  withMaterialPublication<T>(session: SessionDescriptor, cut: import('../history/contracts.js').HistorySourceCut, operation: () => Promise<T>, boundaries?: readonly import('../material/contracts.js').MaterialAuthorityBoundary[]): Promise<T>;
+  materialRevocationRevision(session:SessionDescriptor,owner:import('../material/contracts.js').MaterialOwner):Promise<number>;
+  isMaterialRevoked(session:SessionDescriptor,ref:import('../material/contracts.js').QualifiedMaterialRef):Promise<boolean>;
+  revokeMaterial(session:SessionDescriptor,input:import('../material/contracts.js').MaterialRevocation):Promise<import('../material/contracts.js').MaterialRevocationReceipt>;
+  withMaterialRevocations<T>(session:SessionDescriptor,boundaries:readonly import('../material/contracts.js').MaterialAuthorityBoundary[],operation:()=>Promise<T>):Promise<T>;
   currentModelSettings(session: SessionDescriptor): Promise<ModelSelection | undefined>;
   currentToolCatalogSelection(session: SessionDescriptor): Promise<import('@agent-core/tools').ToolCatalogSelectionState>;
   findToolCatalogSelection(session: SessionDescriptor, operationId: string): Promise<import('@agent-core/tools').ToolCatalogSelectionState | undefined>;
@@ -526,7 +573,7 @@ export interface SessionRepository {
   /** Committed journal metadata and retained item content across every branch; excludes unreferenced staged artifacts. */
   committedRetainedStateBytes(session: SessionDescriptor): Promise<number>;
   findSessionStateBatch(session: SessionDescriptor, idempotencyKey: string): Promise<SessionStateBatchReceipt | undefined>;
-  saveSessionState(session: SessionDescriptor, batch: SessionStateBatchCommit, options?: {readonly withOwnership?: (<T>(operation: () => Promise<T>) => Promise<T>) | undefined}): Promise<SessionStateBatchReceipt>;
+  saveSessionState(session: SessionDescriptor, batch: SessionStateBatchCommit, options?: {readonly withOwnership?: (<T>(operation: () => Promise<T>) => Promise<T>) | undefined; readonly materialPublication?: import('../material/contracts.js').MaterialPublicationGuard | undefined}): Promise<SessionStateBatchReceipt>;
   readSessionStateItem(session: SessionDescriptor, ref: SessionStateItemRef, leafId?: string | null): Promise<SessionStateItemRevision>;
   currentSessionStateItem(session: SessionDescriptor, itemId: string, leafId?: string | null): Promise<SessionStateItemRevision | undefined>;
   listSessionState(session: SessionDescriptor, request?: SessionStatePageRequest): Promise<SessionStatePage>;
@@ -601,7 +648,7 @@ export interface SessionRepository {
   commitContextTransition(
     session: SessionDescriptor,
     input: ContextTransitionCommit,
-    options?: {readonly withOwnership?: (<T>(operation: () => Promise<T>) => Promise<T>) | undefined}
+    options?: {readonly withOwnership?: (<T>(operation: () => Promise<T>) => Promise<T>) | undefined; readonly materialPublication?: import('../material/contracts.js').MaterialPublicationGuard | undefined}
   ): Promise<SessionContextTransitionEntry>;
   branchFrom(
     session: SessionDescriptor,
@@ -629,6 +676,9 @@ export interface SessionRepository {
       claimId?: string;
     }
   ): Promise<SessionPendingSubmission>;
+  /** Host-only, atomic key/payload admission. Retries return the immutable original receipt. */
+  admitTriggeredSubmission(session: SessionDescriptor, input: SessionTriggeredSubmissionAdmission): Promise<SessionTriggeredSubmissionReceipt>;
+  readTriggeredSubmissionReceipt(session: SessionDescriptor, key: string): Promise<SessionTriggeredSubmissionReceipt | undefined>;
   /** Claims the oldest durable queued input only when no submission occupies the slot. */
   claimNextSubmission(session: SessionDescriptor, claimId: string): Promise<SessionPendingSubmission | undefined>;
   transitionSubmission(

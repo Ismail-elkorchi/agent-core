@@ -50,7 +50,8 @@ async function fixture(t, { reset = 'fresh_request', automatic = false, pressure
             : [{ type: 'text', text: 'Answered.' }])],
         stop_reason: transition ? 'tool_use' : 'end_turn', usage: { input_tokens: 20, output_tokens: 10 } });
     } });
-  const service = new InferenceService({ provider, artifacts, repository: new InMemoryInferenceRepository() });
+  const inferences = new InMemoryInferenceRepository();
+  const service = new InferenceService({ provider, artifacts, repository: inferences });
   let context;
   const runtime = () => {
     const history = new HistoryReader({ repository: sessions, session, artifacts, events });
@@ -62,7 +63,7 @@ async function fixture(t, { reset = 'fresh_request', automatic = false, pressure
       repositories: { artifacts, events, session: { repository: sessions, descriptor: session } },
       toolBoundary: { authorizationPolicyId: 'test', executionTargetId: 'test' }, toolPolicy: { allowedRisks: ['read', 'write'] } });
   };
-  return { calls, runtime, service, session, context: () => context, sessions: () => sessions,
+  return { calls, runtime, service, session, artifacts, inferences, context: () => context, sessions: () => sessions,
     update: input => { stateUpdate = { reason: 'Replace the current interpretation.', ...input }; },
     renew: () => { renew = true; }, changeInstructions: () => { instructions = 'Changed authority.'; },
     reopen: () => { sessions = new JsonlSessionRepository(root); } };
@@ -284,6 +285,10 @@ test('fork inherits admitted reference replacements at their original positions 
   f.update(await replaceSelectedItem(f, 'Shared interpretation.'));
   await completed(f.runtime(), 'shared', 'Shared user requirement.');
   const sharedRequest = f.calls.at(-1);
+  const originalAdmission = (await f.inferences.load('owner')).latestInvocation.start;
+  const originalArtifact = Buffer.from(await f.artifacts.readVerified(originalAdmission.requestRef));
+  const originalPresentation = (await f.service.admittedInput('owner', originalAdmission.invocationId)).presentation;
+  assert.ok(originalPresentation.materialDependencies?.length, 'The inherited native prefix must carry material authority');
   const point = (await f.sessions().readConversation(f.session)).filter(entry => entry.type === 'assistant').at(-1);
   f.update(await replaceSelectedItem(f, 'Parent-only interpretation.'));
   await completed(f.runtime(), 'parent', 'Parent-only request.');
@@ -295,6 +300,30 @@ test('fork inherits admitted reference replacements at their original positions 
   assert.equal((await f.context().sessionState()).items[0].text, 'Shared interpretation.');
   assert.ok(!JSON.stringify(child).includes('Parent-only interpretation.'));
   assert.ok(!JSON.stringify(child).includes('Parent-only request.'));
+  assert.deepEqual(Buffer.from(await f.artifacts.readVerified(originalAdmission.requestRef)), originalArtifact,
+    'Rebinding child branch authority cannot rewrite the original admitted input artifact');
+  assert.deepEqual((await f.service.admittedInput('owner', originalAdmission.invocationId)).presentation, originalPresentation,
+    'The original admitted presentation retains its exact producing-branch authority stamps');
+});
+
+test('fork cannot revive revoked local material through an inherited signed native prefix', async t => {
+  const f = await fixture(t);
+  f.update(await replaceSelectedItem(f, 'Revocable inherited interpretation.'));
+  await completed(f.runtime(), 'revocable-shared', 'Preserve the original native source.');
+  const point = (await f.sessions().readConversation(f.session)).filter(entry => entry.type === 'assistant').at(-1);
+  const selected = (await f.context().sessionState()).items[0];
+  const cut = await f.context().history.capture();
+  const owner = { kind: 'session', sessionId: cut.sessionId, branchId: cut.branchId };
+  await f.context().materials.revoke({ owner, operationId: 'revoke-before-fork',
+    expectedRevision: await f.sessions().materialRevocationRevision(f.session, owner),
+    refs: [{ itemId: selected.itemId, revisionId: selected.revisionId }] });
+  await f.sessions().branchFrom(f.session, point.id, 'Earlier inherited prefix');
+  f.reopen();
+  const requestsBefore = f.calls.length;
+  const child = await f.runtime().run({ runId: 'revoked-child', task: 'Continue inherited work.' }).result;
+  assert.equal(child.terminal?.executionStatus, 'failed', JSON.stringify(child));
+  assert.match(child.terminal.errorMessage, /material|revok|unavailable/i);
+  assert.equal(f.calls.length, requestsBefore, 'An inherited prefix cannot reauthorize revoked material before provider dispatch');
 });
 
 

@@ -1837,7 +1837,7 @@ test('logical request fingerprint separates every dynamic context origin and has
   const fixture = await harness({
     withoutSession: true,
     contextItems: [item('configured', 'configured context')],
-    contextProvider: () => [item('provider', 'provider context')]
+    contextProvider: () => ({ items: [item('provider', 'provider context')] })
   });
   const result = ended(
     await fixture.agent.run({ task: 'snapshot', contextItems: [item('run', 'run context')] }).result

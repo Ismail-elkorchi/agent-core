@@ -66,7 +66,7 @@ export function conversationEntryView<Message extends ComponentMessage>(
     });
   const segments: InlineContent =
     entry.kind === 'assignment'
-      ? [{ kind: 'text', text: `Delegated assignment · model-authored · from ${entry.origin.sender.sessionId}\n`, style: { bold: true } },
+      ? [{ kind: 'text', text: entry.origin.kind === 'host_wake' ? `Host wake · intention ${entry.origin.intentionId}\n` : `Delegated assignment · model-authored · from ${entry.origin.sender.sessionId}\n`, style: { bold: true } },
           { kind: 'text', text: entry.text }]
       : entry.kind === 'peer'
       ? [{ kind: 'text', text: `Peer ${entry.participantId} · model-authored contribution\n`, style: { bold: true } },

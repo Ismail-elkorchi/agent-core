@@ -163,6 +163,7 @@ function sessionEntries(
       ];
     case 'session_state_batch':
       return [{ id, kind: 'notice', tone: 'info', text: 'Working material saved; the active context is unchanged.' }];
+    case 'session_material_revocation':
     case 'tool_catalog_selection':
     case 'model_settings':
       // Catalog persistence is bookkeeping; its governed tool observation is already shown.
@@ -304,6 +305,7 @@ export function conversationText(entry: ConversationEntry, expanded = true): str
     case 'peer':
       return `Peer ${entry.participantId} · model-authored contribution · session ${entry.sessionId} · run ${entry.senderRunId}\n${entry.text}`;
     case 'assignment':
+      if (entry.origin.kind === 'host_wake') return `Host wake · intention ${entry.origin.intentionId} revision ${String(entry.origin.intentionRevision)}\n${entry.text}`;
       return `Delegated assignment · model-authored · session ${entry.origin.sender.sessionId}\nAssignment ${entry.origin.assignmentId} revision ${String(entry.origin.assignmentRevision)}\n${entry.text}`;
     case 'assistant':
       return entry.text;

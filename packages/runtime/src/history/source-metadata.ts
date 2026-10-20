@@ -9,9 +9,10 @@ export function historySourceFacts(entry: SessionBranchEntry): Omit<HistorySourc
     : entry.type === 'assistant' || entry.type === 'steering' ? entry.content
     : entry.type === 'observation' ? `${entry.toolName}: ${entry.summary}`
     : entry.type === 'tool_call' ? JSON.stringify(entry.call) : entry.type;
+  const inputAuthorship = historyInputAuthorship(entry);
   return Object.freeze({
     type: entry.type,
-    ...(historyInputAuthorship(entry) ? { inputAuthorship: 'model' as const } : {}),
+    ...(inputAuthorship ? { inputAuthorship } : {}),
     description: description.slice(0, 200),
     ...('runId' in entry ? { runId: entry.runId } : {}),
     ...(entry.type === 'assistant' || entry.type === 'tool_call' || entry.type === 'observation'

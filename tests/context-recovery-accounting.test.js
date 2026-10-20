@@ -73,7 +73,7 @@ async function fixture({ budget, sourceBound = 100000, targetCapacity = 25000,
     return {
       provider, model: 'fixture', context, contextRenewal: { automatic: true },
       instructions: [{ id: 'application-authority', role: 'system', content: applicationInstruction }],
-      contextProvider: request => { contextCollections.push(request); return []; },
+      contextProvider: request => { contextCollections.push(request); return { items: [] }; },
       recordLogicalRequest: request => { logicalRequests.push(request); },
       repositories: { events, artifacts, session: { repository: sessions, descriptor } },
       // These scenarios activate history selections without narrative mutations. Keep

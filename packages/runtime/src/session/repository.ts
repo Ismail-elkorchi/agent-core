@@ -1,3 +1,8 @@
+import type { MaterialAuthorityBoundary } from '../material/contracts.js';
+import { MaterialAccessError } from '../material/contracts.js';
+import { materialRevocationSchema } from '../material/repository.js';
+import { assertLocalMaterialOwner, assertLocalMaterialBoundaries, localMaterialRevocationKey, decodeSessionMaterialRevocation, localMaterialRevocationReceipt, assertLocalMaterialRevocationRetry } from './material-revocation.js';
+import { captureTriggeredSubmission, triggeredRunId, findTriggeredSubmissionReceipt, triggeredSubmissionReceipt, assertTriggeredSubmissionRetry } from './triggered-submission.js';
 import { ownPeerContributionInput, samePeerContribution, decodePeerContributionEntry } from './peer-contribution.js';
 import { decodeSessionToolCatalogSelection, emptySessionToolCatalogSelection, toolCatalogSelectionOwner } from './tool-catalog.js';
 import { parseToolCatalogSelection, type ToolCatalogSelectionState } from '@agent-core/tools';
@@ -128,7 +133,7 @@ export class InMemorySessionRepository implements SessionRepository {
       const header: SessionHeader = Object.freeze({
         type: 'session',
         version: 1,
-        format: 'agent-core.session/7',
+        format: 'agent-core.session/8',
         sessionStateStorage: 'session',
         id,
         timestamp: new Date().toISOString(),
@@ -137,7 +142,7 @@ export class InMemorySessionRepository implements SessionRepository {
         ...(options.provider ? { provider: options.provider } : {}),
         ...(options.model ? { model: options.model } : {})
       });
-      const state = { header, branchEntries: [], finalizations: [], confirmations: [], submissionRecords: [], acceptedInputRevision: 0, acceptedCorrectionRevision: 0, retainedStateBytes: 0, peerDeliveries: new Map<string, import('./contracts.js').SessionPeerContributionEntry>(), stateIndexes: new Map<string,MemoryStateIndex>(), catalogIndexes: new Map<string, MemoryCatalogIndex>() };
+      const state = { header, branchEntries: [], finalizations: [], confirmations: [], submissionRecords: [], acceptedInputRevision: 0, acceptedCorrectionRevision: 0, materialRevocationRevision:0, materialRevoked:new Set<string>(), materialRevocations:new Map<string,import('./contracts.js').SessionMaterialRevocationEntry>(), retainedStateBytes: 0, peerDeliveries: new Map<string, import('./contracts.js').SessionPeerContributionEntry>(), stateIndexes: new Map<string,MemoryStateIndex>(), catalogIndexes: new Map<string, MemoryCatalogIndex>() };
       this.states.set(id, state);
       return sessionFromState(state);
     });
@@ -201,6 +206,41 @@ export class InMemorySessionRepository implements SessionRepository {
   acceptedCorrectionRevision(session: SessionDescriptor): Promise<number> {
     return this.serial(() => this.requireDescriptor(session).acceptedCorrectionRevision);
   }
+  withMaterialPublication<T>(session: SessionDescriptor, cut: import('../history/contracts.js').HistorySourceCut, operation: () => Promise<T>, boundaries:readonly MaterialAuthorityBoundary[]=[]): Promise<T> {
+    return this.serial(async () => {
+      const state = this.requireDescriptor(session);
+      const branch = activeBranch(state.branchEntries, branchLeaf(state.branchEntries));
+      const branchId = [...branch].reverse().find(entry => entry.type === 'branch')?.id ?? session.id;
+      const through = cut.throughEntryId === null ? -1 : branch.findIndex(entry => entry.id === cut.throughEntryId);
+      const revision = state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length;
+      if (cut.sessionId !== session.id || cut.branchId !== branchId || cut.sourceRevision > revision || cut.sourceRevision < state.acceptedInputRevision ||
+          (cut.throughEntryId !== null && through < 0) || branch.slice(through + 1).some(entry => entry.type === 'input' || entry.type === 'steering'))
+        throw new PersistenceConflictError('Accepted input or producing branch changed before material publication.');
+      assertLocalMaterialBoundaries(session.id,state.materialRevocationRevision,boundaries,catalogState(state,branchLeaf(state.branchEntries)).branchId);
+      return operation();
+    });
+  }
+  materialRevocationRevision(session:SessionDescriptor,owner:import('../material/contracts.js').MaterialOwner):Promise<number> {
+    assertLocalMaterialOwner(session.id,owner);return this.serial(()=>this.requireDescriptor(session).materialRevocationRevision);
+  }
+  isMaterialRevoked(session:SessionDescriptor,ref:import('../material/contracts.js').QualifiedMaterialRef):Promise<boolean> {
+    assertLocalMaterialOwner(session.id,ref.owner);return this.serial(()=>this.requireDescriptor(session).materialRevoked.has(localMaterialRevocationKey(ref)));
+  }
+  withMaterialRevocations<T>(session:SessionDescriptor,boundaries:readonly MaterialAuthorityBoundary[],operation:()=>Promise<T>):Promise<T> {
+    return this.serial(()=>{const state=this.requireDescriptor(session);assertLocalMaterialBoundaries(session.id,state.materialRevocationRevision,boundaries,catalogState(state,branchLeaf(state.branchEntries)).branchId);return operation();});
+  }
+  revokeMaterial(session:SessionDescriptor,input:import('../material/contracts.js').MaterialRevocation) {
+    const value=materialRevocationSchema.parse(input);assertLocalMaterialOwner(session.id,value.owner);
+    return this.serial(()=>{
+      const state=this.requireDescriptor(session),previous=state.materialRevocations.get(value.operationId);
+      if(previous)return assertLocalMaterialRevocationRetry(previous,value);
+      assertLocalMaterialBoundaries(session.id,state.materialRevocationRevision,[{owner:value.owner,revocationRevision:value.expectedRevision}],catalogState(state,branchLeaf(state.branchEntries)).branchId);
+      const items=stateItems(state,branchLeaf(state.branchEntries));
+      for(const ref of value.refs)if(!state.materialRevoked.has(localMaterialRevocationKey(ref))&&items.revisions.get(ref.revisionId)?.itemId!==ref.itemId)throw new MaterialAccessError();
+      const record=decodeSessionMaterialRevocation({...baseEntry(branchLeaf(state.branchEntries)),...value,type:'session_material_revocation',revision:state.materialRevocationRevision+1});
+      appendBranchRecord(state,record);return localMaterialRevocationReceipt(record);
+    });
+  }
   currentModelSettings(session: SessionDescriptor): Promise<ModelSelection | undefined> {
     return this.serial(() => {
       const state = this.requireDescriptor(session);
@@ -236,17 +276,23 @@ export class InMemorySessionRepository implements SessionRepository {
       if (previous) return assertStateRetry(previous, batch);
       if (batch.capturedHistoryCut.sourceRevision < state.acceptedInputRevision) throw new PersistenceConflictError('Accepted input changed after the state inference.');
       assertStateSourceCut(session.id, branch, batch, state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length);
+      for(const revision of batch.revisions)if(revision.previousRevisionId&&state.materialRevoked.has(localMaterialRevocationKey({itemId:revision.itemId,revisionId:revision.previousRevisionId})))throw new MaterialAccessError();
       await validateSessionStateCommit(batch, itemId => Promise.resolve(items.heads.get(itemId)), state.retainedStateBytes);
+      if(options.materialPublication)assertLocalMaterialBoundaries(session.id,state.materialRevocationRevision,options.materialPublication.boundaries,catalogState(state,branchLeaf(state.branchEntries)).branchId);
+      const commit=()=>{
       const entry = decodeSessionStateBatchEntry({...baseEntry(branchLeaf(state.branchEntries)), type: 'session_state_batch', batch});
       appendBranchRecord(state, entry);
-      return stateReceipt(entry);
+      return Promise.resolve(stateReceipt(entry));
+      };
+      return options.materialPublication?options.materialPublication.withAuthority(commit):commit();
     });
     return options.withOwnership ? options.withOwnership(publish) : publish();
   }
   currentSessionStateItem(session: SessionDescriptor, itemId: string, leafId?: string | null) {
     return this.serial(() => {
       const state = this.requireDescriptor(session);
-      return stateItems(state,leafId === undefined ? branchLeaf(state.branchEntries) : leafId).heads.get(itemId);
+      const item=stateItems(state,leafId === undefined ? branchLeaf(state.branchEntries) : leafId).heads.get(itemId);
+      return item&&!state.materialRevoked.has(localMaterialRevocationKey(item))?item:undefined;
     });
   }
   readSessionStateItem(session: SessionDescriptor, input: Parameters<SessionRepository['readSessionStateItem']>[1], leafId?: string | null) {
@@ -254,6 +300,7 @@ export class InMemorySessionRepository implements SessionRepository {
     return this.serial(() => {
       const state = this.requireDescriptor(session);
       const item = stateItems(state,leafId === undefined ? branchLeaf(state.branchEntries) : leafId).revisions.get(ref.revisionId);
+      if (state.materialRevoked.has(localMaterialRevocationKey(ref)))throw new MaterialAccessError();
       if (item?.itemId !== ref.itemId) throw new Error('Session-state revision is unavailable on this branch.');
       if (ref.range && ref.range.offset + ref.range.bytes > item.contentBytes) throw new Error('Session-state range exceeds the immutable revision.');
       return item;
@@ -264,6 +311,7 @@ export class InMemorySessionRepository implements SessionRepository {
       const state = this.requireDescriptor(session);
       const {limit,maxBytes} = statePageLimits(request);
       const cursor = decodeStatePageCursor(session.id,request);
+      if(cursor&&cursor.revocationRevision!==state.materialRevocationRevision)throw new MaterialAccessError('Session-state cursor revocation boundary changed.');
       const leaf = cursor?.leafId ?? (request.leafId === undefined ? branchLeaf(state.branchEntries) : request.leafId);
       const values = stateItems(state,leaf).orderedItems;
       const items: import('./session-state.js').SessionStateItemMetadata[] = [];
@@ -278,16 +326,19 @@ export class InMemorySessionRepository implements SessionRepository {
           else end = middle;
         }
       }
+      let visited=0;
       for (let index = start; index < values.length; index++) {
+        if(visited++>=256){partial=true;break;}
         const value = values[index];
         if (!value) break;
+        if(state.materialRevoked.has(localMaterialRevocationKey(value))){after=value.itemId;continue;}
         const metadata = stateItemMetadata(value);
         if (items.length >= limit) {partial = true; break;}
-        try {if (statePageResult(session.id,leaf,[...items,metadata],index + 1 < values.length,value.itemId,maxBytes).items.length <= items.length) {partial = true;break;}}
+        try {if (statePageResult(session.id,leaf,[...items,metadata],index + 1 < values.length,value.itemId,maxBytes,state.materialRevocationRevision).items.length <= items.length) {partial = true;break;}}
         catch (error) {if (items.length === 0) throw error;partial = true;break;}
         items.push(metadata); after = value.itemId;
       }
-      return statePageResult(session.id,leaf,items,partial,after,maxBytes);
+      return statePageResult(session.id,leaf,items,partial,after,maxBytes,state.materialRevocationRevision);
     });
   }
 
@@ -698,11 +749,14 @@ export class InMemorySessionRepository implements SessionRepository {
         if (items.batches.has(input.sessionState.idempotencyKey)) throw new PersistenceConflictError('State batch was already committed.');
         if (input.sessionState.capturedHistoryCut.sourceRevision < state.acceptedInputRevision) throw new PersistenceConflictError('Accepted input changed after the state inference.');
         assertStateSourceCut(session.id, branch, input.sessionState, state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length);
+        for(const revision of input.sessionState.revisions)if(revision.previousRevisionId&&state.materialRevoked.has(localMaterialRevocationKey({itemId:revision.itemId,revisionId:revision.previousRevisionId})))throw new MaterialAccessError();
         await validateSessionStateCommit(input.sessionState, itemId => Promise.resolve(items.heads.get(itemId)), state.retainedStateBytes);
       }
       const selectedItems = new Map(stateItems(state,branchLeaf(state.branchEntries)).revisions);
       for (const revision of input.sessionState?.revisions ?? []) selectedItems.set(revision.revisionId,revision);
-      for (const ref of input.window.selection.sessionState ?? []) assertStateSelection(ref,selectedItems.get(ref.revisionId));
+      for (const ref of input.window.selection.sessionState ?? []) {if(state.materialRevoked.has(localMaterialRevocationKey(ref)))throw new MaterialAccessError();assertStateSelection(ref,selectedItems.get(ref.revisionId));}
+      if(options.materialPublication)assertLocalMaterialBoundaries(session.id,state.materialRevocationRevision,options.materialPublication.boundaries,catalogState(state,branchLeaf(state.branchEntries)).branchId);
+      const commit=()=>{
       const entry = decodeContextTransitionEntry({
         ...baseEntry(branchLeaf(state.branchEntries)),
         type: 'context_transition',
@@ -711,7 +765,9 @@ export class InMemorySessionRepository implements SessionRepository {
         transition: input.transition
       });
       appendBranchRecord(state, entry);
-      return entry;
+      return Promise.resolve(entry);
+      };
+      return options.materialPublication?options.materialPublication.withAuthority(commit):commit();
     });
     return options.withOwnership ? options.withOwnership(publish) : publish();
   }
@@ -809,6 +865,7 @@ export class InMemorySessionRepository implements SessionRepository {
     session: SessionDescriptor,
     input: Parameters<SessionRepository['admitSubmission']>[1]
   ): Promise<SessionPendingSubmission> {
+    if (input.input.origin?.kind === 'host_wake') return Promise.reject(new Error('Host wakes require idempotent triggered admission.'));
     return this.serial(() => {
       const state = this.requireDescriptor(session);
       const selection = recordedModelSelection(activeBranch(state.branchEntries, branchLeaf(state.branchEntries)))
@@ -823,6 +880,29 @@ export class InMemorySessionRepository implements SessionRepository {
         throw new Error('Committed admission has no pending submission.');
       return Object.freeze({ ...admitted, state: admitted.state });
     });
+  }
+
+  async admitTriggeredSubmission(session: SessionDescriptor, input: Parameters<SessionRepository['admitTriggeredSubmission']>[1]) {
+    const captured = captureTriggeredSubmission(input);
+    return this.serial(() => {
+      const state = this.requireDescriptor(session);
+      const existing = findTriggeredSubmissionReceipt(session, state.submissionRecords, captured.trigger.key);
+      if (existing) { assertTriggeredSubmissionRetry(existing, { key: captured.trigger.key, input: captured.input, configuration: captured.configuration }); return existing; }
+      if (pendingSessionSubmissions(state.submissionRecords).some(entry => entry.state === 'suspended'))
+        throw new Error('Host wake cannot admit work while the session is suspended.');
+      const selection = recordedModelSelection(activeBranch(state.branchEntries, branchLeaf(state.branchEntries))) ?? initialSessionModelSelection(state.submissionRecords);
+      assertSessionAdmissionConfiguration(captured.configuration, selection);
+      const record = Object.freeze({ ...createSessionAdmission(state.submissionRecords, {
+        ...captured, runId: triggeredRunId(session.id, captured.trigger.key), configuration: captured.configuration,
+        ...(captured.maximumQueuedInputs === undefined ? {} : { maximumQueuedInputs: captured.maximumQueuedInputs })
+      }), trigger: captured.trigger });
+      state.submissionRecords.push(record);
+      state.acceptedInputRevision = state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length;
+      return triggeredSubmissionReceipt(session, record);
+    });
+  }
+  readTriggeredSubmissionReceipt(session: SessionDescriptor, key: string) {
+    return this.serial(() => findTriggeredSubmissionReceipt(session, this.requireDescriptor(session).submissionRecords, key));
   }
 
   claimNextSubmission(session: SessionDescriptor, claimId: string): Promise<SessionPendingSubmission | undefined> {
@@ -915,6 +995,9 @@ function sessionUpdatedAt(state: SessionState): string {
 interface SessionState {
   acceptedInputRevision: number;
   acceptedCorrectionRevision: number;
+  materialRevocationRevision:number;
+  readonly materialRevoked:Set<string>;
+  readonly materialRevocations:Map<string,import('./contracts.js').SessionMaterialRevocationEntry>;
   retainedStateBytes: number;
   readonly peerDeliveries: Map<string, import('./contracts.js').SessionPeerContributionEntry>;
   readonly stateIndexes: Map<string,MemoryStateIndex>;
@@ -945,6 +1028,14 @@ function catalogState(state: SessionState, leafId: string | null): MemoryCatalog
 function appendBranchRecord(state: SessionState, entry: SessionBranchEntry): void {
   const parent = catalogState(state, entry.parentId);
   const branchId = entry.type === 'branch' ? entry.id : parent.branchId;
+  if(entry.type==='session_material_revocation'){
+    assertLocalMaterialOwner(state.header.id,entry.owner);
+    if(entry.owner.branchId!==branchId)throw new Error('Session material revocation owner does not match its recorded branch.');
+    if(state.materialRevocations.has(entry.operationId))throw new Error('Duplicate session material revocation.');
+    const items=stateItems(state,entry.parentId);
+    for(const ref of entry.refs)if(!state.materialRevoked.has(localMaterialRevocationKey(ref))&&items.revisions.get(ref.revisionId)?.itemId!==ref.itemId)throw new Error('Session material revocation target is unavailable on its recorded branch.');
+    if(entry.expectedRevision!==state.materialRevocationRevision||entry.revision!==state.materialRevocationRevision+1)throw new Error('Session material revocation is not consecutive.');
+  }
   state.catalogIndexes.set(entry.id, {
     branchId,
     state: Object.freeze({ ownerId: toolCatalogSelectionOwner(state.header.id, branchId),
@@ -954,6 +1045,7 @@ function appendBranchRecord(state: SessionState, entry: SessionBranchEntry): voi
   state.stateIndexes.set(entry.id,advanceMemoryState(stateItems(state,entry.parentId),entry));
   const batch = stateBatch(entry);
   if (batch) state.retainedStateBytes += sessionStateBatchStorageBytes(batch);
+  if(entry.type==='session_material_revocation'){state.materialRevocationRevision=entry.revision;state.materialRevocations.set(entry.operationId,entry);for(const ref of entry.refs)state.materialRevoked.add(localMaterialRevocationKey(ref));}
   state.branchEntries.push(entry);
   if (entry.type === 'peer_contribution') state.peerDeliveries.set(entry.contribution.deliveryId, entry);
   if (entry.type === 'input' || entry.type === 'steering') state.acceptedInputRevision = state.branchEntries.length + state.finalizations.length + state.confirmations.length + state.submissionRecords.length;

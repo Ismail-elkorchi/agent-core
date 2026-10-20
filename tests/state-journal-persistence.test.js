@@ -24,11 +24,11 @@ async function cut(f) {
 }
 async function batch(f,key,operations,capturedHistoryCut = undefined,maxStorageBytes = 16*1024*1024) {
   capturedHistoryCut ??= await cut(f);
-  const command = {idempotencyKey:key,branchId:capturedHistoryCut.branchId,inference:f.inference,capturedHistoryCut,operations};
+  const command = {owner:{kind:'session',sessionId:capturedHistoryCut.sessionId,branchId:capturedHistoryCut.branchId},idempotencyKey:key,branchId:capturedHistoryCut.branchId,inference:f.inference,capturedHistoryCut,operations};
   const fingerprint = hashJson(command), revisions = [];
   for (const [index,operation] of operations.entries()) {
     const contentRef = await f.artifacts.storeProtected({label:'state-item',mediaType:'text/plain',content:Buffer.from(operation.text ?? '')});
-    revisions.push({itemId:operation.itemId ?? `state-item-${hashJson({branchId:command.branchId,fingerprint,index})}`,
+    revisions.push({owner:command.owner,itemId:operation.itemId ?? `state-item-${hashJson({owner:command.owner,fingerprint,index})}`,
       revisionId:`state-revision-${hashJson({fingerprint,index})}`,previousRevisionId:operation.expectedRevisionId ?? null,
       deleted:operation.kind === 'remove',contentRef,contentSha256:contentRef.sha256,contentBytes:contentRef.size,
       inference:command.inference,capturedHistoryCut});
@@ -130,7 +130,7 @@ test('jsonl: incompatible prior session format is rejected without altering sour
   const f = await fixture(t,'jsonl');
   const file = f.repository.location(f.session.id);
   const originalIndex = await readFile(`${file}.index`);
-  const prior = (await readFile(file,'utf8')).replace('agent-core.session/7','agent-core.session/6');
+  const prior = (await readFile(file,'utf8')).replace('agent-core.session/8','agent-core.session/7');
   await writeFile(file,prior);
   const restarted = new JsonlSessionRepository(f.root);
   await assert.rejects(restarted.open(f.session.id,binding),error => {
@@ -268,7 +268,7 @@ test('jsonl: save-derived previews survive restart and listing performs no body 
   const context = new ContextService({ ...f, history, assertStateWrite: async () => {}, policy: { maxSourceBytes: 65536 } });
   const capturedHistoryCut = await history.capture();
   const text = '\uFEFF' + '😀'.repeat(1000);
-  await context.saveSessionState({ idempotencyKey: 'derived-preview', branchId: capturedHistoryCut.branchId,
+  await context.saveSessionState({ idempotencyKey: 'derived-preview', owner: { kind: 'session', sessionId: capturedHistoryCut.sessionId, branchId: capturedHistoryCut.branchId }, branchId: capturedHistoryCut.branchId,
     capturedHistoryCut, inference: f.inference, operations: [{ kind: 'create', text }] });
   f.artifacts.readVerified = async () => { throw new Error('metadata listing must not load artifact bodies'); };
   const restarted = new JsonlSessionRepository(f.root);

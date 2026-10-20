@@ -222,3 +222,19 @@ for (const scheduled of [false, true])
     assert.equal(completed.inspection.window, null);
     assert.equal(completed.notice, 'Context selection unchanged.');
   });
+
+test('editing original history preserves exact material, skill and artifact selections', async () => {
+  const source = { sessionId: 'session', entryId: 'optional', sha256: 'a'.repeat(64) };
+  const materials = [{ owner: { kind: 'scope', scopeId: 'person-1' }, itemId: 'preference', revisionId: 'v2', range: { offset: 0, bytes: 5 } }];
+  const skills = [{ scopeId: 'methods', packageId: 'review', revision: 'c'.repeat(64), bindingRevision: 'grant-3' }];
+  const artifacts = [{ representation: 'reference', artifact: { artifactId: 'source', sha256: 'b'.repeat(64), size: 3, mediaType: 'text/plain', visibility: 'public' } }];
+  const draft = { ...selectionDraft(), selection: { retained: [source], materials, skills, artifacts } };
+  const edited = updateContext(draft, { type: 'context.source', source }, {}).state;
+  assert.deepEqual(edited.selection, { retained: [], materials, skills, artifacts });
+  let received;
+  const pending = updateContext(edited, { type: 'context.apply' }, {
+    transitionContext: async request => { received = request.selection; return { selection: { kind: 'selected' } }; }
+  });
+  await pending.effects[0].run({ signal: new AbortController().signal });
+  assert.deepEqual(received, edited.selection);
+});

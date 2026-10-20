@@ -25,7 +25,7 @@ export function scopedTool(input: {
   readonly schema: z.ZodType;
   readonly buildModelContent?: import('@agent-core/tools').ToolDefinition['buildModelContent'];
   readonly mode: 'read' | 'write';
-  readonly root: string;
+  readonly root: string | readonly string[];
   readonly canonicalize: (
     value: JsonObject
   ) => Promise<{ readonly value: JsonObject; readonly scope: string }>;
@@ -39,8 +39,8 @@ export function scopedTool(input: {
     ...(input.buildModelContent ? { buildModelContent: input.buildModelContent } : {}),
     outputSchema: z.json(),
     effectEnvelope: {
-      accesses: [{ mode: input.mode, scope: input.root }],
-      lockScopes: input.mode === 'write' ? [input.root] : []
+      accesses: (typeof input.root === 'string' ? [input.root] : input.root).map(scope => ({ mode: input.mode, scope })),
+      lockScopes: input.mode === 'write' ? [...typeof input.root === 'string' ? [input.root] : input.root] : []
     },
     async canonicalizeInput(value: unknown) {
       const canonical = await input.canonicalize(parseJsonObject(value));

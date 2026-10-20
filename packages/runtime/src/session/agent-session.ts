@@ -1,3 +1,4 @@
+import { assertTriggeredSubmissionRetry, captureTriggeredSubmission, triggeredRunId } from './triggered-submission.js';
 import { parseSessionSubmissionOrigin } from './submission-origin.js';
 import { hashJson, type ArtifactRepository } from '@agent-core/persistence';
 import {
@@ -127,6 +128,12 @@ export interface AgentSessionOptions {
    * Accepted input remains authoritative even if the guard loses its return acknowledgement.
    */
   readonly withSubmissionAdmission?: <T>(operation: () => Promise<T>) => Promise<T>;
+  /** Optional host-owned durable staging, before admission under its authorization fence.
+   * Retry-safe by the stable prospective identity. Must not reenter this AgentSession.
+   * Failure leaves no admitted submission; this hook grants no tool/execution authority.
+   */
+  readonly stageTriggeredSubmission?: (input: import('./contracts.js').SessionTriggeredSubmissionStagingInput) => Promise<void>;
+
 }
 
 export class AgentSession {
@@ -249,6 +256,7 @@ export class AgentSession {
   ): Promise<AgentSessionSubmissionResult> {
     return this.serial(async () => {
       await this.restorePending();
+      if (input.origin?.kind === 'host_wake') throw new Error('Host wakes require submitTriggered() and a current host admission fence.');
       const task = input.task;
       if (task.trim().length === 0) throw new Error('Session input must not be empty.');
       const submissionId = randomUUID();
@@ -320,6 +328,59 @@ export class AgentSession {
       if (this.options.scheduling !== 'manual') await this.launchNext();
       return { kind: 'queued', submissionId, runId: pending.runId, completion: pending.completion };
     });
+  }
+
+  /** Host ingress only. It never steers, resumes suspended work, or creates a second executor.
+   * withAdmission must serialize the current authority/condition check with the durable admission.
+   * A retry with an existing receipt does not re-authorize or dispatch additional work.
+   */
+  async submitTriggered(input: {
+    readonly key: string;
+    readonly signal?: AbortSignal;
+    readonly input: import('./contracts.js').SessionTriggeredSubmissionAdmission['input'];
+    readonly withAdmission: <T>(operation: () => Promise<T>) => Promise<T>;
+  }): Promise<import('./contracts.js').SessionTriggeredSubmissionReceipt> {
+    if (typeof input.withAdmission !== 'function') throw new Error('Host-trigger admission requires an authorization fence.');
+    const captured = captureTriggeredSubmission({ key: input.key, input: input.input, configuration: this.configuration });
+    const key = captured.trigger.key, signal = input.signal, withAdmission = input.withAdmission;
+    return this.serial(async () => {
+      this.assertOpen();
+      const request = { key, input: captured.input,
+        configuration: this.configuration, maximumQueuedInputs: this.maximumQueuedInputs };
+      const previous = await this.options.repository.readTriggeredSubmissionReceipt(this.options.descriptor, key);
+      if (previous) { assertTriggeredSubmissionRetry(previous, request); return previous; }
+      await this.restorePending();
+      if (this.suspended) throw new Error('Host wake cannot admit work while the session is suspended.');
+      const binding = await this.options.providerBinding?.resolve(this.configuration, captured.input);
+      let receipt: import('./contracts.js').SessionTriggeredSubmissionReceipt | undefined;
+      let operationStarted = false;
+      await withAdmission(() => this.withSubmissionAdmission(async () => {
+        if (operationStarted) throw new Error('Host admission fence invoked its publication more than once.');
+        operationStarted = true;
+        signal?.throwIfAborted();
+        const configuration = ownSessionSubmissionConfiguration(this.configuration);
+        await this.options.stageTriggeredSubmission?.(Object.freeze({ ...captured.trigger,
+          sessionId: this.options.descriptor.id, submissionId: captured.submissionId,
+          runId: triggeredRunId(this.options.descriptor.id, key), input: captured.input, configuration }));
+        signal?.throwIfAborted();
+        receipt = await this.options.repository.admitTriggeredSubmission(this.options.descriptor, { ...request, configuration });
+        return receipt;
+      }));
+      if (!receipt) throw new Error('Host admission fence did not complete durable admission.');
+      if (binding && this.options.providerBinding) this.options.providerBinding.commit(binding);
+      await this.restorePending();
+      this.scheduleRefresh();
+      if (this.options.scheduling !== 'manual') await this.launchNext();
+      return receipt;
+    });
+  }
+
+  /** Durable receipt replay remains available after cancellation or completion of the admitted run. */
+  readTriggeredSubmissionReceipt(key: string) {
+    return this.serial(() => this.options.repository.readTriggeredSubmissionReceipt(this.options.descriptor, key));
+  }
+  readSubmission(submissionId: string) {
+    return this.serial(() => this.options.repository.readSubmission(this.options.descriptor, submissionId));
   }
 
   /** Changes future inference only after durable pending work has reached a lawful boundary. */
@@ -412,6 +473,8 @@ export class AgentSession {
       await this.restorePending();
       const record = this.pendingSnapshot.find((submission) => submission.submissionId === submissionId && submission.state === 'queued');
       if (!record) throw new Error(`Submission is no longer queued: ${submissionId}`);
+      if (change.kind === 'replace' && (change.input.origin?.kind === 'host_wake' || record.input.origin?.kind === 'host_wake'))
+        throw new Error('Host-wake payloads cannot be replaced through user queue editing; cancel and accept a new intention.');
       const pending = this.handles.get(submissionId);
       const owned =
         change.kind === 'replace'

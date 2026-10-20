@@ -5,12 +5,27 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "include": ["src"],
+  "include": [
+    "src"
+  ],
   "references": [
-    { "path": "../effects" },
-    { "path": "../persistence" },
-    { "path": "../json" },
-    { "path": "../model" },
-    { "path": "../tools" }
+    {
+      "path": "../effects"
+    },
+    {
+      "path": "../persistence"
+    },
+    {
+      "path": "../json"
+    },
+    {
+      "path": "../model"
+    },
+    {
+      "path": "../tools"
+    },
+    {
+      "path": "../skills"
+    }
   ]
 }

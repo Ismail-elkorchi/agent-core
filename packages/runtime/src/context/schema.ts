@@ -1,3 +1,5 @@
+import { qualifiedMaterialRefSchema } from '../material/contracts.js';
+import { skillSelectionReferencesSchema } from '@agent-core/skills';
 import { decodeOwnedArtifactRef } from '@agent-core/persistence';
 import { parseJsonObject } from '@agent-core/json';
 import { sessionStateBatchCommitSchema, sessionStateItemRefSchema } from '../session/session-state.js';
@@ -16,6 +18,8 @@ export const contextArtifactSelectionSchema = z.discriminatedUnion('representati
   }).readonly().optional() }).readonly()
 ]);
 const sourceSelectionShape = {
+  materials: z.array(qualifiedMaterialRefSchema).max(256).readonly().optional(),
+  skills: skillSelectionReferencesSchema.optional(),
   sessionState: z.array(sessionStateItemRefSchema).max(10000).readonly().optional(),
   artifacts: z.array(contextArtifactSelectionSchema).max(10000).readonly().optional(),
   excerpts: z.array(sourceExcerptSchema).max(10000).readonly().optional(),

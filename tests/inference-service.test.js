@@ -501,6 +501,7 @@ test('fencing rejection before dispatch durably releases the owning reservation'
     service.invokeWithLifecycle(
       { request: input().request, profile, session: { complete: provider.complete }, turnIndex: 0 },
       {
+        notSent: async cause => { throw cause; },
         start: async () => {
           throw new Error('fencing denied');
         },
@@ -639,6 +640,7 @@ test('precompiled input is admitted before any invocation or external effect is 
       service.invokeWithLifecycle(
         { request, compiled, profile, session: service.createSession(), turnIndex: 1 },
         {
+          async notSent(cause) { throw cause; },
           async start() {
             starts++;
           },
@@ -1009,3 +1011,25 @@ test('native admission awaits history capture for initial, successor and extende
   assert.equal(await service.isNativeAcknowledgement('work', successorId, 'native-history', 'unrelated-call'), false);
   assert.equal(await service.isNativeAcknowledgement('work', successorId, successorId, 'context-call'), false);
 });
+
+for (const mode of ['skip', 'deferred', 'duplicate']) {
+  test(`held inference authority ${mode} cannot produce an unowned or duplicate launch`, async () => {
+    let calls = 0, fences = 0, late;
+    const repository = new InMemoryInferenceRepository();
+    const provider = fixture(async request => { calls++; return response(request); });
+    const service = new InferenceService({ provider, repository, artifacts: new InMemoryArtifactRepository() });
+    const run = service.invoke({ ...input(`fence-${mode}`), withDispatchAuthority: async operation => {
+      fences++;
+      if (mode === 'skip') return;
+      if (mode === 'deferred') { late = operation; return; }
+      await operation();
+      if (fences === 2) await operation();
+    } });
+    await assert.rejects(run, /authority|exactly once/);
+    if (late) await assert.rejects(late(), /outlived/);
+    const persisted = (await repository.load('work', { invocationId: `fence-${mode}` })).invocation;
+    assert.equal(calls, mode === 'duplicate' ? 1 : 0);
+    assert.ok(mode === 'duplicate' ? persisted.uncertain : persisted.notSent);
+    if (mode !== 'duplicate') assert.equal(persisted.uncertain, undefined);
+  });
+}

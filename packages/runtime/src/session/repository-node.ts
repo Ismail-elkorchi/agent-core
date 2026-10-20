@@ -1,3 +1,7 @@
+import type { MaterialAuthorityBoundary } from '../material/contracts.js';
+import { materialRevocationSchema } from '../material/repository.js';
+import { assertLocalMaterialOwner, decodeSessionMaterialRevocation, localMaterialRevocationReceipt, assertLocalMaterialRevocationRetry } from './material-revocation.js';
+import { captureTriggeredSubmission, triggeredRunId, findTriggeredSubmissionReceipt, triggeredSubmissionId, triggeredSubmissionReceipt, assertTriggeredSubmissionRetry, ownSubmissionTrigger } from './triggered-submission.js';
 import { materializedSessionInput } from './submission-lifecycle.js';
 import { ownPeerContributionInput, samePeerContribution, decodePeerContributionEntry } from './peer-contribution.js';
 import { decodeSessionToolCatalogSelection } from './tool-catalog.js';
@@ -138,7 +142,7 @@ export class JsonlSessionRepository implements SessionRepository {
         const header: SessionHeader = Object.freeze({
           type: 'session',
           version: 1,
-          format: 'agent-core.session/7',
+          format: 'agent-core.session/8',
           sessionStateStorage: 'session',
           id,
           timestamp: new Date().toISOString(),
@@ -170,6 +174,31 @@ export class JsonlSessionRepository implements SessionRepository {
   }
   async acceptedCorrectionRevision(session: SessionDescriptor): Promise<number> {
     return (await this.branchIndex(session.id).checked(session)).acceptedCorrectionRevision;
+  }
+  withMaterialPublication<T>(session: SessionDescriptor, cut: import('../history/contracts.js').HistorySourceCut, operation: () => Promise<T>, boundaries:readonly MaterialAuthorityBoundary[]=[]): Promise<T> {
+    return this.enqueue(session.id, () => this.withSessionLock(session.id, async () => {
+      await this.branchIndex(session.id).validateMaterialSource(session, cut);
+      await this.branchIndex(session.id).validateMaterialBoundaries(session,boundaries);
+      return operation();
+    }));
+  }
+  materialRevocationRevision(session:SessionDescriptor,owner:import('../material/contracts.js').MaterialOwner):Promise<number> {return this.branchIndex(session.id).materialRevocationRevision(session,owner);}
+  isMaterialRevoked(session:SessionDescriptor,ref:import('../material/contracts.js').QualifiedMaterialRef):Promise<boolean> {return this.branchIndex(session.id).isMaterialRevoked(session,ref);}
+  withMaterialRevocations<T>(session:SessionDescriptor,boundaries:readonly MaterialAuthorityBoundary[],operation:()=>Promise<T>):Promise<T> {
+    return this.enqueue(session.id,()=>this.withSessionLock(session.id,async()=>{await this.branchIndex(session.id).validateMaterialBoundaries(session,boundaries);return operation();}));
+  }
+  revokeMaterial(session:SessionDescriptor,input:import('../material/contracts.js').MaterialRevocation) {
+    const value=materialRevocationSchema.parse(input);assertLocalMaterialOwner(session.id,value.owner);
+    return this.enqueue(session.id,()=>this.withSessionLock(session.id,async()=>{
+      const index=this.branchIndex(session.id),state=await index.descriptor(session.header.binding);assertDescriptor(session,state);
+      const previous=await index.findMaterialRevocation(session,value.operationId);if(previous)return assertLocalMaterialRevocationRetry(previous,value);
+      await index.validateMaterialBoundaries(session,[{owner:value.owner,revocationRevision:value.expectedRevision}]);
+      const revision=await index.materialRevocationRevision(session,value.owner);
+      if(revision!==value.expectedRevision)throw new PersistenceConflictError('Session material revocation revision changed.');
+      for(const ref of value.refs)if(!await index.isMaterialRevoked(session,{...ref,owner:value.owner}))await index.readStateItem(session,ref);
+      const record=decodeSessionMaterialRevocation({...baseEntry(state.leafId),...value,type:'session_material_revocation',revision:revision+1});
+      await this.appendRecord(session.id,state,record);return localMaterialRevocationReceipt(record);
+    }));
   }
   async currentModelSettings(session: SessionDescriptor): Promise<ModelSelection | undefined> {
     const entry = await this.branchIndex(session.id).currentModelSettings(session);
@@ -232,9 +261,13 @@ export class JsonlSessionRepository implements SessionRepository {
       const previous = await index.findStateBatch(session,batch.idempotencyKey);
       if (previous) return assertStateRetry(previous,batch);
       await index.validateState(session,batch);
+      if(options.materialPublication)await index.validateMaterialBoundaries(session,options.materialPublication.boundaries);
+      const commit=async()=>{
       const entry = decodeSessionStateBatchEntry({...baseEntry(state.leafId),type:'session_state_batch',batch});
       await this.appendRecord(session.id,state,entry);
       return stateReceipt(entry);
+      };
+      return options.materialPublication?options.materialPublication.withAuthority(commit):commit();
     }));
     return options.withOwnership ? options.withOwnership(publish) : publish();
   }
@@ -426,7 +459,7 @@ export class JsonlSessionRepository implements SessionRepository {
             typeof value.type === 'string' &&
             value.type.startsWith('submission.')
           ) {
-            return parseSubmissionRecord(value);
+            return parseSubmissionRecord(value, sessionId);
           }
           return parseBranchEntry(value);
           } catch (error) {if (error instanceof PersistenceCorruptionError) throw error; throw corruption(filePath, line.line, line.byteOffset, errorMessage(error), 'invalid_record');}
@@ -714,6 +747,8 @@ export class JsonlSessionRepository implements SessionRepository {
           if (existing) return existing;
           await this.branchIndex(session.id).validateContext(session, input);
           if (input.sessionState) await this.branchIndex(session.id).validateState(session,input.sessionState);
+          if(options.materialPublication)await this.branchIndex(session.id).validateMaterialBoundaries(session,options.materialPublication.boundaries);
+          const commit=async()=>{
           const entry = decodeContextTransitionEntry({
             ...baseEntry(state.leafId),
             type: 'context_transition',
@@ -723,6 +758,8 @@ export class JsonlSessionRepository implements SessionRepository {
           });
           await this.appendRecord(session.id, state, entry);
           return entry;
+          };
+          return options.materialPublication?options.materialPublication.withAuthority(commit):commit();
         }
       )
     );
@@ -828,6 +865,7 @@ export class JsonlSessionRepository implements SessionRepository {
     session: SessionDescriptor,
     input: Parameters<SessionRepository['admitSubmission']>[1]
   ): Promise<SessionPendingSubmission> {
+    if (input.input.origin?.kind === 'host_wake') return Promise.reject(new Error('Host wakes require idempotent triggered admission.'));
     return this.enqueue(session.id, () => this.withSessionLock(session.id, async () => {
         const state = await this.branchIndex(session.id).descriptor(session.header.binding);
         assertDescriptor(session, state);
@@ -840,6 +878,30 @@ export class JsonlSessionRepository implements SessionRepository {
         return admitted;
       }
     ));
+  }
+
+  async admitTriggeredSubmission(session: SessionDescriptor, input: Parameters<SessionRepository['admitTriggeredSubmission']>[1]) {
+    const captured = captureTriggeredSubmission(input);
+    return this.enqueue(session.id, () => this.withSessionLock(session.id, async () => {
+      const state = await this.branchIndex(session.id).descriptor(session.header.binding);
+      assertDescriptor(session, state);
+      const records = await this.branchIndex(session.id).submissionRecords(session, captured.submissionId);
+      const existing = findTriggeredSubmissionReceipt(session, records, captured.trigger.key);
+      if (existing) { assertTriggeredSubmissionRetry(existing, { key: captured.trigger.key, input: captured.input, configuration: captured.configuration }); return existing; }
+      if ((await this.branchIndex(session.id).pending(session)).some(entry => entry.state === 'suspended'))
+        throw new Error('Host wake cannot admit work while the session is suspended.');
+      assertSessionAdmissionConfiguration(captured.configuration, await this.currentModelSettings(session));
+      const record = Object.freeze({ ...await this.branchIndex(session.id).admission(session, {
+        ...captured, runId: triggeredRunId(session.id, captured.trigger.key), configuration: captured.configuration,
+        ...(captured.maximumQueuedInputs === undefined ? {} : { maximumQueuedInputs: captured.maximumQueuedInputs })
+      }), trigger: captured.trigger });
+      await this.appendRecord(session.id, state, record);
+      return triggeredSubmissionReceipt(session, record);
+    }));
+  }
+  readTriggeredSubmissionReceipt(session: SessionDescriptor, key: string) {
+    return this.enqueue(session.id, async () => findTriggeredSubmissionReceipt(session,
+      await this.branchIndex(session.id).submissionRecords(session, triggeredSubmissionId(key)), key));
   }
 
   claimNextSubmission(session: SessionDescriptor, claimId: string): Promise<SessionPendingSubmission | undefined> {
@@ -993,7 +1055,7 @@ async function readValidatedSessionBodies(
         typeof value.type === 'string' &&
         value.type.startsWith('submission.')
       )
-        submissionRecords.push(parseSubmissionRecord(value));
+        submissionRecords.push(parseSubmissionRecord(value, sessionId));
       else branchEntries.push(parseBranchEntry(value));
     } catch (error) {
       throw corruption(filePath, line.line, line.byteOffset, errorMessage(error), 'invalid_record');
@@ -1055,6 +1117,7 @@ function parseBranchEntry(value: JsonValue): SessionBranchEntry {
   if (value.type === 'peer_contribution') return decodePeerContributionEntry(value);
   if (value.type === 'context_transition') return decodeContextTransitionEntry(value);
   if (value.type === 'session_state_batch') return decodeSessionStateBatchEntry(value);
+  if (value.type === 'session_material_revocation') return decodeSessionMaterialRevocation(value);
   if (value.type === 'tool_catalog_selection') return decodeSessionToolCatalogSelection(value);
   throw new Error(
     `Unsupported or malformed session entry: ${typeof value.type === 'string' ? value.type : 'unknown'}`
@@ -1127,7 +1190,7 @@ const SESSION_HEADER_FIELDS = new Set([
 function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader {
   if (
     !isJsonObject(value) ||
-    value.format !== 'agent-core.session/7' ||
+    value.format !== 'agent-core.session/8' ||
     value.sessionStateStorage !== 'session'
   )
     throw new Error(
@@ -1149,7 +1212,7 @@ function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader 
   return Object.freeze({
     type: 'session',
     version: 1,
-    format: 'agent-core.session/7',
+    format: 'agent-core.session/8',
     sessionStateStorage: 'session',
     id: value.id,
     timestamp: value.timestamp,
@@ -1412,7 +1475,7 @@ function isSessionBranchMarkerEntry(
     (value.label === undefined || typeof value.label === 'string')
   );
 }
-function parseSubmissionRecord(value: JsonObject): SessionSubmissionRecord {
+function parseSubmissionRecord(value: JsonObject, sessionId: string): SessionSubmissionRecord {
   if (
     typeof value.submissionId !== 'string' ||
     value.submissionId.length === 0 ||
@@ -1427,8 +1490,15 @@ function parseSubmissionRecord(value: JsonObject): SessionSubmissionRecord {
         typeof value.maximumQueuedInputs !== 'number' || !Number.isSafeInteger(value.maximumQueuedInputs) || value.maximumQueuedInputs < 0 ||
         (value.claimId !== undefined && (typeof value.claimId !== 'string' || value.claimId.length === 0)))
       throw new Error('Admitted session submission is invalid.');
+    if (value.trigger !== undefined) {
+      const trigger = ownSubmissionTrigger(value.trigger);
+      const captured = ownSessionSubmissionInput(value.input);
+      if (captured.origin?.kind !== 'host_wake' || trigger.payloadDigest !== hashJson(captured) || value.submissionId !== triggeredSubmissionId(trigger.key) || value.runId !== triggeredRunId(sessionId, trigger.key))
+        throw new Error('Host-trigger admission identity or payload digest is invalid.');
+    } else if (ownSessionSubmissionInput(value.input).origin?.kind === 'host_wake') throw new Error('Host wake has no durable trigger identity.');
     return Object.freeze({
       type: 'submission.admitted',
+      ...(value.trigger === undefined ? {} : { trigger: ownSubmissionTrigger(value.trigger) }),
       maximumQueuedInputs: value.maximumQueuedInputs,
       ...(value.claimId === undefined ? {} : { claimId: value.claimId }),
       submissionId: value.submissionId,
@@ -1450,6 +1520,7 @@ function parseSubmissionRecord(value: JsonObject): SessionSubmissionRecord {
   const base = { submissionId: value.submissionId, runId: value.runId, timestamp: value.timestamp };
   if (value.type === 'submission.revised') {
     if (!isJsonObject(value.input)) throw new Error('Revised session input is invalid.');
+    if (ownSessionSubmissionInput(value.input).origin?.kind === 'host_wake') throw new Error('Queued replacement cannot forge a host wake.');
     return Object.freeze({
       ...base,
       type: value.type,
@@ -1586,6 +1657,7 @@ function encodeSubmissionRecord(record: SessionSubmissionRecord): JsonObject {
     return Object.freeze({
       type: record.type,
       maximumQueuedInputs: record.maximumQueuedInputs,
+      ...(record.trigger === undefined ? {} : { trigger: { key: record.trigger.key, payloadDigest: record.trigger.payloadDigest } }),
       ...(record.claimId === undefined ? {} : { claimId: record.claimId }),
       submissionId: record.submissionId,
       runId: record.runId,

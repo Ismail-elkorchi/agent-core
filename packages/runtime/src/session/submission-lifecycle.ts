@@ -293,6 +293,8 @@ function foldSubmissions(
     if (record.type === 'submission.revised' || record.type === 'submission.cancelled') {
       if (current.state !== 'queued')
         throw new Error(`Only queued input can change: ${record.submissionId}`);
+      if (record.type === 'submission.revised' && (current.input.origin?.kind === 'host_wake' || record.input.origin?.kind === 'host_wake'))
+        throw new Error('Host-wake payloads cannot be replaced through queue editing.');
       submissions.set(
         record.submissionId,
         record.type === 'submission.revised'
@@ -336,6 +338,8 @@ export function createQueuedSubmissionUpdate(
   const current = foldSubmissions(records).get(submissionId);
   if (current?.state !== 'queued')
     throw new Error(`Submission is no longer queued: ${submissionId}`);
+  if (change.kind === 'replace' && (current.input.origin?.kind === 'host_wake' || change.input.origin?.kind === 'host_wake'))
+    throw new Error('Host-wake payloads cannot be replaced through queue editing.');
   if (hashJson(current.input) !== hashJson(ownSessionSubmissionInput(change.expectedInput)))
     throw new Error(`Queued input changed since it was read: ${submissionId}`);
   const base = { submissionId, runId: current.runId, timestamp: new Date().toISOString() };
@@ -631,6 +635,7 @@ export function materializedSessionInput(
   if (accepted.originalInput && hashJson(accepted.originalInput.origin ?? null) !== hashJson(origin ?? null))
     throw new Error('Run input origin differs from its accepted session submission.');
   if (accepted.originalInput) return accepted;
+  if (origin?.kind === 'host_wake') throw new Error('Host wake input requires a durable triggered admission.');
   return origin === undefined ? {} : { originalInput: ownSessionSubmissionInput({ task: input.task, origin,
     ...(input.images === undefined ? {} : { images: input.images }) }) };
 }

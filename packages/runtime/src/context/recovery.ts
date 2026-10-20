@@ -90,8 +90,8 @@ const controlGrants = new WeakMap<ToolDefinition, ContextControlRole>();
 export function grantContextControlTool<T extends CompiledToolDefinition>(tool: T, role: ContextControlRole): T {
   if (!['read', 'state', 'activation', 'catalog'].includes(role)) throw new TypeError('Invalid context control role.');
   if (role === 'read' && !tool.effectEnvelope.accesses.every(access => access.mode === 'read' &&
-      ['context', 'history', 'session_state', 'tool_catalog'].includes(access.scope)))
-    throw new TypeError('Context control reads require read-only context, history, session-state or tool-catalog effects.');
+      ['context', 'history', 'session_state', 'materials', 'skills', 'tool_catalog'].includes(access.scope)))
+    throw new TypeError('Context control reads require read-only context, history, session-state, material, skill or tool-catalog effects.');
   controlGrants.set(tool, role);
   return tool;
 }

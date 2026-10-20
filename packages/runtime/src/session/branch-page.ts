@@ -19,7 +19,7 @@ import type {
 } from './contracts.js';
 
 export interface BranchEntryPosition {
-  readonly inputAuthorship?: 'model';
+  readonly inputAuthorship?: 'model' | 'host';
   readonly depth: number;
   readonly ancestors: readonly string[];
   readonly context: SessionSourceMetadata['context'];
@@ -545,12 +545,14 @@ function branchEntryText(entry: SessionBranchEntry): string {
       return `${entry.provider}/${entry.model}`;
     case 'context_transition':
       return entry.window.reason;
+    case 'session_material_revocation': return 'Material future-use revocation';
     case 'session_state_batch':
       return entry.batch.idempotencyKey;
   }
 }
 
 export function branchEntryMetadata(entry: SessionBranchEntry) {
+  const inputAuthorship = historyInputAuthorship(entry);
   const toolName = historyToolName(entry);
   return {
     context: historySourceFacts(entry),
@@ -558,7 +560,7 @@ export function branchEntryMetadata(entry: SessionBranchEntry) {
     ...(toolName ? { toolName } : {}),
     identity: entryIdentity(entry),
     type: entry.type,
-    ...(historyInputAuthorship(entry) ? { inputAuthorship: 'model' as const } : {}),
+    ...(inputAuthorship ? { inputAuthorship } : {}),
     ...('runId' in entry ? { runId: entry.runId } : {}),
     ...(entry.source ? { source: entry.source } : {}),
     ...(entry.type === 'branch' ? { fromEntryId: entry.fromEntryId } : {}),

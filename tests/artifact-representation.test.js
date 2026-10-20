@@ -106,7 +106,7 @@ test('state edit hydration preserves BOM and exact ranges reject every invalid b
   const f = await fixture(new InMemoryArtifactRepository());
   const requestRef = await f.artifacts.storeProtected({ label: 'request', content: Buffer.from('{}') });
   const cut = await f.history.capture();
-  const batch = { branchId: cut.branchId, capturedHistoryCut: cut,
+  const batch = { owner: { kind: 'session', sessionId: cut.sessionId, branchId: cut.branchId }, branchId: cut.branchId, capturedHistoryCut: cut,
     inference: { ownerId: 'fixture', invocationId: 'fixture', requestRef } };
   const initial = '\uFEFFمرحبا🙂';
   const ref = (await f.context.saveSessionState({ ...batch, idempotencyKey: 'initial', operations: [{ kind: 'create', text: initial }] })).revisions[0];

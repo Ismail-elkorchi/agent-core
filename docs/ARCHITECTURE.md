@@ -20,7 +20,7 @@ Original user contributions retain their authorship. Applications decide which c
 
 Application state has application-defined meaning and immutable revision identity. Core does not prescribe fields for coding plans, editorial briefs, research findings, or completion criteria.
 
-Session branches own addressable narrative items with immutable per-item revisions, protected content references and recorded inference attribution. Conditional batches save independently of model requests; disjoint item writes do not conflict. An admitted context view selects exact revisions and optional byte ranges, not all current heads. Explicit combined save-and-activate publishes both or neither after admission. Forks inherit the selected historical branch state. Storage, bounded retrieval and compiled request fit are independent limits. State cannot grant permission, alter accepted requirements or certify a check result. See [the context guide](CONTEXT.md) for the concrete APIs.
+Addressable narrative items have a canonical owner: a session branch or an explicitly host-granted durable scope. Both use the same immutable revision and conditional mutation rules, protected content references and recorded inference attribution. The producing inference and its captured history boundary remain distinct from the target owner. Conditional batches save independently of model requests; disjoint item writes do not conflict. An admitted context view selects exact revisions and optional byte ranges, not all current heads. Session-local combined save-and-activate publishes both or neither after admission. Shared-scope saves commit independently; a later view selects their returned revisions. Mixed-owner atomic batches and shared-scope combined activation are rejected. Forks inherit historical branch state. Storage, bounded retrieval and compiled request fit are independent limits. Material cannot grant permission, alter accepted requirements or certify a check result. See [the context guide](CONTEXT.md) for the concrete APIs.
 
 Provider context state contains versioned continuation or reasoning material. Its adapter declares endpoint/model/protocol-revision compatibility and replay rules. Signed or opaque protocol state is distinct from display reasoning summaries and is not exposed through public history tools. A model switch must preserve only compatible state or explicitly reset that continuity.
 
@@ -41,6 +41,45 @@ Applications sequence verification, acceptance and publication through the share
 Execution resources have an explicitly granted lifetime owner independent of their originating call. A resource may span runs; adapters implement acquisition, control and release without changing its causal identity. Commands and filesystem resources are optional integrations.
 
 Selected original sources, tool model content, and optional session-state revisions are admitted context choices. Core preserves selected images or explicitly rejects a modality or resource-limit mismatch; it does not remove older attachments during assembly. Fresh transitions preserve portable original history and protected artifacts, require an explicit `fresh_request` reset capability at a safe protocol boundary, and replace the live provider session without carrying old response identifiers or opaque continuation state into the new window. Selected-view changes can append exact attributed replacement notices to a frozen checkpoint without resetting compatible native reasoning or tool continuation. Stored item heads are distinct from exact active references and older superseded projections within that continuation. Effective view no-ops publish no window or notice; explicit renewal overrides no-op classification. Applications propose evidence and renewal intent, while Core owns prefix validation and reset identity. Pressure checkpoints append runtime control to the unchanged prefix and tool catalog; execution gates restrict checkpoint tools. Accepted input arriving during publication is reassembled and readmitted before dispatch.
+
+## Scoped material and reusable methods
+
+Subject identity and audience are separate. Material about a person, relationship,
+activity or environment is visible only through explicit host grants. Matching names
+never merge subjects or grant access. Bounded discovery authorizes identifiers,
+previews and cursors as well as bodies. Literal or semantic retrieval can suggest
+useful references; it does not publish an active view or establish their truth.
+Accepted inputs and outstanding execution obligations are independent of optional
+recall. Late recall cannot cross a newer correction or permission boundary.
+
+Inventory removal hides a live head. Deselection changes the active view.
+Supersession records a changed interpretation. Revocation withdraws future use,
+including material retained inside a native prefix. These operations do not promise
+physical deletion. An optional erasure capability reports its actual local coverage,
+retained shared bytes and unsupported storage; prior remote deliveries and separately
+governed history are explicit limitations. Declared derivation can propagate
+revocation, but cannot prove complete semantic unlearning.
+
+Skill packages are immutable reusable instructions and resource inventories. Their
+metadata can be discovered without loading every body. Selection binds an exact
+package revision; scripts are never run by discovery or reading. Resource execution
+uses the existing authorized tool or command capability. Package permission metadata
+cannot enlarge host authority. Repository-scoped guidance retains its different
+applicability and is not replaced merely because a skill has similar prose.
+
+## Accepted future work
+
+An intention records future work the host has actually accepted, including its
+original authorization and current condition. A host event or clock adapter admits
+a wake through the ordinary session queue. Durable trigger identities make retries
+return the same admission receipt, including after restart or a lost acknowledgment.
+A wake carries its own origin; it is not a fabricated user correction or permission
+to resume suspended work. Host recovery must rediscover eligible unacknowledged
+intentions. An in-memory timer alone does not supply that guarantee.
+
+Admission idempotency does not make arbitrary external effects exactly once.
+Cancellation, current authorization, budget ownership and uncertain outcomes retain
+their ordinary execution contracts. No new agent loop or executor is introduced.
 
 ## Breaking formats and release evidence
 

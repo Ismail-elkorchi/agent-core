@@ -333,7 +333,7 @@ async function seedSelectedState(f, text, id) {
       assert.deepEqual(batch.inference, { ownerId: 'owner', invocationId: id, requestRef });
       assert.deepEqual(batch.capturedHistoryCut, cut);
     }, policy: { maxSourceBytes: 100000, historyRead: { history: f.history, isAvailable: () => true } } });
-  const staged = await context.stageSessionState({ idempotencyKey: id, branchId: cut.branchId, capturedHistoryCut: cut,
+  const staged = await context.stageSessionState({ idempotencyKey: id, owner: { kind: 'session', sessionId: cut.sessionId, branchId: cut.branchId }, branchId: cut.branchId, capturedHistoryCut: cut,
     inference: { ownerId: 'owner', invocationId: id, requestRef }, operations: [{ kind: 'create', text }] });
   const refs = staged.revisions.map(({ itemId, revisionId }) => ({ itemId, revisionId }));
   const update = await context.transition({ expectedWindowId: (await context.history.selectedContext(cut))?.windowId ?? null,

@@ -40,3 +40,5 @@ export { inputRpcMethods, type InputRpcOperations } from './input-methods.js';
 export { recoveryRpcMethods, type RecoveryRpcOperations } from './recovery-methods.js';
 
 export { collaborationRpcMethods, type CollaborationRpcOperations } from './collaboration-methods.js';
+
+export { materialRpcMethods, type MaterialRpcOperations } from './material-methods.js';

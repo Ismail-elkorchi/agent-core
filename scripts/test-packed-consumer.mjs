@@ -114,6 +114,14 @@ try {
   }
   await exec(process.execPath, ['collaboration-consumer.mjs'], { cwd: consumer });
 
+  // Skills remain data-only through installed public exports, without an implicit executor.
+  for (const name of ['skills-consumer.mjs', 'skills-consumer.ts']) {
+    const source = await readFile(path.join(root, 'tests', 'fixtures', name), 'utf8');
+    assertNoDistImports(source, name);
+    await writeFile(path.join(consumer, name), source);
+  }
+  await exec(process.execPath, ['skills-consumer.mjs'], { cwd: consumer });
+
   // Exercise the packed worker URL, WASM dependency, and explicit Node adapter exports.
   await writeFile(path.join(consumer, 'optional-tools.mjs'), String.raw`
 import assert from 'node:assert/strict';
@@ -236,13 +244,15 @@ void [result, configurationRevision, recursive, reference, catalog, http, stdio,
       "import * as nodePersistence from '@agent-core/persistence/node';",
       "if (!runtime.decodeAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.AgentSession || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !effects.decodeExternalEffectIntent || !persistence.InMemoryEventRepository || !nodePersistence.JsonlEventRepository || !tools.planToolCall || !tools.invokeToolCallPlan || !tools.isCommandExecution || !tools.createReadArtifactTool || local.readArtifactTool !== undefined || !runtime.resolveEffectiveToolCatalog || !runtime.SessionProviderBinding || !local.LocalCommandExecution) throw new Error('public runtime exports missing');",
       "if (!runtime.HistoryReader || !runtime.ContextService || !runtime.InferenceService || !runtime.InMemoryInferenceRepository || !nodeRuntime.JsonlInferenceRepository || !runtime.createHistoryTools || typeof runtime.ContextService.prototype.toolDefinitions !== 'function' || !runtime.EffectExecutor || !runtime.createObservationAccess || !tools.commandExecutionResources || !tools.contextRequiredObservation || !model.accountModelRequest || !model.compileModelRequest) throw new Error('persistent context exports missing');",
-      "for (const name of ['decodeSessionStateContent', 'sessionStateContentSchema', 'sessionStateBlockSchema', 'sessionStateRevisionSchema', 'sessionStateView', 'sessionStateTextRange', 'applySessionStateEdits', 'sessionStateBatchStorageBytes', 'sessionStateRevisionIdentity', 'sessionStateItemIdentity', 'plannedSessionStateRefs', 'validateSessionStateCommit', 'contextControlRole', 'captureInferenceCapabilities', 'captureContextCapabilities', 'sessionStatePageSchema', 'SESSION_STATE_RETRIEVAL_LIMITS']) if (name in runtime) throw new Error('Retired state export remains: ' + name);",
+      "for (const name of ['decodeSessionStateContent', 'sessionStateContentSchema', 'sessionStateBlockSchema', 'sessionStateRevisionSchema', 'sessionStateView', 'sessionStateTextRange', 'applySessionStateEdits', 'sessionStateBatchStorageBytes', 'sessionStateRevisionIdentity', 'sessionStateItemIdentity', 'plannedSessionStateRefs', 'validateSessionStateCommit', 'contextControlRole', 'captureInferenceCapabilities', 'captureContextCapabilities', 'SESSION_STATE_RETRIEVAL_LIMITS']) if (name in runtime) throw new Error('Retired state export remains: ' + name);",
       "if ('recordAdmittedCapabilities' in runtime.InferenceService.prototype || 'recordAdmittedCapabilities' in runtime.ContextService.prototype) throw new Error('Internal capability capture leaked through public classes');",
       "const content = runtime.sessionStateItemContentSchema.parse({ text: 'Answer the question 文😀' });",
       "if (!Object.isFrozen(content) || runtime.sessionStateItemContentSchema.safeParse({ blocks: [] }).success || runtime.sessionStateItemContentSchema.safeParse({ text: 'No identity', id: 'caller-owned' }).success || runtime.sessionStateItemRefSchema.safeParse({ itemId: 'item' }).success) throw new Error('item-state schema boundary failed');",
+      // The canonical bounded page input is deliberately public: the RPC package consumes it.
+      "if (!runtime.sessionStatePageSchema.safeParse({ limit: 1, maxBytes: 512 }).success || runtime.sessionStatePageSchema.safeParse({ maxBytes: 511 }).success) throw new Error('bounded page public contract failed');",
       "const sessions = new runtime.InMemorySessionRepository(); const session = await sessions.create({ binding: { schemaId: 'packed/session-state', schemaVersion: 1, subject: {} } }); const artifacts = new persistence.InMemoryArtifactRepository(); const history = new runtime.HistoryReader({ repository: sessions, session, artifacts }); const context = new runtime.ContextService({ repository: sessions, session, artifacts, history, assertStateWrite: async () => {}, policy: { maxSourceBytes: 8192, historyRead: { history, isAvailable: () => true } } });",
       "if ('currentSessionState' in sessions || (await context.sessionState()).id !== null || (await context.sessionState()).items.length) throw new Error('empty selected view boundary failed');",
-      "const requestRef = await artifacts.storeProtected({ label: 'packed-inference', content: new TextEncoder().encode('{}') }); const cut = await history.capture(); const batch = { idempotencyKey: 'packed-save', branchId: cut.branchId, capturedHistoryCut: cut, inference: { ownerId: 'owner', invocationId: 'invocation', requestRef }, operations: [{ kind: 'create', ...content }] }; const receipt = await context.saveSessionState(batch); const ref = receipt.revisions[0];",
+      "const requestRef = await artifacts.storeProtected({ label: 'packed-inference', content: new TextEncoder().encode('{}') }); const cut = await history.capture(); const batch = { owner: { kind: 'session', sessionId: cut.sessionId, branchId: cut.branchId }, idempotencyKey: 'packed-save', branchId: cut.branchId, capturedHistoryCut: cut, inference: { ownerId: 'owner', invocationId: 'invocation', requestRef }, operations: [{ kind: 'create', ...content }] }; const receipt = await context.saveSessionState(batch); const ref = receipt.revisions[0];",
       "if (!ref.itemId || !ref.revisionId || (await context.sessionState()).id !== null || (await context.listSessionState({ limit: 1 })).items[0].itemId !== ref.itemId || (await context.readSessionState(ref)).text !== content.text || (await context.searchSessionState({ query: 'Answer', limit: 1 })).matches[0].revisionId !== ref.revisionId) throw new Error('independent save/list/read/search failed');",
       "if ((await context.saveSessionState(batch)).entryId !== receipt.entryId) throw new Error('durable save retry changed identity');",
       "const selected = { ...ref, range: { offset: 0, bytes: 6 } }; await context.transition({ expectedWindowId: null, idempotencyKey: 'packed-view', reason: 'Select exact saved span', renewal: true, selection: { retained: [], sessionState: [selected] } }, { admit: async input => ({ compiledInputIdentity: 'packed-input', capabilityRevision: 'packed', selection: { ...input.selection, continuity: { kind: 'fresh', resetId: 'packed-reset', historyPosition: input.cut, model: { provider: 'packed', model: 'packed' }, sources: input.selection.retained } } }) });",
@@ -343,7 +353,7 @@ void [result, configurationRevision, recursive, reference, catalog, http, stdio,
       "const selection: ContextSelection = { retained: [source], sessionState: [ref] };",
       "declare const cut: HistorySourceCut; declare const inference: SessionStateInference; declare const context: ContextService;",
       "const operations: readonly SessionStateOperation[] = [{ kind: 'create', ...interpretation }, { kind: 'replace', itemId: ref.itemId, expectedRevisionId: ref.revisionId, text: 'Correction' }, { kind: 'edit', itemId: ref.itemId, expectedRevisionId: ref.revisionId, edits: [{ offset: 0, bytes: 6, text: 'Revised' }] }, { kind: 'remove', itemId: ref.itemId, expectedRevisionId: ref.revisionId }];",
-      "const batch: SessionStateBatch = { idempotencyKey: 'save', branchId: cut.branchId, capturedHistoryCut: cut, inference, operations };",
+      "const batch: SessionStateBatch = { owner: { kind: 'session', sessionId: cut.sessionId, branchId: cut.branchId }, idempotencyKey: 'save', branchId: cut.branchId, capturedHistoryCut: cut, inference, operations };",
       "const saved: Promise<SessionStateBatchReceipt> = context.saveSessionState(batch);",
       "const listed: Promise<SessionStatePage> = context.listSessionState({ limit: 1, maxBytes: 1024 });",
       "const read: Promise<SessionStateSelectedItem | undefined> = context.readSessionState(ref);",
@@ -414,7 +424,7 @@ void [result, configurationRevision, recursive, reference, catalog, http, stdio,
     const config = `tsconfig-${String(exactOptionalPropertyTypes)}.json`;
     await writeFile(
       path.join(consumer, config),
-      `${JSON.stringify({ compilerOptions: { target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext', types: ['node'], strict: true, skipLibCheck: false, exactOptionalPropertyTypes, noEmit: true }, files: ['consumer.ts', 'optional-tools.ts', 'collaboration-consumer.ts'] }, null, 2)}\n`
+      `${JSON.stringify({ compilerOptions: { target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext', types: ['node'], strict: true, skipLibCheck: false, exactOptionalPropertyTypes, noEmit: true }, files: ['consumer.ts', 'optional-tools.ts', 'collaboration-consumer.ts', 'skills-consumer.ts'] }, null, 2)}\n`
     );
     await exec(process.execPath, [tscCli, '-p', config, '--pretty', 'false'], {
       cwd: consumer,

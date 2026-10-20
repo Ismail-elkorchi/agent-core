@@ -88,7 +88,7 @@ export function updateContext(
       const retained = previous.some((source) => sameSource(source, message.source))
         ? previous.filter((source) => !sameSource(source, message.source))
         : [...previous, message.source];
-      return { state: { ...state, selection: { retained } } };
+      return { state: { ...state, selection: { ...state.selection, retained } } };
     }
     case 'context.scroll':
       return { state: { ...state, offset: message.offset } };
@@ -262,6 +262,14 @@ export function contextView(
                     : { onPress: (): Message => ({ type: 'context.page', source: 'history' }) })
                 })
               ]
+            : []),
+          ...(state.selection?.materials?.length
+            ? [text({ content: `Scoped material · ${String(state.selection.materials.length)} exact revisions selected` }),
+                ...state.selection.materials.map(ref => text({ content: `${JSON.stringify(ref.owner)} · ${ref.itemId} @ ${ref.revisionId}${ref.range ? ` · bytes ${String(ref.range.offset)}–${String(ref.range.offset + ref.range.bytes)}` : ''}` }))]
+            : []),
+          ...(state.selection?.skills?.length
+            ? [text({ content: `Reusable skills · ${String(state.selection.skills.length)} exact package revisions selected` }),
+                ...state.selection.skills.map(ref => text({ content: `${ref.scopeId}/${ref.packageId} @ ${ref.revision} · grant ${ref.bindingRevision}` }))]
             : []),
           ...(state.inspection?.sessionState
             ? [

@@ -47,7 +47,7 @@ export function exportToolJsonSchema(schema: z.ZodType, normalizeDefaults: boole
   const owned = contracts.get(schema);
   if (owned) return { ...owned };
   const external = new Map<string, JsonObject>();
-  const result = { ...z.toJSONSchema(schema, { io: 'output', override(context) {
+  const result = { ...z.toJSONSchema(schema, { io: 'output', reused: 'ref', override(context) {
     const contract = contracts.get(context.zodSchema);
     if (!contract) return;
     const name = `external_${hashJson(contract)}`;
@@ -98,23 +98,40 @@ function rewriteReferences(schema: JsonObject, prefix: string): JsonObject {
 function schemaChild(value: JsonValue, prefix: string): JsonValue {
   return object(value) ? rewriteReferences(value, prefix) : value;
 }
-function normalizeJsonSchema(value: unknown): unknown {
+function normalizeJsonSchema(value: unknown, root: unknown = value): unknown {
   if (!object(value)) return value;
   const normalized = Object.fromEntries(Object.entries(value).map(([key, item]) => {
     if (maps.has(key) && object(item))
-      return [key, Object.fromEntries(Object.entries(item).map(([name, child]) => [name, normalizeJsonSchema(child)]))];
-    if (children.has(key)) return [key, normalizeJsonSchema(item)];
-    if (alternatives.has(key) && Array.isArray(item)) return [key, item.map(normalizeJsonSchema)];
+      return [key, Object.fromEntries(Object.entries(item).map(([name, child]) => [name, normalizeJsonSchema(child, root)]))];
+    if (children.has(key)) return [key, normalizeJsonSchema(item, root)];
+    if (alternatives.has(key) && Array.isArray(item)) return [key, item.map(child => normalizeJsonSchema(child, root))];
     return [key, item];
   }));
   const properties = normalized.properties;
   if (object(properties) && Array.isArray(normalized.required)) {
     const required = normalized.required.filter((item): item is string => typeof item === 'string' &&
-      !(object(properties[item]) && Object.hasOwn(properties[item], 'default')));
+      !schemaHasDefault(properties[item], root));
     if (required.length > 0) normalized.required = required;
     else delete normalized.required;
   }
   return normalized;
+}
+/** Resolve only schema references; defaults and examples remain untouched literal JSON. */
+function schemaHasDefault(value: unknown, root: unknown): boolean {
+  const visited = new Set<string>();
+  while (object(value)) {
+    if (Object.hasOwn(value, 'default')) return true;
+    const ref = value.$ref;
+    if (typeof ref !== 'string' || !ref.startsWith('#/') || visited.has(ref)) return false;
+    visited.add(ref);
+    let resolved: unknown = root;
+    for (const part of ref.slice(2).split('/')) {
+      if (!object(resolved)) return false;
+      resolved = resolved[part.replaceAll('~1', '/').replaceAll('~0', '~')];
+    }
+    value = resolved;
+  }
+  return false;
 }
 function object(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);

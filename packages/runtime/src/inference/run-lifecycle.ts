@@ -1,5 +1,4 @@
 import type { HistorySourceCut } from '../history/contracts.js';
-import type { EffectLifecycle } from '@agent-core/effects';
 import {
   UNKNOWN_EFFECT_RECOVERY,
   closeExternalEffect,
@@ -54,6 +53,7 @@ import type { NativeSteeringCoordinator } from './native-steering.js';
 import type { ParticipantExecutionBinding } from '../collaboration/contracts.js';
 import {
   InferenceContextRejectedError,
+  type InferenceLifecycle,
   InferenceOutcomeUnknownError,
   type InferenceService
 } from './service.js';
@@ -72,6 +72,7 @@ export type RunInferenceResult =
   | { readonly kind: 'outcome_unknown'; readonly effectId: string };
 export interface RunInferenceInput {
   readonly assertSources?: () => Promise<void>;
+  readonly withDispatchAuthority?: <T>(operation: () => Promise<T>) => Promise<T>;
   readonly capturedHistoryCut?: HistorySourceCut | undefined;
   readonly service: InferenceService;
   readonly steering?: NativeSteeringCoordinator;
@@ -112,7 +113,7 @@ export interface RunInferenceInput {
 export function createRunInferenceLifecycle(
   input: RunInferenceInput & { readonly operation: 'generation' | 'native_generation' }
 ): {
-  readonly lifecycle: EffectLifecycle<RunInferenceResult, ModelResponse>;
+  readonly lifecycle: InferenceLifecycle<RunInferenceResult>;
   readonly onStreamEvent: (
     event: Exclude<ModelStreamEvent, { readonly type: 'done' }>
   ) => Promise<void>;
@@ -165,7 +166,7 @@ export function createRunInferenceLifecycle(
         message: event.message
       });
   };
-  const lifecycle: EffectLifecycle<RunInferenceResult, ModelResponse> = {
+  const lifecycle: InferenceLifecycle<RunInferenceResult> = {
     start: async () => {
       await append({
         type: 'turn.snapshot.created',
@@ -332,6 +333,26 @@ export function createRunInferenceLifecycle(
         identity: Object.freeze(identity)
       });
     },
+    notSent: async (error) => {
+      const pending = providerWork(turnRequest.run.state(), identity);
+      if (pending.stage !== 'effect_pending' || pending.effect.intent.effectId !== effectId) throw error;
+      const diagnostic = { provider: input.options.provider.id, code: 'invalid_request' as const, retryable: false,
+        causeSummary: { message: error.message } };
+      const failed = { type: 'provider.attempt.failed' as const, ...identity, effectId, responseId,
+        inputIdentity: input.compiled.inputIdentity, diagnostic };
+      const receipt = await turnRequest.run.append(failed, providerSettlementKey(effectId, responseId));
+      const settled = settleExternalEffect(pending.effect, pending.effect.settlementPermit, {
+        outcome: 'failed', resultDigest: hashJson(failed), exposure: knownEffectExposure([])
+      });
+      if (settled.status !== 'settled' && settled.status !== 'already_settled')
+        throw new Error('Known not-sent provider attempt could not settle its original effect.');
+      await turnRequest.run.transitionProvider('reconcile_provider_request', identity, () => ({ ...pending,
+        stage: 'failed', effect: settled.state,
+        settlementReference: { runId: turnRequest.runId, eventId: receipt.eventId, sequence: receipt.sequence, hash: receipt.hash }
+      }));
+      // Preserve the exact admission cause for lawful ordinary preparation retry.
+      throw error;
+    },
     uncertain: async (error) => {
       const pending = providerWork(turnRequest.run.state(), identity);
       if (pending.stage !== 'effect_pending' || pending.effect.intent.effectId !== effectId)
@@ -466,6 +487,7 @@ export async function invokeRunInference(input: RunInferenceInput): Promise<RunI
   const governed = createRunInferenceLifecycle({ ...input, operation: 'generation' });
   return input.service.invokeWithLifecycle(
     {
+      ...(input.withDispatchAuthority ? { withDispatchAuthority: input.withDispatchAuthority } : {}),
       stateSelectionId: input.requestFingerprint.stateSelectionId,
       capturedHistoryCut: input.capturedHistoryCut,
       request: input.request,

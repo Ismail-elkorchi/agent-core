@@ -1,3 +1,4 @@
+import { collectOptionalContext, contextRecallNotice, type AgentContextProvider, type AgentContextPolicy } from './context/recall.js';
 import { parseSessionSubmissionOrigin } from './session/submission-origin.js';
 import { parseNativeToolExposure, type NativeToolExposure } from './orchestration/native-tool-exposure.js';
 import { toolInvocationCaller } from './run/control/tool-state.js';
@@ -13,7 +14,7 @@ import { resolveEffectiveToolCatalog, resolveToolHostEligibility, type Effective
 import { NativeContextIncompatibilityError } from './orchestration/model-change.js';
 import { parseContextControlPolicy, parseOutputReservationPolicy, resolveOutputReservation, contextControlRole, type ContextControlPolicy, type OutputReservationPolicy, assembleContextControlRequest, contextControlReserve, contextControlPreview, contextControlSteering } from './context/recovery.js';
 import { resolveToolModelContent } from './orchestration/observation-source.js';
-import { NativeContextTransitionRequired } from './inference/input.js';
+import { NativeContextTransitionRequired, type RequestPresentation } from './inference/input.js';
 import type { SessionStateSnapshot } from './session/session-state.js';
 import { providerSettlementKey } from './inference/run-lifecycle.js';
 import { ContextSourceCapacityError, ContextContinuityError, type ContextAdmissionConflict } from './run/context-admission.js';
@@ -191,15 +192,7 @@ export interface AgentInstruction {
   readonly priority?: number;
 }
 
-export interface AgentContextRequest {
-  readonly task: string;
-  readonly turnIndex: number;
-  readonly instructions: readonly AgentEffectiveInstruction[];
-}
-
-export type AgentContextProvider = (
-  request: AgentContextRequest
-) => readonly PromptContextItemInput[] | Promise<readonly PromptContextItemInput[]>;
+export type { AgentContextRequest, AgentContextProvider, AgentContextResult, AgentContextPolicy, AgentContextBoundary } from './context/recall.js';
 
 export interface AgentRuntimeOptions {
   readonly provider: ModelProvider;
@@ -231,6 +224,7 @@ export interface AgentRuntimeOptions {
     | (() => readonly AgentInstruction[] | Promise<readonly AgentInstruction[]>);
   readonly contextItems?: readonly PromptContextItemInput[];
   readonly contextProvider?: AgentContextProvider;
+  readonly contextProviderPolicy?: Partial<AgentContextPolicy>;
   readonly context?: ContextService;
   readonly contextControlPolicy?: Partial<ContextControlPolicy>;
   readonly outputReservationPolicy?: OutputReservationPolicy;
@@ -300,6 +294,8 @@ interface TurnSnapshot {
   readonly instructions: readonly AgentEffectiveInstruction[];
 }
 
+class ContextPreparationChanged extends Error {}
+
 interface ResolvedContextInputs {
   readonly configured: readonly PromptContextItemInput[];
   readonly provider: readonly PromptContextItemInput[];
@@ -334,6 +330,7 @@ type AssistantTurnResult =
   | { readonly kind: 'decision'; readonly decision: ExecutionDecision }
   | { readonly kind: 'outcome_unknown'; readonly effectId: string };
 interface RequestAssemblyResult {
+  readonly contextBoundaryRevision?: number;
   readonly capturedHistoryCut?: import('./history/contracts.js').HistorySourceCut;
   readonly sourceAccess?: CapturedHistorySourceAccess | undefined;
   readonly freshContext?: boolean;
@@ -1863,6 +1860,7 @@ export class AgentRuntime {
         if (assistant.kind === 'settled') {
           const admitted = assistant.turn;
           snapshot = admitted.snapshot;
+          for (const instruction of snapshot.instructions) if (instruction.provenance === 'steering' && !effectiveInstructions.some(value => value.id === instruction.id)) effectiveInstructions.push(instruction);
           toolBatchId = admitted.toolBatchId;
           activeTurnIdentity = turnIdentity(snapshot.record);
           turnIndex = snapshot.record.turnIndex;
@@ -2958,6 +2956,10 @@ export class AgentRuntime {
           assembly = prepared.assembly;
           if (request.snapshot.record.contextRecovery) recoveryAssembly = assembly;
         }
+        if (assembly.contextBoundaryRevision !== undefined && assembly.contextBoundaryRevision !== this.contextBoundaryRevision) {
+          request = await this.applyPreparingSteering(request);
+          continue;
+        }
         if (assembly.freshContext && request.replaceModelSession) {
           request = { ...request, modelSession: await request.replaceModelSession() };
         }
@@ -2973,6 +2975,7 @@ export class AgentRuntime {
         const protocol = request.snapshot.profile.capabilities.protocol;
         if (
           !request.snapshot.record.contextRecovery && request.modelSession.continueNative &&
+          !this.requestHasRevocableMaterial(assembly.compiled) &&
           (protocol?.asyncTools || protocol?.steering === 'native')
         ) {
           return await this.requestNativeTurns(
@@ -2982,6 +2985,9 @@ export class AgentRuntime {
             nativeWork.observationStore
           );
         }
+        // This ordinary launch preserves the complete compiled prefix. Steering is
+        // applied at the next request boundary because native transport cannot hold its source guard.
+        if (this.requestHasRevocableMaterial(assembly.compiled)) this.nativeSteering?.bind(request.modelSession, false);
         const ledgerModelRequest = { ...assembly.request };
         delete ledgerModelRequest.signal;
         await append({ type: 'assistant.started', ...identity });
@@ -2991,6 +2997,11 @@ export class AgentRuntime {
         try { completedAttempt = await invokeRunInference({
           service: this.inferenceService,
           assertSources: () => this.assertHistorySourceAccess(assembly.sourceAccess),
+          withDispatchAuthority: operation => this.withRequestMaterial(assembly.compiled, () => {
+            if (assembly.contextBoundaryRevision !== undefined && assembly.contextBoundaryRevision !== this.contextBoundaryRevision)
+              throw new ContextPreparationChanged('A newer accepted instruction invalidated the request before dispatch.');
+            return operation();
+          }),
           ...(assembly.capturedHistoryCut ? { capturedHistoryCut: assembly.capturedHistoryCut } : {}),
           ...(this.nativeSteering ? { steering: this.nativeSteering } : {}),
           options: this.options,
@@ -3003,7 +3014,22 @@ export class AgentRuntime {
           append,
           emit: snapshotRecoveryEmitter(request.snapshot, emit),
           advanceRun: (driver, procedure, advance) => this.advanceRun(driver, procedure, advance)
-        }); } finally { await recoverySession?.close?.(); }
+        }); } catch (cause) {
+          if (!(cause instanceof InferenceNotSentError) || !(cause.cause instanceof ContextPreparationChanged)) throw cause;
+          const phase = providerWork(request.run.state(), identity);
+          if (phase.stage !== 'failed') throw cause;
+          request = await this.applyPreparingSteering(request);
+          const snapshot = { ...request.snapshot, record: { ...request.snapshot.record, requestAttempt: request.snapshot.record.requestAttempt + 1 } };
+          request = { ...request, snapshot };
+          recoveryAssembly = undefined;
+          await this.advanceRun(request.run, 'consume_provider_settlement', {
+            phase: { kind: 'active' },
+            providerRequests: [...request.run.state().providerRequests.map(previous =>
+              sameTurnIdentity(previous.identity, phase.identity) ? { ...phase, stage: 'consumed' as const } : previous),
+              { kind: 'provider', stage: 'ready', identity: turnIdentity(snapshot.record), toolBatchId: request.toolBatchId }]
+          });
+          continue;
+        } finally { await recoverySession?.close?.(); }
         if (completedAttempt.kind === 'outcome_unknown') return completedAttempt;
         if (completedAttempt.kind === 'failed') {
           const capacityFailure = completedAttempt.diagnostic.code === 'context_overflow';
@@ -3231,6 +3257,15 @@ export class AgentRuntime {
     }
   }
 
+  private async applyPreparingSteering(request: AssistantTurnRequest): Promise<AssistantTurnRequest> {
+    if (!this.steerQueue.some(item => item.runId === request.runId)) return request;
+    const steering = await this.consumeSteeringInstructions(request.runId);
+    const delivered = steeringInstructions(steering, request.snapshot.instructions.length);
+    for (const instruction of delivered) request.modelWindow.recordInput(instruction.id, { role: 'user', content: instruction.content }, request.turnIndex);
+    const instructions = Object.freeze([...request.snapshot.instructions, ...delivered]);
+    return { ...request, snapshot: { ...request.snapshot, instructions, record: { ...request.snapshot.record, instructions } } };
+  }
+
   /** Pre-dispatch preparation has no provider effect to settle or replay. */
   private async prepareModelRequest(
     request: AssistantTurnRequest,
@@ -3239,6 +3274,7 @@ export class AgentRuntime {
     rejected?: CompiledModelRequest
   ): Promise<{ request: AssistantTurnRequest; assembly: RequestAssemblyResult }> {
     for (let retries = 0; ; retries++) {
+      request = await this.applyPreparingSteering(request);
       this.preserveRecoveryFailure(undefined, request);
       request.controller.assertElapsed();
       const tail = await this.options.repositories.events.tail(request.runId, { metadataOnly: true });
@@ -3258,6 +3294,10 @@ export class AgentRuntime {
           return await this.assembleContextRecovery(request, error, append);
         }
       } catch (error) {
+        if (error instanceof ContextPreparationChanged) {
+          request = await this.applyPreparingSteering(request);
+          continue;
+        }
         this.preserveRecoveryFailure(error, request);
         const diagnostic = providerFailureDiagnostic(error);
         if (!diagnostic?.retryable) throw error;
@@ -3427,7 +3467,8 @@ export class AgentRuntime {
         throw new ContextContinuityError('unsupported', 'The exact admitted native tool definitions are unavailable or ambiguous for recovery.');
       recoveryTools = matched;
       recoveryOriginal = await this.requestAdmission.compile({ ...accepted.request, messages, signal: ordinary.signal },
-        ordinary.snapshot.profile, accepted.outputReservation, accepted.presentation);
+        ordinary.snapshot.profile, accepted.outputReservation, continuation.materialDependencies
+          ? { ...accepted.presentation, materialDependencies: continuation.materialDependencies } : accepted.presentation);
     }
     const originalConflict = requestCapacityConflict(failure, this.outputReservationPolicy);
     const inspection = await context.inspect(cut, { limit: this.contextControlPolicy.inventoryItems, maxBytes: this.contextControlPolicy.inventoryBytes });
@@ -3625,11 +3666,20 @@ export class AgentRuntime {
       if (!(error instanceof ContextSourceCapacityError)) throw error;
       sourceConflict = error;
     }
+    const prefix = request.modelWindow.continuation();
+    if (prefix?.input.presentation.materialDependencies?.some(value => value.ref.owner.kind === 'session') && this.options.context) {
+      const current = await this.options.context.materials.currentSessionOwner();
+      const dependencies = prefix.materialDependencies ?? prefix.input.presentation.materialDependencies;
+      if (dependencies.some(value => value.ref.owner.kind === 'session' && value.ref.owner.branchId !== current.branchId))
+        request.modelWindow.bindContinuationMaterialAuthority(await this.options.context.materials.captureInheritedPrefixDependencies(dependencies));
+    }
+    const preparationRevision = this.contextBoundaryRevision;
     const collectedContext = await this.collectContextItems(
       request.input,
       request.turnIndex,
-      request.snapshot.instructions
+      request.snapshot.instructions, request
     );
+    if (preparationRevision !== this.contextBoundaryRevision) throw new ContextPreparationChanged('Accepted steering changed the optional recall boundary.');
     const programReceipts = await programCompletionContext(request.runId, this.options.repositories.events, this.options.repositories.artifacts);
     const contextInputs = { ...collectedContext, run: [ ...collectedContext.run, ...programReceipts.items ] };
     const capturedContext = [
@@ -3642,7 +3692,8 @@ export class AgentRuntime {
       window: ModelWindow,
       sessionState: SessionStateSnapshot,
       artifacts: readonly PromptContextItemInput[] = [],
-      proposedOutputReservation?: number
+      proposedOutputReservation?: number,
+      use?: Pick<RequestPresentation, 'materialDependencies' | 'skillReferences'>
     ) => {
       const outputReservation = this.validateOutputReservation(proposedOutputReservation ?? await this.selectedOutputReservation());
       const result = await this.requestAdmission.assemble(
@@ -3667,6 +3718,8 @@ export class AgentRuntime {
               }))
           }),
           contextItems: [...capturedContext, ...sessionStateContext(sessionState), ...artifacts],
+          ...(use?.materialDependencies ? { materialDependencies: use.materialDependencies } : {}),
+          ...(use?.skillReferences ? { skillReferences: use.skillReferences } : {}),
           ...(capacityNotice ? { capacityNotice } : {}),
           tools: promptToolSpecs(
             [...request.snapshot.tools],
@@ -3695,6 +3748,7 @@ export class AgentRuntime {
         },
         outputReservation
       );
+      await this.assertRequestMaterial(result.compiled);
       return { ...result, stateSelectionId: sessionState.id };
     };
     const contextPublication = { committed: false, fresh: false, candidateAdmitted: false };
@@ -3712,7 +3766,7 @@ export class AgentRuntime {
       let renewal;
       try {
         proposed = await this.contextWindowForAdmission(input, request);
-        result = await assemble(proposed.window, input.sessionState, input.artifacts, input.outputReservation);
+        result = await assemble(proposed.window, input.sessionState, input.artifacts, input.outputReservation, input);
         await admitOrdinary(result.compiled);
       } catch (error) {
         if (input.strategy !== 'append' ||
@@ -3723,7 +3777,7 @@ export class AgentRuntime {
         proposed = await this.contextWindowForAdmission({ ...input, strategy: 'fresh' }, request);
         renewal = { selection: proposed.selection,
           cause: error instanceof ContextAdmissionError ? 'capacity' as const : 'prefix_incompatibility' as const };
-        result = await assemble(proposed.window, input.sessionState, input.artifacts, input.outputReservation);
+        result = await assemble(proposed.window, input.sessionState, input.artifacts, input.outputReservation, input);
         await admitOrdinary(result.compiled);
       }
       if (result.compiled.inputIdentity === rejected?.inputIdentity)
@@ -3822,9 +3876,12 @@ export class AgentRuntime {
     const sessionState = (await this.options.context?.sessionState(cut)) ?? {
       id: null, items: []
     };
+    const optionalMaterial = await this.options.context?.selectedMaterialContext(cut, request.signal);
+    const selectedArtifacts = await this.options.context?.selectedArtifactContext(cut) ?? [];
+    const selectedReferenceItems = [...selectedArtifacts, ...(optionalMaterial?.items ?? [])];
     let result: Awaited<ReturnType<typeof assemble>>;
     try {
-      result = await assemble(request.modelWindow, sessionState, await this.options.context?.selectedArtifactContext(cut) ?? []);
+      result = await assemble(request.modelWindow, sessionState, selectedReferenceItems, undefined, optionalMaterial);
     } catch (error) {
       if (!(error instanceof NativeContextTransitionRequired)) throw error;
       await this.scheduleModelCompatibilityTransition(request.runId);
@@ -3867,7 +3924,7 @@ export class AgentRuntime {
           capacityNotice = feedback.notice;
           const withFeedback = await assemble(
             request.modelWindow,
-            await this.options.context.sessionState()
+            await this.options.context.sessionState(), selectedReferenceItems, undefined, optionalMaterial
           );
           await admitOrdinary(withFeedback.compiled);
           result = withFeedback;
@@ -3939,7 +3996,7 @@ export class AgentRuntime {
       outputReservation: compiled.accounting.outputReservation,
       presentation: assembly.presentation
     });
-    return { request: result.request, compiled, estimate, fingerprint, freshContext: contextPublication.fresh,
+    return { request: result.request, compiled, estimate, fingerprint, contextBoundaryRevision: preparationRevision, freshContext: contextPublication.fresh,
       sourceAccess, ...(cut ? { capturedHistoryCut: cut } : {}) };
   }
 
@@ -4884,23 +4941,55 @@ export class AgentRuntime {
         : {})
     };
   }
+  private requestHasRevocableMaterial(compiled: CompiledModelRequest): boolean {
+    const use = this.inferenceService.presentationFor(compiled);
+    return (use?.materialDependencies?.length ?? 0) > 0 || (use?.skillReferences?.length ?? 0) > 0;
+  }
+  private async assertRequestMaterial(compiled: CompiledModelRequest): Promise<void> {
+    const use = this.inferenceService.presentationFor(compiled);
+    if (!use || !this.requestHasRevocableMaterial(compiled)) return;
+    if (!this.options.context) throw new Error('Retained request material no longer has a host context authority.');
+    await this.options.context.assertMaterialUse(use);
+  }
+  private async withRequestMaterial<T>(compiled: CompiledModelRequest, operation: () => Promise<T>): Promise<T> {
+    const use = this.inferenceService.presentationFor(compiled);
+    if (!use || !this.requestHasRevocableMaterial(compiled)) return operation();
+    if (!this.options.context) throw new Error('Retained request material no longer has a host context authority.');
+    return this.options.context.withMaterialUse(use, operation);
+  }
+  private contextBoundaryRevision = 0;
+  private readonly contextCollectionOwner = {};
   private async collectContextItems(
     input: AgentRunInput,
     turnIndex: number,
-    instructions: readonly AgentEffectiveInstruction[]
+    instructions: readonly AgentEffectiveInstruction[],
+    request: AssistantTurnRequest
   ): Promise<ResolvedContextInputs> {
-    const providerItems = this.options.contextProvider
-      ? await this.options.contextProvider({
-          task: input.task,
-          turnIndex,
-          instructions
-        })
-      : [];
-    return Object.freeze({
-      configured: Object.freeze([...(this.options.contextItems ?? [])]),
-      provider: Object.freeze([...providerItems]),
-      run: Object.freeze([...(input.contextItems ?? [])])
-    });
+    const contextRevision = this.contextBoundaryRevision;
+    const cut = await this.options.context?.history.capture();
+    const boundary = Object.freeze({ runId: request.runId, ...turnIdentity(request.snapshot.record), instructionHash: hashJson(instructions), ...(cut ? { historyCut: cut } : {}) });
+    const collection = this.options.contextProvider ? await collectOptionalContext({
+      owner: this.contextCollectionOwner, provider: this.options.contextProvider, request: { task: input.task, turnIndex, instructions, boundary }, signal: request.signal, obsoleteSignal: this.observationController.signal,
+      ...(this.options.contextProviderPolicy ? { policy: this.options.contextProviderPolicy } : {}),
+      isCurrent: async () => contextRevision === this.contextBoundaryRevision && this.activeRunId === request.runId && (!cut || hashJson(await this.options.context?.history.capture()) === hashJson(cut)),
+      validateCandidates: async (candidates, signal) => {
+        signal.throwIfAborted();
+        if (candidates.materials?.length) {
+          if (!this.options.context?.materials) throw new Error('No material scopes are granted.');
+          await this.options.context.materials.captureDependencies(candidates.materials);
+        }
+        if (candidates.skills?.length) {
+          if (!this.options.context?.skills) throw new Error('No skill sources are granted.');
+          await this.options.context.skills.assertAvailable(candidates.skills, signal);
+        }
+      }
+    }) : { result: { items: [] } };
+    const providerItems: PromptContextItemInput[] = [...collection.result.items];
+    const candidates = collection.result.candidates ? contextRecallNotice(collection.result.candidates) : undefined;
+    if (candidates) providerItems.push(candidates);
+    if (collection.diagnostic) providerItems.push({ id: `context-diagnostic:${hashJson(boundary)}`, sourceUri: 'runtime://optional-context-diagnostic', sourceKind: 'generated', representation: 'full', mediaType: 'text/plain', title: 'Optional context unavailable',
+      purpose: 'Bounded retrieval status, not evidence that no relevant retained material exists.', content: `Optional retrieval ${collection.diagnostic}; committed selections and mandatory current input are unchanged.` });
+    return Object.freeze({ configured: Object.freeze([...(this.options.contextItems ?? [])]), provider: Object.freeze(providerItems), run: Object.freeze([...(input.contextItems ?? [])]) });
   }
   private readonly authorizeTool: ToolAuthorizer = request => {
     const tool = this.tools.find(tool => tool.name === request.call.name && tool.implementationId === request.toolImplementationId);
@@ -4989,6 +5078,7 @@ export class AgentRuntime {
     });
     this.steeringReceipts.set(receipt.id, { ...receipt, instruction: input.instruction });
     this.steerQueue.push({ ...receipt, instruction: input.instruction });
+    this.contextBoundaryRevision++;
     this.observationController.abort('Steering accepted; yield the current observation.');
     const steering = this.nativeSteering;
     if (steering)

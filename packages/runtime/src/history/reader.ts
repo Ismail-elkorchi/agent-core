@@ -1594,7 +1594,8 @@ export function sourceRef(sessionId: string, entry: SessionBranchEntry): History
   return source;
 }
 export function historyRole(entry: SessionBranchEntry): HistoryItem['role'] {
-  return historyMetadataRole({ type: entry.type, ...(historyInputAuthorship(entry) ? { inputAuthorship: 'model' } : {}) });
+  const inputAuthorship = historyInputAuthorship(entry);
+  return historyMetadataRole({ type: entry.type, ...(inputAuthorship ? { inputAuthorship } : {}) });
 }
 function historyItem(sessionId: string, entry: SessionBranchEntry, maxBytes: number): HistoryItem {
   const text = publicText(entry);
@@ -1651,6 +1652,7 @@ function publicText(entry: SessionBranchEntry): string {
       });
     case 'branch':
       return JSON.stringify({ fromEntryId: entry.fromEntryId, label: entry.label });
+    case 'session_material_revocation': return JSON.stringify({operationId:entry.operationId,revision:entry.revision});
     case 'session_state_batch':
       return JSON.stringify({idempotencyKey:entry.batch.idempotencyKey,revisions:entry.batch.revisions.map(({itemId,revisionId,deleted,contentBytes}) => ({itemId,revisionId,deleted,contentBytes}))});
     case 'context_transition':
@@ -1663,7 +1665,8 @@ function publicText(entry: SessionBranchEntry): string {
 }
 function matchesMetadata(entry: SessionBranchEntry, filter?: HistoryFilter): boolean {
   const toolName = historyToolName(entry);
-  return matchesHistoryMetadata({ ...entry, ...(historyInputAuthorship(entry) ? { inputAuthorship: 'model' } : {}), ...(toolName ? { toolName } : {}) }, filter);
+  const inputAuthorship = historyInputAuthorship(entry);
+  return matchesHistoryMetadata({ ...entry, ...(inputAuthorship ? { inputAuthorship } : {}), ...(toolName ? { toolName } : {}) }, filter);
 }
 function matches(entry: SessionBranchEntry, filter?: HistoryFilter): boolean {
   if (!matchesMetadata(entry, filter)) return false;

@@ -497,7 +497,7 @@ test('a changed admitted request resumes a definitively rejected provider reques
   const runtime = new AgentRuntime({
     ...state.options,
     provider,
-    contextProvider: () =>
+    contextProvider: () => ({ items:
       extra
         ? [
             {
@@ -511,7 +511,7 @@ test('a changed admitted request resumes a definitively rejected provider reques
               content: extra
             }
           ]
-        : []
+        : [] })
   });
   const suspended = await runtime.run({ task: 'Keep the original work.' }).result;
   assert.equal(suspended.reason, 'context_admission');

@@ -15,7 +15,7 @@ async function fixture(policy = {}) {
     policy: { maxSourceBytes: 65536, historyRead: { history, isAvailable: () => true }, ...policy } });
   const cut = await history.capture();
   const batch = (idempotencyKey, operations, capturedHistoryCut = cut) => ({ idempotencyKey,
-    branchId: capturedHistoryCut.branchId, capturedHistoryCut,
+    owner: { kind: 'session', sessionId: capturedHistoryCut.sessionId, branchId: capturedHistoryCut.branchId }, branchId: capturedHistoryCut.branchId, capturedHistoryCut,
     inference: { ownerId: 'owner', invocationId: 'inference', requestRef }, operations });
   return { repository, session, artifacts, history, context, batch };
 }
@@ -408,6 +408,8 @@ test('state retrieval rejects forged sibling and abandoned branch boundaries bef
   await f.repository.branchFrom(f.session, seed.entryId, 'sibling');
   const authorizedCut = await f.history.capture();
   const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url');
+  const owner = { kind: 'session', sessionId: authorizedCut.sessionId, branchId: authorizedCut.branchId };
+  const boundary = await f.context.materials.captureBoundary(owner);
   let reads = 0;
   const read = f.artifacts.readVerified.bind(f.artifacts);
   const range = f.artifacts.readVerifiedRange.bind(f.artifacts);
@@ -417,12 +419,12 @@ test('state retrieval rejects forged sibling and abandoned branch boundaries bef
     query: 'secret', leafId: secret.entryId });
   await assert.rejects(f.context.searchSessionState({ query: 'secret', cursor: forgedSearch }), /authorized branch|authorized.*cut/);
   await assert.rejects(f.context.listSessionState({ leafId: secret.entryId }), /authorized branch|authorized.*cut/);
-  await assert.rejects(f.context.listSessionState({ cursor: encode({ sessionId: authorizedCut.sessionId,
-    leafId: secret.entryId, after: seed.revisions[0].itemId }) }), /authorized branch|authorized.*cut/);
+  await assert.rejects(f.context.listSessionState({ cursor: encode({ owner, ...boundary, cursor: encode({ sessionId: authorizedCut.sessionId,
+    leafId: secret.entryId, after: seed.revisions[0].itemId, revocationRevision: boundary.revocationRevision }) }) }), /authorized branch|authorized.*cut/);
   await assert.rejects(f.context.readSessionState(secret.revisions[0], abandonedCut), /authorized branch/);
   await assert.rejects(f.context.readSessionState(secret.revisions[0], { ...abandonedCut, branchId: authorizedCut.branchId }), /authorized branch/);
   await assert.rejects(f.context.listSelectedSessionState({ cursor: encode({ cut: { ...abandonedCut,
-    branchId: authorizedCut.branchId }, offset: 0 }) }, authorizedCut), /authorized branch|authorized.*cut/);
+    branchId: authorizedCut.branchId }, boundary, offset: 0 }) }, authorizedCut), /authorized branch|authorized.*cut/);
   assert.equal(reads, 0);
   assert.equal((await f.context.readSessionState(seed.revisions[0])).text, 'shared value');
 });
@@ -480,7 +482,8 @@ test('state retrieval schemas and repository share defaults and advertised bound
   await f.context.saveSessionState(f.batch('bounds', Array.from({ length: 128 }, (_, i) => ({ kind: 'create', text: `${i}: ${'😀'.repeat(80)}` }))));
   const direct = await f.repository.listSessionState(f.session, { limit: 256 });
   const service = await f.context.listSessionState({ limit: 256 });
-  assert.deepEqual(service, direct);
+  assert.deepEqual(service.items, direct.items.slice(0, service.items.length), 'Authority-qualified envelope can fit fewer items within the same complete budget');
+  assert.equal(service.revocationRevision, 0);
   assert.ok(Buffer.byteLength(JSON.stringify(service)) <= 32768);
   for (const name of ['context_state_list', 'context_state_search']) {
     const tool = f.context.toolDefinitions().find(item => item.name === name);

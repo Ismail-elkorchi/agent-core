@@ -462,7 +462,7 @@ test('fresh continuation keeps the current session state separate from selected 
   const requestRef = await f.artifacts.storeProtected({ label: 'original-inference', mediaType: 'application/json', content: new TextEncoder().encode(JSON.stringify({ stateSelectionId: null, logical: { model: 'model', messages: [] } })) });
   const cut = await f.history.capture();
   const sessionState = await f.context.stageSessionState({
-    idempotencyKey: 'current-understanding', branchId: cut.branchId, capturedHistoryCut: cut,
+    idempotencyKey: 'current-understanding', owner: { kind: 'session', sessionId: cut.sessionId, branchId: cut.branchId }, branchId: cut.branchId, capturedHistoryCut: cut,
     operations: [{ kind: 'create', text: 'Keep the original Unicode constraint; understanding does not authorize edits.' }],
     inference: { ownerId: 'owner', invocationId: 'original', requestRef }
   });

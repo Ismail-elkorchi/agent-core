@@ -1,3 +1,5 @@
+import { materialUseDependencySchema } from '../material/contracts.js';
+import { skillSelectionReferencesSchema } from '@agent-core/skills';
 import { parseModelRequest, type ModelRequest } from '@agent-core/model';
 import {
   decodeOwnedArtifactRef,
@@ -17,6 +19,9 @@ const contextPresentationSchema = z.strictObject({
 
 /** Exact current material selection whose placement is fixed by an admitted native prefix. */
 export const requestPresentationSchema = z.strictObject({
+  format: z.literal('agent-core.request-presentation/1'),
+  materialDependencies: z.array(materialUseDependencySchema).max(256).readonly().optional(),
+  skillReferences: skillSelectionReferencesSchema.optional(),
   runtimeControl: z.strictObject({ kind: z.literal('context-recovery'), id: z.string().min(1), revision: z.string().min(1) }).readonly().optional(),
   authority: z.string(),
   context: contextPresentationSchema.extend({ kind: z.literal('host-context') }).readonly(),

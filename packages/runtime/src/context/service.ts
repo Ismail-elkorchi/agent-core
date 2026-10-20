@@ -1,10 +1,14 @@
+import { ScopedMaterialService, type ScopedMaterialServiceOptions } from '../material/service.js';
+import { qualifiedMaterialRefSchema, materialOwnerSchema, type QualifiedMaterialRef, type MaterialOwner, type MaterialUseDependency } from '../material/contracts.js';
+import { SkillCatalog, type SkillReference } from '@agent-core/skills';
+import type { RequestPresentation } from '../inference/input.js';
 import type { ContextAdmittedCapabilities, ContextOperationalInspectionPage, SessionOperationalInspection } from '../session/operational.js';
 export type { ContextOperationalInspectionPage } from '../session/operational.js';
 import * as z from 'zod';
 import { contextToolDefinitions } from './tools.js';
 import { stageSessionStateBatch } from './session-state.js';
 import { HistorySearchIndex } from '../history/search-index.js';
-import { fitStatePage, boundedStateResult, statePageLimits, decodeStatePageCursor } from '../session/state-records.js';
+import { fitStatePage, boundedStateResult, statePageLimits } from '../session/state-records.js';
 import type { PromptContextItemInput } from '../inference/prompt-material.js';
 import { contextSourceManifest, selectedHistoryMetadata, SELECTED_METADATA_LIMITS, SelectedHistoryMetadata, type ContextInspectionPage } from './inspection.js';
 import {
@@ -88,6 +92,8 @@ export interface ContextPolicy {
     | Promise<readonly HistorySourceRef[]>;
 }
 export interface ContextAdmissionInput {
+  readonly materialDependencies?: readonly MaterialUseDependency[];
+  readonly skillReferences?: readonly SkillReference[];
   readonly outputReservation?: number | undefined;
   readonly cut: HistorySourceCut;
   readonly entries: readonly SessionBranchEntry[];
@@ -107,6 +113,8 @@ export type ContextAdmission = (input: ContextAdmissionInput) => Promise<{
   readonly renewal?: { readonly selection: ContextSelection; readonly cause: 'capacity' | 'prefix_incompatibility' };
 }>;
 export interface ContextServiceOptions {
+  readonly materials?: Omit<ScopedMaterialServiceOptions, 'history' | 'sessionRepository' | 'session' | 'assertWrite' | 'sessionArtifacts'>;
+  readonly skills?: SkillCatalog;
   readonly withStateOwnership?: <T>(operation: () => Promise<T>) => Promise<T>;
   readonly assertStateWrite?: (batch: SessionStateBatch | SessionStateBatchCommit) => Promise<void>;
   readonly inspectOperational?: (page?: ContextOperationalInspectionPage) => Promise<SessionOperationalInspection>;
@@ -124,6 +132,9 @@ export function captureContextCapabilities(context: ContextService, value: Conte
 }
 
 export class ContextService {
+  /** Canonical local and granted shared material authority, including durable revocation. */
+  readonly materials: ScopedMaterialService;
+  readonly skills: SkillCatalog | undefined;
   readonly resourcePolicy: Required<ContextResourcePolicy>;
   // Disposable negative filter. Authorization always comes from the cut-pinned repository page.
   private stateSearchIndex = new HistorySearchIndex<{ readonly position: { at: number; sequence: number; entryId: string } }>();
@@ -149,6 +160,8 @@ export class ContextService {
         artifacts: options.artifacts
       });
     this.selectedMetadataCache = new SelectedHistoryMetadata(this.history);
+    this.materials = new ScopedMaterialService({ ...(options.materials ?? { artifacts: options.artifacts }), history: this.history, sessionArtifacts: options.artifacts, sessionRepository: options.repository, session: options.session, assertWrite: batch => this.assertStateWrite(batch) });
+    this.skills = options.skills;
 
   }
   /** Construct governed context capabilities with this service's owned storage. */
@@ -160,12 +173,15 @@ export class ContextService {
     cut ??= await this.history.capture();
     const pending = await this.options.repository.pendingSubmissionSummaries(this.options.session);
     const window = await this.history.selectedContext(cut);
+    await this.assertSelectionAvailable(window?.selection ?? { retained: [] }, cut);
     const capacity = this.capacity();
     const retainedBytes = await this.options.repository.committedRetainedStateBytes(this.options.session);
     const selection = window
       ? {
           retained: window.selection.retained,
           sessionState: window.selection.sessionState ?? [],
+          materials: window.selection.materials ?? [],
+          skills: window.selection.skills ?? [],
           artifacts: window.selection.artifacts ?? [],
           ...(window.selection.excerpts ? { excerpts: window.selection.excerpts } : {}),
           ...(window.selection.protected ? { protected: window.selection.protected } : {}),
@@ -336,6 +352,8 @@ export class ContextService {
     cut: HistorySourceCut,
     change: {
       readonly sessionState?: readonly SessionStateItemRef[] | undefined;
+      readonly materials?: readonly QualifiedMaterialRef[] | undefined;
+      readonly skills?: readonly SkillReference[] | undefined;
       readonly artifacts?: readonly ContextArtifactSelection[] | undefined;
       readonly excerpts?: readonly HistorySourceExcerpt[] | undefined;
       readonly recentFrom?: HistorySourceRef | undefined;
@@ -380,6 +398,8 @@ export class ContextService {
       change.excerpts ?? view.contextWindow?.selection.excerpts ?? [], [...retained.values()], cut);
     return {
       sessionState: change.sessionState ?? view.contextWindow?.selection.sessionState ?? [],
+      materials: change.materials ?? view.contextWindow?.selection.materials ?? [],
+      skills: change.skills ?? view.contextWindow?.selection.skills ?? [],
       artifacts: change.artifacts ?? view.contextWindow?.selection.artifacts ?? [],
       ...(excerpts.length ? { excerpts } : {}),
       retained: await this.history.orderSources([...retained.values()], cut),
@@ -517,7 +537,9 @@ export class ContextService {
     const outputReservation = request.outputReservation ?? window?.outputReservation;
     const sameView = outputReservation === window?.outputReservation && sameSelection &&
       hashJson(request.selection.sessionState ?? []) === hashJson(window?.selection.sessionState ?? []) &&
-      hashJson(request.selection.artifacts ?? []) === hashJson(window?.selection.artifacts ?? []);
+      hashJson(request.selection.artifacts ?? []) === hashJson(window?.selection.artifacts ?? []) &&
+      hashJson(request.selection.materials ?? []) === hashJson(window?.selection.materials ?? []) &&
+      hashJson(request.selection.skills ?? []) === hashJson(window?.selection.skills ?? []);
     const freshReset = requiredRenewal || !sameSelection;
     const plannedSelection: ContextSelection = {
       ...request.selection,
@@ -560,7 +582,7 @@ export class ContextService {
           limit: this.resourcePolicy.maxSourceBytes,
           observedAtLeast: sourceBytes
         });
-      if (entry.type === 'context_transition' || entry.type === 'session_state_batch' || entry.type === 'tool_catalog_selection')
+      if (entry.type === 'context_transition' || entry.type === 'session_state_batch' || entry.type === 'session_material_revocation' || entry.type === 'tool_catalog_selection')
         throw new Error(
           'context_admission_failed: session state and window records are not selectable conversational contributions.'
         );
@@ -612,7 +634,7 @@ export class ContextService {
         cut.throughEntryId
       );
       for await (const entry of snapshot.entries)
-        if (!['branch', 'model_settings', 'context_transition', 'session_state_batch', 'tool_catalog_selection'].includes(entry.type) &&
+        if (!['branch', 'model_settings', 'context_transition', 'session_state_batch', 'session_material_revocation', 'tool_catalog_selection'].includes(entry.type) &&
             !retained.has(entry.entryId))
           throw new Error(
             'context_admission_failed: omitted history has no authorized available read capability.'
@@ -621,7 +643,8 @@ export class ContextService {
     if (request.sessionState && !await this.history.extendsCut(request.sessionState.capturedHistoryCut, cut))
       throw new Error('Session-state capture is not an ancestor of the transition boundary.');
     const sessionState = await this.selectedSessionState(request.selection.sessionState ?? [], cut, request.sessionState);
-    const artifacts = await this.selectedArtifacts(request.selection.artifacts ?? []);
+    const optional = await this.prepareMaterialSelection(request.selection, options.signal, request.sessionState);
+    const artifacts = [...await this.selectedArtifacts(request.selection.artifacts ?? []), ...optional.items];
     const pending = await this.options.repository.loadPendingSubmissions(this.options.session);
     const bytes = Buffer.byteLength(
       JSON.stringify({
@@ -653,6 +676,8 @@ export class ContextService {
       selection: plannedSelection,
       sessionState,
       artifacts,
+      materialDependencies: optional.materialDependencies,
+      skillReferences: optional.skillReferences,
       strategy,
       ...(options.signal ? { signal: options.signal } : {})
     });
@@ -677,6 +702,13 @@ export class ContextService {
       throw new PersistenceConflictError(
         'Context source boundary changed during request admission.'
       );
+    await this.assertMaterialUse(optional);
+    const materialPublication = await this.materials.capturePublicationAuthority(optional.materialDependencies, request.sessionState?.revisions.flatMap(item => item.artifactSources ?? []) ?? []);
+    const skillCatalog = this.skills;
+    const publication = optional.skillReferences.length && skillCatalog ? {
+      ...materialPublication,
+      withAuthority: <T>(operation: () => Promise<T>) => materialPublication.withAuthority(() => skillCatalog.withAvailable(optional.skillReferences, operation, options.signal))
+    } : materialPublication;
     const timestamp = new Date().toISOString();
     const windowId = randomUUID();
     if (request.sessionState) await this.assertStateWrite(request.sessionState);
@@ -714,7 +746,7 @@ export class ContextService {
           : { requestedSourceRevision: request.expectedSourceRevision }),
         committedAt: timestamp
       }
-    }, withOwnership ? { withOwnership } : undefined);
+    }, { ...(withOwnership ? { withOwnership } : {}), materialPublication: publication });
   }
   private async assertStateWrite(batch: SessionStateBatch | SessionStateBatchCommit): Promise<void> {
     const validate = this.runtime?.assertStateWrite ?? this.options.assertStateWrite;
@@ -724,7 +756,10 @@ export class ContextService {
 
   async stageSessionState(batch: SessionStateBatch): Promise<SessionStateBatchCommit> {
     batch = sessionStateBatchSchema.parse(batch);
+    if (batch.owner.kind !== 'session' || batch.owner.sessionId !== this.options.session.id || batch.owner.branchId !== batch.branchId)
+      throw new Error('Shared material cannot participate in a session-local save-and-activate transaction. Save it independently first.');
     await this.assertStateWrite(batch);
+    await this.materials.authorizeProvenance(batch);
     const cut = await this.history.capture();
     if (cut.branchId !== batch.branchId || cut.sessionId !== batch.capturedHistoryCut.sessionId)
       throw new PersistenceConflictError('Session-state batch belongs to another branch.');
@@ -738,6 +773,9 @@ export class ContextService {
   /** Saves durable understanding without compiling or activating a successor request. */
   async saveSessionState(batch: SessionStateBatch) {
     batch = sessionStateBatchSchema.parse(batch);
+    if (batch.owner.kind === 'scope') {
+      return this.materials.save(batch);
+    }
     const prior = await this.options.repository.findSessionStateBatch(this.options.session, batch.idempotencyKey);
     if (prior) {
       if (prior.fingerprint !== hashJson(batch)) throw new PersistenceConflictError('Session-state idempotency key has conflicting content.');
@@ -746,7 +784,17 @@ export class ContextService {
     const staged = await this.stageSessionState(batch);
     await this.assertStateWrite(staged);
     const withOwnership = this.runtime?.withStateOwnership ?? this.options.withStateOwnership;
-    return this.options.repository.saveSessionState(this.options.session, staged, withOwnership ? { withOwnership } : undefined);
+    const dependencies = await this.materials.captureDependencies(staged.revisions.flatMap(item => item.dependencies ?? []));
+    const materialPublication = await this.materials.capturePublicationAuthority(dependencies, staged.revisions.flatMap(item => item.artifactSources ?? []));
+    try {
+      return await this.options.repository.saveSessionState(this.options.session, staged, { ...(withOwnership ? { withOwnership } : {}), materialPublication });
+    } catch (error) {
+      let committed;
+      try { committed = await this.materials.findSavedBatch(batch); }
+      catch (cause) { throw new Error('Session material publication outcome requires reconciliation.', { cause }); }
+      if (committed) return committed;
+      throw error;
+    }
   }
 
   /** Caller-provided page boundaries must remain ancestors of the authorized cut. */
@@ -759,15 +807,14 @@ export class ContextService {
 
   async listSessionState(request: SessionStatePageRequest = {}, authorizedCut?: HistorySourceCut) {
     const cut = authorizedCut ?? await this.history.capture();
-    const cursor = decodeStatePageCursor(cut.sessionId, request);
-    const leafId = cursor ? cursor.leafId : request.leafId === undefined ? cut.throughEntryId : request.leafId;
-    await this.validateStateReadBoundary(leafId, cut);
-    const { limit, maxBytes } = statePageLimits(request);
-    return boundedStateResult(await this.options.repository.listSessionState(this.options.session, { ...request, leafId, limit, maxBytes }), maxBytes);
+    await this.history.validateCut(cut);
+    if (request.leafId !== undefined) await this.validateStateReadBoundary(request.leafId, cut);
+    const page = await this.materials.list({ kind: 'session', sessionId: cut.sessionId, branchId: cut.branchId }, { ...request, leafId: request.leafId === undefined ? cut.throughEntryId : request.leafId }, cut);
+    return { ...page, items: page.items.map(({ itemId, revisionId, contentBytes, contentSha256, preview }) => ({ itemId, revisionId, contentBytes, contentSha256, ...(preview === undefined ? {} : { preview }) })) };
   }
 
-  async searchSessionState(input: { readonly query: string; readonly cursor?: string; readonly limit?: number;
-    readonly maxBytes?: number; readonly maxScannedBytes?: number; readonly cut?: HistorySourceCut }) {
+  async searchSessionState(input: { readonly query: string; readonly cursor?: string | undefined; readonly limit?: number | undefined;
+    readonly maxBytes?: number | undefined; readonly maxScannedBytes?: number | undefined; readonly cut?: HistorySourceCut | undefined }) {
     const { query, limit, maxBytes, maxScannedBytes } = sessionStateSearchSchema.parse({ query: input.query, cursor: input.cursor,
       limit: input.limit, maxBytes: input.maxBytes, maxScannedBytes: input.maxScannedBytes });
     const cut = input.cut ?? await this.history.capture();
@@ -784,12 +831,51 @@ export class ContextService {
     }
     await this.validateStateReadBoundary(leafId, cut);
     const resume = (next: string | undefined) => Buffer.from(JSON.stringify({ sessionId: cut.sessionId, branchId: cut.branchId, query, leafId, ...(next ? { cursor: next } : {}) })).toString('base64url');
-    const matches: { itemId: string; revisionId: string; range: { offset: number; bytes: number }; excerptRange: { offset: number; bytes: number }; excerpt: string }[] = [];
+    return this.searchStored({ query, limit, maxBytes, maxScannedBytes, cursor, resume,
+      list: async cursor => this.listSessionState({ leafId, ...(cursor ? { cursor } : {}), limit: 1, maxBytes: 16 * 1024 }, cut),
+      read: item => this.materials.readForSearch({ owner: { kind: 'session', sessionId: cut.sessionId, branchId: cut.branchId }, itemId: item.itemId, revisionId: item.revisionId }, maxScannedBytes)
+    });
+  }
+
+  async searchMaterials(owner: MaterialOwner, input: { readonly query: string; readonly cursor?: string | undefined; readonly limit?: number | undefined; readonly maxBytes?: number | undefined; readonly maxScannedBytes?: number | undefined }) {
+    owner = materialOwnerSchema.parse(owner);
+    const service = this.materials;
+    // Authorization precedes cursor contents, identifiers, counts and cached negative filters.
+    const boundary = await service.captureBoundary(owner);
+    const { query, limit, maxBytes, maxScannedBytes } = sessionStateSearchSchema.parse(input);
+    let cursor: string | undefined;
+    if (input.cursor) {
+      if (Buffer.byteLength(input.cursor) > SESSION_STATE_RETRIEVAL_LIMITS.maxCursorBytes) throw new Error('Material-search cursor exceeds its byte bound.');
+      const parsed = materialSearchCursorSchema.parse(JSON.parse(Buffer.from(input.cursor, 'base64url').toString('utf8')));
+      if (hashJson(parsed.owner) !== hashJson(owner) || parsed.query !== query || hashJson(parsed.boundary) !== hashJson(boundary))
+        throw new Error('Material-search cursor belongs to a changed query, owner or authority boundary.');
+      cursor = parsed.cursor;
+    }
+    const resume = (next: string | undefined) => Buffer.from(JSON.stringify({ owner, query, boundary, ...(next ? { cursor: next } : {}) })).toString('base64url');
+    const result = await this.searchStored({ query, limit, maxBytes, maxScannedBytes, cursor, resume,
+      list: async cursor => service.list(owner, { ...(cursor ? { cursor } : {}), limit: 1, maxBytes: 16 * 1024 }),
+      read: async item => service.readForSearch({ owner, itemId: item.itemId, revisionId: item.revisionId }, maxScannedBytes)
+    });
+    if (hashJson(await service.captureBoundary(owner)) !== hashJson(boundary)) throw new Error('Material authority changed during search.');
+    return result;
+  }
+
+  /** One literal-search implementation and disposable negative index for every eligible owner. */
+  private async searchStored(input: {
+    readonly query: string; readonly limit: number; readonly maxBytes: number; readonly maxScannedBytes: number;
+    readonly cursor: string | undefined;
+    readonly resume: (next: string | undefined) => string;
+    readonly list: (cursor: string | undefined) => Promise<{ readonly items: readonly { readonly owner?: MaterialOwner; readonly itemId: string; readonly revisionId: string; readonly contentBytes: number }[]; readonly cursor?: string | undefined; readonly coverage: 'complete' | 'partial' }>;
+    readonly read: (item: { readonly itemId: string; readonly revisionId: string }) => Promise<string>;
+  }) {
+    const { query, limit, maxBytes, maxScannedBytes, resume, list, read } = input;
+    let cursor = input.cursor;
+    const matches: { owner?: MaterialOwner; itemId: string; revisionId: string; range: { offset: number; bytes: number }; excerptRange: { offset: number; bytes: number }; excerpt: string }[] = [];
     let scannedBytes = 0, visited = 0, indexed = 0, candidates = 0;
     const result = (next: string | undefined, complete: boolean, items = matches) => ({ matches: items, scannedBytes, visited, indexed, candidates,
       occurrence: 'first_per_item' as const, coverage: complete ? 'complete' as const : 'partial' as const, ...(complete ? {} : { cursor: resume(next) }) });
     while (visited < SESSION_STATE_RETRIEVAL_LIMITS.maxLimit && matches.length < limit) {
-      const page = await this.listSessionState({ leafId, ...(cursor ? { cursor } : {}), limit: 1, maxBytes: 16 * 1024 }, cut);
+      const page = await list(cursor);
       const item = page.items[0];
       if (!item) {
         if (page.cursor === cursor && page.coverage === 'partial') throw new Error('State inventory did not advance.');
@@ -798,7 +884,8 @@ export class ContextService {
         visited++;
         continue;
       }
-      let indexedSource = this.indexedStateRevisions.get(item.revisionId);
+      const indexKey = hashJson({ owner: item.owner ?? null, revisionId: item.revisionId });
+      let indexedSource = this.indexedStateRevisions.get(indexKey);
       let text: string | undefined;
       const candidate = !indexedSource || this.stateSearchIndex.mayMatch(indexedSource, query);
       if (candidate) {
@@ -816,16 +903,15 @@ export class ContextService {
           const partial = { ...result(cursor, false), unsearched: { itemId: item.itemId, revisionId: item.revisionId, requiredBytes: item.contentBytes } };
           return boundedStateResult(Buffer.byteLength(JSON.stringify(partial)) <= maxBytes ? partial : result(cursor, false), maxBytes);
         }
-        const revision = await this.options.repository.readSessionStateItem(this.options.session, { itemId: item.itemId, revisionId: item.revisionId }, leafId);
-        text = decodeUtf8(await this.options.artifacts.readVerified(revision.contentRef));
+        text = await read(item);
         scannedBytes += item.contentBytes; candidates++;
         if (!indexedSource) {
           // Bound retained derived work, including tiny revisions; no bodies are retained.
           if (this.indexedStateBytes + item.contentBytes > 16 * 1024 * 1024 || this.indexedStateRevisions.size >= 16384) {
             this.stateSearchIndex = new HistorySearchIndex(); this.indexedStateRevisions.clear(); this.indexedStateBytes = 0;
           }
-          indexedSource = { position: { at: this.indexedStateRevisions.size, sequence: 0, entryId: item.revisionId } };
-          this.stateSearchIndex.add(indexedSource, text); this.indexedStateRevisions.set(item.revisionId, indexedSource);
+          indexedSource = { position: { at: this.indexedStateRevisions.size, sequence: 0, entryId: indexKey } };
+          this.stateSearchIndex.add(indexedSource, text); this.indexedStateRevisions.set(indexKey, indexedSource);
           this.indexedStateBytes += item.contentBytes; indexed++;
         }
       }
@@ -838,7 +924,7 @@ export class ContextService {
         const suffix = Array.from(text.slice(at + query.length, at + query.length + 321)).slice(0, 160).join('');
         const offset = Buffer.byteLength(prefix), bytes = Buffer.byteLength(query);
         const excerpt = start + query + suffix;
-        const match = { itemId: item.itemId, revisionId: item.revisionId, range: { offset, bytes },
+        const match = { ...(item.owner ? { owner: item.owner } : {}), itemId: item.itemId, revisionId: item.revisionId, range: { offset, bytes },
           excerptRange: { offset: offset - Buffer.byteLength(start), bytes: Buffer.byteLength(excerpt) }, excerpt };
         const candidatePage = { ...result(page.cursor, page.coverage === 'complete', [...matches, match]), visited: visited + 1 };
         if (Buffer.byteLength(JSON.stringify(candidatePage)) > maxBytes) {
@@ -872,6 +958,7 @@ export class ContextService {
     refs = Object.freeze(refs.map(ref => sessionStateItemRefSchema.parse(ref)));
     cut ??= await this.history.capture();
     await this.validateStateReadBoundary(cut.throughEntryId, cut);
+    const dependencies = await this.materials.captureDependencies(refs.filter(ref => !staged?.revisions.some(item => item.itemId === ref.itemId && item.revisionId === ref.revisionId)).map(ref => ({ ...ref, owner: { kind: 'session' as const, sessionId: cut.sessionId, branchId: cut.branchId } })));
     let bytes = 0;
     const items = [];
     const seen = new Set<string>();
@@ -886,7 +973,8 @@ export class ContextService {
       const size = ref.range?.bytes ?? revision.contentBytes;
       bytes += size;
       if (bytes > maxBytes) throw sessionStateLimitError('state_read', maxBytes, bytes, 'Selected session-state material exceeds the bounded read limit.');
-      const range = await this.options.artifacts.readVerifiedRange(revision.contentRef, { offset, length: size });
+      const readRange = () => this.options.artifacts.readVerifiedRange(revision.contentRef, { offset, length: size });
+      const range = dependencies.length ? await this.materials.withDependencies(dependencies, readRange) : await readRange();
       if (range.offset !== offset || range.end !== offset + size) throw new Error('Session-state selection range is not an exact UTF-8 span.');
       const text = decodeUtf8(range.bytes);
       sessionStateTextRange(text, 0, size);
@@ -908,6 +996,7 @@ export class ContextService {
   }> {
     cut ??= await this.history.capture();
     const refs = (await this.history.selectedContext(cut))?.selection.sessionState ?? [];
+    await this.assertSelectionAvailable({ retained: [], sessionState: refs }, cut);
     const selected = [];
     let bytes = 0;
     for (const ref of refs) {
@@ -927,23 +1016,119 @@ export class ContextService {
   async listSelectedSessionState(request: SessionStatePageRequest = {}, authorizedCut?: HistorySourceCut) {
     const authority = authorizedCut ?? await this.history.capture();
     let cut = authority;
+    const owner = { kind: 'session' as const, sessionId: cut.sessionId, branchId: cut.branchId };
+    const boundary = await this.materials.captureBoundary(owner);
     let offset = 0;
     if (request.cursor) {
       if (Buffer.byteLength(request.cursor) > SESSION_STATE_RETRIEVAL_LIMITS.maxCursorBytes) throw new Error('Selected-state cursor exceeds its byte bound.');
       const cursor = selectedStateCursorSchema.parse(JSON.parse(Buffer.from(request.cursor, 'base64url').toString('utf8')));
-      if (cursor.cut.sessionId !== cut.sessionId || cursor.cut.branchId !== cut.branchId) throw new Error('Selected-state cursor belongs to another branch.');
+      if (cursor.cut.sessionId !== cut.sessionId || cursor.cut.branchId !== cut.branchId || hashJson(cursor.boundary) !== hashJson(boundary)) throw new Error('Selected-state cursor belongs to another branch or authority boundary.');
       cut = cursor.cut; offset = cursor.offset;
     }
     await this.validateStateReadBoundary(cut.throughEntryId, authority);
     await this.history.validateCut(cut);
     const refs = (await this.history.selectedContext(cut))?.selection.sessionState ?? [];
+    await this.assertSelectionAvailable({ retained: [], sessionState: refs }, cut);
     if (offset > refs.length) throw new Error('Selected-state cursor exceeds the selected inventory.');
     const { limit, maxBytes } = statePageLimits(request);
     return fitStatePage(refs.slice(offset, offset + limit), values => {
       const next = offset + values.length;
       return { items: values, totalCount: refs.length, coverage: next === refs.length ? 'complete' as const : 'partial' as const,
-        ...(next < refs.length ? { cursor: Buffer.from(JSON.stringify({ cut, offset: next })).toString('base64url') } : {}) };
+        ...(next < refs.length ? { cursor: Buffer.from(JSON.stringify({ cut, boundary, offset: next })).toString('base64url') } : {}) };
     }, maxBytes);
+  }
+
+  listMaterialScopes(page: SessionStatePageRequest = {}) {
+    return this.materials.listScopes(page);
+  }
+  listMaterials(owner: MaterialOwner, page: SessionStatePageRequest = {}) {
+    return this.materials.list(materialOwnerSchema.parse(owner), page);
+  }
+  readMaterial(ref: QualifiedMaterialRef, maxBytes = this.resourcePolicy.sessionStateReadBytes) {
+    return this.materials.read(qualifiedMaterialRefSchema.parse(ref), { maxBytes });
+  }
+
+  private async assertSelectionAvailable(selection: ContextSourceSelection, cut: HistorySourceCut): Promise<void> {
+    const refs = [...(selection.materials ?? []), ...(selection.sessionState ?? []).map(ref => ({ ...ref, owner: { kind: 'session' as const, sessionId: cut.sessionId, branchId: cut.branchId } }))];
+    if (refs.length) {
+      await this.materials.captureDependencies(refs);
+    }
+    if (selection.skills?.length) {
+      if (!this.skills) throw new Error('Selected skills are unavailable under current host grants.');
+      await this.skills.assertAvailable(selection.skills);
+    }
+  }
+
+  /** Dependencies describe every retained byte, including deselected native-prefix material. */
+  async assertMaterialUse(use: Pick<RequestPresentation, 'materialDependencies' | 'skillReferences'>): Promise<void> {
+    if (use.materialDependencies?.length) {
+      await this.materials.assertDependencies(use.materialDependencies);
+    }
+    if (use.skillReferences?.length) {
+      if (!this.skills) throw new Error('Selected skills have no current host source.');
+      await this.skills.assertAvailable(use.skillReferences);
+    }
+  }
+
+  /** Hold host grants and revocation publication through request launch, never generation settlement. */
+  async withMaterialUse<T>(use: Pick<RequestPresentation, 'materialDependencies' | 'skillReferences'>, operation: () => Promise<T>): Promise<T> {
+    await this.assertMaterialUse(use);
+    const skillCatalog = this.skills, materialService = this.materials;
+    const skills = () => {
+      if (!use.skillReferences?.length) return operation();
+      if (!skillCatalog) throw new Error('Selected skills have no current host source.');
+      return skillCatalog.withAvailable(use.skillReferences, operation);
+    };
+    if (!use.materialDependencies?.length) return skills();
+    return materialService.withDependencies(use.materialDependencies, skills);
+  }
+
+  private preparedMaterial: { readonly key: string; readonly value: Awaited<ReturnType<ContextService['prepareMaterialSelectionUncached']>> } | undefined;
+  async prepareMaterialSelection(selection: ContextSourceSelection, signal?: AbortSignal, staged?: SessionStateBatchCommit) {
+    const key = hashJson({ materials: selection.materials ?? [], skills: selection.skills ?? [], sessionState: selection.sessionState ?? [], staged: staged?.fingerprint ?? null });
+    if (this.preparedMaterial?.key === key) {
+      throwIfAborted(signal);
+      await this.assertMaterialUse(this.preparedMaterial.value);
+      return this.preparedMaterial.value;
+    }
+    const value = await this.prepareMaterialSelectionUncached(selection, signal, staged);
+    this.preparedMaterial = { key, value };
+    return value;
+  }
+  private async prepareMaterialSelectionUncached(selection: ContextSourceSelection, signal?: AbortSignal, staged?: SessionStateBatchCommit) {
+    const refs = selection.materials ?? [];
+    const skillReferences = selection.skills ?? [];
+    if (skillReferences.length && !this.skills) throw new Error('No skill sources are granted.');
+    const cut = await this.history.capture();
+    const localRefs = (selection.sessionState ?? []).filter(ref => !staged?.revisions.some(item => item.itemId === ref.itemId && item.revisionId === ref.revisionId)).map(ref => ({ ...ref, owner: { kind: 'session' as const, sessionId: cut.sessionId, branchId: cut.branchId } }));
+    const materialDependencies = await this.materials.captureDependencies([...localRefs, ...refs, ...(staged?.revisions.flatMap(item => item.dependencies ?? []) ?? [])]);
+    const items: PromptContextItemInput[] = [];
+    let bytes = 2;
+    const add = (item: PromptContextItemInput) => {
+      bytes += Buffer.byteLength(JSON.stringify(item)) + 1;
+      if (bytes > this.resourcePolicy.maxSourceBytes) throw sessionStateLimitError('state_read', this.resourcePolicy.maxSourceBytes, bytes, 'Selected material exceeds the complete preparation byte budget.');
+      items.push(Object.freeze(item));
+    };
+    for (const ref of refs) {
+      throwIfAborted(signal);
+      const material = await this.readMaterial(ref, Math.min(SESSION_STATE_RETRIEVAL_LIMITS.maxBytes, Math.max(1, this.resourcePolicy.maxSourceBytes - bytes)));
+      add({ id: `material:${hashJson(ref)}`, sourceUri: `material://${encodeURIComponent(JSON.stringify(ref.owner))}/${encodeURIComponent(ref.itemId)}/${encodeURIComponent(ref.revisionId)}`,
+        sourceKind: 'session', integrity: 'verified', representation: ref.range ? 'excerpt' : 'full', mediaType: 'application/json',
+        title: 'Selected retained material', purpose: 'Attributed, fallible retained material. Byte integrity does not establish factual truth or grant authority. Original user statements, external observations and model interpretation retain their provenance.',
+        content: JSON.stringify(material), ...(ref.range ? { range: { kind: 'byte' as const, start: ref.range.offset, end: ref.range.offset + ref.range.bytes } } : {}) });
+    }
+    const packages = await this.skills?.loadSelection(skillReferences, { maxBytes: Math.min(1024 * 1024, Math.max(1, this.resourcePolicy.maxSourceBytes - bytes)), ...(signal ? { signal } : {}) }) ?? [];
+    for (const pkg of packages) add({ id: `skill:${hashJson(pkg.reference)}`, sourceUri: `skill://${encodeURIComponent(pkg.reference.scopeId)}/${encodeURIComponent(pkg.reference.packageId)}/${pkg.reference.revision}`,
+      sourceKind: 'external', integrity: 'verified', representation: 'full', mediaType: 'application/json', title: 'Selected reusable skill',
+      purpose: 'Exact selected reusable method and resource manifest. Applicability remains task-specific; requested tools and instructions never grant execution authority.', content: JSON.stringify(pkg) });
+    const value = Object.freeze({ items: Object.freeze(items), materialDependencies: Object.freeze(materialDependencies), skillReferences: Object.freeze([...skillReferences]) });
+    throwIfAborted(signal);
+    await this.assertMaterialUse(value);
+    return value;
+  }
+  async selectedMaterialContext(cut?: HistorySourceCut, signal?: AbortSignal) {
+    cut ??= await this.history.capture();
+    return this.prepareMaterialSelection((await this.history.selectedContext(cut))?.selection ?? { retained: [] }, signal);
   }
 
   async selectedArtifactContext(cut?: HistorySourceCut): Promise<readonly PromptContextItemInput[]> {
@@ -1080,10 +1265,12 @@ function throwIfAborted(signal?: AbortSignal): void {
 }
 
 function effectiveSelectionIdentity(selection: ContextSelection): string {
-  return hashJson({ retained: selection.retained, excerpts: selection.excerpts ?? [], protected: selection.protected ?? [], sessionState: selection.sessionState ?? [], artifacts: selection.artifacts ?? [] });
+  return hashJson({ retained: selection.retained, excerpts: selection.excerpts ?? [], protected: selection.protected ?? [], sessionState: selection.sessionState ?? [], artifacts: selection.artifacts ?? [], materials: selection.materials ?? [], skills: selection.skills ?? [] });
 }
 
 const stateSearchCursorSchema = z.strictObject({ sessionId: z.string().min(1), branchId: z.string().min(1), query: z.string().min(1),
   leafId: z.string().nullable(), cursor: z.string().optional() });
 
-const selectedStateCursorSchema = z.strictObject({ cut: historyCutSchema, offset: z.int().nonnegative() });
+const selectedStateCursorSchema = z.strictObject({ cut: historyCutSchema, boundary: z.strictObject({ grantRevision: z.string().min(1), revocationRevision: z.int().nonnegative() }), offset: z.int().nonnegative() });
+
+const materialSearchCursorSchema = z.strictObject({ owner: materialOwnerSchema, query: z.string().min(1), boundary: z.strictObject({ grantRevision: z.string().min(1), revocationRevision: z.int().nonnegative() }), cursor: z.string().optional() });

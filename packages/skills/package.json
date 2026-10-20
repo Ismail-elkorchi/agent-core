@@ -1,0 +1,26 @@
+{
+  "name": "@agent-core/skills",
+  "version": "0.2.0",
+  "description": "Bounded, immutable Agent Skills packages without execution or permission grants.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./node": "./dist/node.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24.8.0"
+  },
+  "dependencies": {
+    "@agent-core/json": "0.2.0",
+    "@agent-core/persistence": "0.2.0",
+    "yaml": "^2.8.1",
+    "zod": "^4.4.3",
+    "@agent-core/tools-local": "0.2.0"
+  }
+}

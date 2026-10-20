@@ -116,8 +116,9 @@ may require scanning every body. Partial coverage and oversized unread items are
 explicit; a first item larger than the scan allowance refuses with the required size.
 
 `ContextService.saveSessionState(batch)` is the corresponding host save API.
-Supply the branch, idempotency key, recorded originating inference, captured
-history cut, and operations; an owned attribution validator is required.
+Supply the explicit session owner `{ kind: "session", sessionId, branchId }`,
+producing branch, idempotency key, recorded originating inference, captured history
+cut, and operations; an owned attribution validator is required.
 `listSessionState`, `readSessionState`, and `searchSessionState` retrieve storage.
 `sessionState()` returns only the committed selected view, not all saved heads.
 `SessionStateSnapshot` contains `id` and selected `items`; each selected item
@@ -142,6 +143,91 @@ The retained revision allowance is not an artifact-store disk quota. Failed
 staging/admission can leave unreachable content-addressed artifacts; physical
 artifact storage policy belongs to the host’s `ArtifactRepository`. No policy
 silently truncates saved text or discards stored revisions to make a view fit.
+
+## Material scopes and reusable skills
+
+A host can supply shared `ContextServiceOptions.materials` and optional `skills`.
+`ContextService.materials` is always the same canonical authority for local and
+shared operations. Local revocation is durable in the session journal even when
+shared-scope configuration is absent after restart. Material scopes
+are explicit grants, independent of a coding workspace or the subject of a note.
+`ScopedMaterialService` uses the same item staging, immutable revision, conditional
+update and bounded retrieval contracts as session state. Shared owners use
+`EventMaterialRepository` or `JsonlMaterialRepository`; the host supplies its grant
+provider and attribution/transfer policy. In-memory grants are process-lifetime
+authority: their opaque effective revisions deliberately change when reconstructed.
+A durable host grant provider must preserve its own revisions and revocation fences.
+
+`context_material_scopes` discovers granted scopes. The canonical
+`context_state_list`, `context_state_search` and `context_state_read` operations
+accept an explicit owner; omission selects the current session at the tool boundary.
+An exact reference includes `owner`, `itemId`, `revisionId`, and an optional UTF-8
+range. Discovery cannot disclose another scope's identifiers, previews or counts.
+A cursor binds its authority and snapshot; changed grants, revocation or inventory
+boundaries can require restarting discovery rather than silently mixing results.
+
+`context_state_save` accepts an owner for shared material. The ordinary tool
+boundary supplies the current session owner when saving local state. A host-level
+batch always supplies its owner explicitly. The producing inference and captured
+history remain attributable even when the target has a longer lifetime. Declared
+cross-owner history, material and artifact provenance requires host transfer
+authority. A citation is not permission to share its source. Declared artifact provenance
+also requires an explicit revisioned artifact-authority capability; a read callback
+without a publication/dispatch fence is insufficient.
+
+Shared saves survive later failed activation. `context_save_and_activate` remains
+session-local; it does not imitate a distributed transaction across owners. Select
+saved shared revisions through the existing `context_transition` `materials` field.
+Omitting a selection retains it; an explicitly committed empty array removes its
+active applicability. Neither operation deletes original records.
+
+Revocation withdraws future use of exact revisions and declared derivatives.
+Dispatch checks include dependencies retained in an older provider prefix, even
+when those items were later deselected. A revoked prefix requires a legal fresh
+continuation or refusal before dispatch. The native continuous-turn transport
+cannot currently hold this authority fence through its send boundary; requests
+with revocable material use the ordinary governed launch where supported, or fail
+explicitly. Required provider continuity is never silently discarded.
+
+Physical erasure is a separate optional host capability. Targets must already be
+revoked so old compiled requests cannot deliver retained text. An erasure receipt
+reports bodies, previews, indexes, caches, shared retained bytes and unsupported
+coverage. Session history, original request snapshots and previous provider
+copies have separate retention rules. A host without erasure support rejects the
+operation; it never reports a tombstone as deletion.
+
+`SkillCatalog` from `@agent-core/skills` provides bounded package discovery,
+exact instruction loading and resource reads. `context_skill_scopes` discovers
+readable scope identifiers without opening package bodies; denied scopes remain
+undisclosed and transient inspection failures report incomplete coverage.
+`context_skill_discover`,
+`context_skill_read` and `context_skill_resource_read` expose those capabilities
+through ordinary authorization. The `skills` transition field selects exact
+scope/package/revision/binding references. Skill content remains attributed
+reference material. Permission metadata never adds tools or approvals. Reading a
+script does not run it; execution requires an existing governed tool.
+
+The filesystem skill adapter uses the existing Linux rooted-file authority and
+fails explicitly on platforms where that confinement is unavailable. Portable
+sources can implement the same catalog contract. Loaded old revisions remain
+exact; after restart, a filesystem package that no longer provides a selected
+revision is unavailable rather than silently replaced with newer instructions.
+
+## Optional contextual recall
+
+`AgentContextProvider` receives an abort signal, deadline, item/byte budget and
+captured request boundary. It returns owned `items` and optional exact material or
+skill `candidates`. These suggestions are inert until explicitly selected. An
+empty suggestion page does not clear an existing selection. Accepted inputs and
+runtime obligations do not depend on optional retrieval.
+
+Failure, timeout, stale input or exceeded bounds produce a diagnostic; they do not
+claim that no relevant memory exists. Suppliers must stop work when cancelled. Each runtime bounds unsettled optional
+collection work; a supplier or validator that ignores cancellation prevents a new
+attempt for that owner until it settles, rather than accumulating orphan work.
+Candidate validation and the final boundary check occur before publication. Hosts
+can replace the recall policy without introducing another active context or agent
+loop. The runtime does not require periodic re-anchoring, reflection or summaries.
 
 ## Context transitions and renewal
 

@@ -56,7 +56,7 @@ test('stateless archived runs restore the selected item view and preserve correc
   let current;
   const update = async (id, text) => {
     const cut = await history.capture();
-    const staged = await context.stageSessionState({ idempotencyKey: id, branchId: cut.branchId,
+    const staged = await context.stageSessionState({ idempotencyKey: id, owner: { kind: 'session', sessionId: cut.sessionId, branchId: cut.branchId }, branchId: cut.branchId,
       capturedHistoryCut: cut, inference: { ownerId: 'owner', invocationId: id, requestRef },
       operations: [current ? { kind: 'replace', itemId: current.itemId,
         expectedRevisionId: current.revisionId, text } : { kind: 'create', text }] });

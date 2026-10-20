@@ -18,7 +18,7 @@ async function fixture() {
   const refs = entries.map(entry => sourceRef(session.id, entry));
   const requestRef = await artifacts.storeProtected({ label: 'inference', content: Buffer.from('{}') });
   const batch = (cut, operations, idempotencyKey = `state-${cut.sourceRevision}`) => ({ idempotencyKey,
-    branchId: cut.branchId, capturedHistoryCut: cut, operations,
+    owner: { kind: 'session', sessionId: cut.sessionId, branchId: cut.branchId }, branchId: cut.branchId, capturedHistoryCut: cut, operations,
     inference: { ownerId: 'owner', invocationId: idempotencyKey, requestRef } });
   return { repository, session, artifacts, history, context, refs, batch };
 }

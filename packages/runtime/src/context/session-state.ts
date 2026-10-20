@@ -16,6 +16,7 @@ export async function stageSessionStateBatch(input: {
   readonly committedRetainedBytes: number;
 }): Promise<SessionStateBatchCommit> {
   const batch = sessionStateBatchSchema.parse(input.batch);
+  if (batch.owner.kind === 'session' && (batch.owner.sessionId !== batch.capturedHistoryCut.sessionId || batch.owner.branchId !== batch.branchId)) throw new Error('Session-owned material must target its producing session branch.');
   if (batch.branchId !== batch.capturedHistoryCut.branchId) throw new Error('Session-state batch branch disagrees with inference capture.');
   await input.history.validateCut(batch.capturedHistoryCut);
   const fingerprint = hashJson(batch);
@@ -25,14 +26,20 @@ export async function stageSessionStateBatch(input: {
   if (materializedBytes > input.maxMutationBytes) throw sessionStateLimitError('mutation_preparation', input.maxMutationBytes, materializedBytes, 'Session-state batch exceeds the mutation preparation byte limit.');
   for (const [index, operation] of batch.operations.entries()) {
     const itemId = operation.kind === 'create'
-      ? sessionStateItemIdentity(batch.branchId, fingerprint, index) : operation.itemId;
+      ? sessionStateItemIdentity(batch.owner, fingerprint, index) : operation.itemId;
     if (touched.has(itemId)) throw new Error('A session-state batch may touch an item only once.');
     touched.add(itemId);
     let text: string;
     let sources;
+    let subject;
+    let dependencies;
+    let artifactSources;
     if (operation.kind === 'create' || operation.kind === 'replace') {
       text = operation.text;
       sources = operation.sources;
+      subject = operation.subject;
+      dependencies = operation.dependencies;
+      artifactSources = operation.artifactSources;
     } else if (operation.kind === 'remove') text = '';
     else {
       const current = await input.current(itemId);
@@ -43,6 +50,9 @@ export async function stageSessionStateBatch(input: {
       const prior = decodeUtf8(await input.artifacts.readVerified(current.contentRef));
       text = applySessionStateEdits(prior, operation.edits);
       sources = current.sources;
+      subject = current.subject;
+      dependencies = current.dependencies;
+      artifactSources = current.artifactSources;
     }
     if (operation.kind !== 'create') assertSessionStateItemRevision(await input.current(itemId), operation.expectedRevisionId, itemId);
     for (const source of sources ?? [])
@@ -51,6 +61,7 @@ export async function stageSessionStateBatch(input: {
     materializedBytes += Buffer.byteLength(text);
     if (materializedBytes > input.maxMutationBytes) throw sessionStateLimitError('mutation_preparation', input.maxMutationBytes, materializedBytes, 'Session-state batch exceeds the mutation preparation byte limit.');
     drafts.push(Object.freeze({
+      owner: batch.owner, ...(artifactSources ? { artifactSources } : {}), ...(subject === undefined ? {} : { subject }), ...(dependencies ? { dependencies } : {}),
       itemId, revisionId: sessionStateRevisionIdentity(fingerprint, index),
       previousRevisionId: operation.kind === 'create' ? null : operation.expectedRevisionId,
       text, ...(text ? { preview: statePreview(text) } : {}), contentSha256: hashArtifactBytes(Buffer.from(text)), contentBytes: Buffer.byteLength(text),
@@ -58,7 +69,7 @@ export async function stageSessionStateBatch(input: {
       inference: batch.inference, capturedHistoryCut: batch.capturedHistoryCut
     }));
   }
-  const metadata = { idempotencyKey: batch.idempotencyKey, branchId: batch.branchId, inference: batch.inference, capturedHistoryCut: batch.capturedHistoryCut };
+  const metadata = { owner: batch.owner, idempotencyKey: batch.idempotencyKey, branchId: batch.branchId, inference: batch.inference, capturedHistoryCut: batch.capturedHistoryCut };
   const lowerBound = drafts.reduce((sum, revision) => sum + revision.contentBytes, 0) + Buffer.byteLength(JSON.stringify({
     ...metadata, fingerprint, maxStorageBytes: input.maxStorageBytes,
     revisions: drafts.map(draft => Object.fromEntries(Object.entries(draft).filter(([key]) => key !== 'text')))

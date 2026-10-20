@@ -20,7 +20,7 @@ async function fixture(t, kind) {
     policy: { maxSourceBytes: 65536, historyRead: { history, isAvailable: () => true } } });
   const requestRef = await artifacts.storeProtected({ label: 'inference', content: Buffer.from('{}') });
   const cut = await history.capture();
-  const receipt = await context.saveSessionState({ idempotencyKey: 'original', branchId: cut.branchId,
+  const receipt = await context.saveSessionState({ idempotencyKey: 'original', owner: { kind: 'session', sessionId: cut.sessionId, branchId: cut.branchId }, branchId: cut.branchId,
     capturedHistoryCut: cut, inference: { ownerId: 'owner', invocationId: 'inference', requestRef },
     operations: [{ kind: 'create', text: 'Exact interpretation 文😀' }] });
   const update = async (id, refs = receipt.revisions) => context.transition({

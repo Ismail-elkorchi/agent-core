@@ -9,3 +9,8 @@ export { SessionHistoryIndexError, SessionHistorySourceError, SessionHistoryInde
 export type { HistoryIndexRebuildOptions, HistoryIndexRecoveryOptions, HistoryIndexRecoveryProgress } from './session/history-index.js';
 
 export { JsonlCollaborationRepository } from './collaboration/repository-node.js';
+export { JsonlIntentionRepository } from './intentions/repository-node.js';
+export type { JsonlIntentionRepositoryOptions } from './intentions/repository-node.js';
+
+export { JsonlMaterialRepository } from './material/repository-node.js';
+export type { JsonlMaterialRepositoryOptions } from './material/repository-node.js';

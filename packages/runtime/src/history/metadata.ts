@@ -12,13 +12,14 @@ export function historyToolName(entry: SessionBranchEntry): string | undefined {
 }
 
 /** Authorship is separate from user-role framing in provider protocols. */
-export function historyInputAuthorship(entry: SessionBranchEntry): 'model' | undefined {
-  return (entry.type === 'input' || entry.type === 'steering') && entry.originalInput?.origin ? 'model' : undefined;
+export function historyInputAuthorship(entry: SessionBranchEntry): 'model' | 'host' | undefined {
+  const origin = entry.type === 'input' || entry.type === 'steering' ? entry.originalInput?.origin : undefined;
+  return origin?.kind === 'host_wake' ? 'host' : origin ? 'model' : undefined;
 }
 
 export function historyMetadataRole(metadata: Pick<SessionSourceMetadata, 'type' | 'inputAuthorship'>): HistoryItem['role'] {
   return metadata.type === 'input' || metadata.type === 'steering'
-    ? metadata.inputAuthorship === 'model' ? 'assistant' : 'user'
+    ? metadata.inputAuthorship === 'host' ? 'control' : metadata.inputAuthorship === 'model' ? 'assistant' : 'user'
     : metadata.type === 'assistant' || metadata.type === 'tool_call' || metadata.type === 'peer_contribution' ? 'assistant'
     : metadata.type === 'observation' ? 'tool' : 'control';
 }
