@@ -2,6 +2,7 @@ import type { ToolCall, ToolEffects, ToolObservation, ToolProgress } from '@agen
 import type { ActivityDetail, ConversationActivityEntry } from './conversation.js';
 export interface ToolActivity extends ConversationActivityEntry {
   readonly activity: 'tool';
+  readonly toolName: string;
 }
 
 interface ExistingActivity {
@@ -61,6 +62,7 @@ export function completedSessionToolActivity(
     id: sessionObservationActivityId(entry),
     kind: 'activity',
     activity: 'tool',
+    toolName: entry.toolName,
     label: current?.label ?? humanize(entry.toolName),
     status: entry.originalUnavailable
       ? 'warning'
@@ -108,6 +110,7 @@ export function pendingToolActivity(
     id,
     kind: 'activity',
     activity: 'tool',
+    toolName: call.name,
     label: presentation?.label ?? humanize(call.name),
     status: 'running',
     summary: 'Waiting to run',
@@ -125,6 +128,7 @@ export function runningToolActivity(
     id,
     kind: 'activity',
     activity: 'tool',
+    toolName: call.name,
     label: presentation?.label ?? humanize(call.name),
     status: 'running',
     summary: 'Running',
@@ -145,6 +149,7 @@ export function updatedToolActivity(
     id,
     kind: 'activity',
     activity: 'tool',
+    toolName,
     label: current?.label ?? humanize(toolName),
     status: 'running',
     summary:
@@ -186,6 +191,7 @@ export function completedToolActivity(
     id,
     kind: 'activity',
     activity: 'tool',
+    toolName,
     label: current?.label ?? humanize(toolName),
     status:
       observation.kind === 'failure'

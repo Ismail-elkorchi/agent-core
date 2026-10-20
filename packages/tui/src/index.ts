@@ -190,6 +190,14 @@ export type {
 } from './context.js';
 
 export * from './conversation-view.js';
+export {
+  projectConversationDisplay,
+  ConversationGroupingPresentation,
+  conversationDisplayKey,
+  type ActivityGroupingOptions,
+  type ConversationActivityGroup,
+  type ConversationDisplayEntry
+} from './activity-grouping.js';
 
 export * from './chrome.js';
 

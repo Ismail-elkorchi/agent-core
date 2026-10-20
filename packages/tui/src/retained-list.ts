@@ -80,17 +80,18 @@ export class RetainedListPresentation<Entry extends { readonly id: string }, Mes
   render(
     entries: readonly Entry[],
     expanded: readonly string[],
-    key: string,
+    key: string | ((entry: Entry) => string),
     render: (entry: Entry) => Element<Message>
   ): readonly Element<Message>[] {
     const retained = new Map<string, RetainedElement<Entry, Message>>();
     const result = entries.map((entry) => {
+      const entryKey = typeof key === 'function' ? key(entry) : key;
       const cached = this.elements.get(entry.id);
       const isExpanded = expanded.includes(entry.id);
       const item =
-        cached?.entry === entry && cached.expanded === isExpanded && cached.key === key
+        cached?.entry === entry && cached.expanded === isExpanded && cached.key === entryKey
           ? cached
-          : { entry, expanded: isExpanded, key, element: render(entry) };
+          : { entry, expanded: isExpanded, key: entryKey, element: render(entry) };
       retained.set(entry.id, item);
       return item.element;
     });

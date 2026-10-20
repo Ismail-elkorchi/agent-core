@@ -27,6 +27,22 @@ Prompt recall owns one search index per entry snapshot and prepares queries thro
 
 `conversationEntryView` shares role labels, reasoning disclosure, interrupted-output labels and tool details across applications. `responsiveStatusline` fits complete configured fields, prioritizing authority and activity. The activity clock measures display elapsed time only; runtime events remain authoritative for execution and accounting. Context inspection exposes the effective source selection, including exchanges after the last explicit transition; Apply selection uses the existing transition without forcing renewal. Correlated unchanged, committed, and rejected outcomes settle pending actions; unchanged updates do not claim a new window. Runtime-selected fresh context uses the selected originals and exact selected state revisions, while compatible updates preserve continuation.
 
+`projectConversationDisplay` groups adjacent settled tool activities using an
+application-supplied classifier over exact tool identities. It keeps original
+members, never groups active/error/uncertain rows, and counts calls rather than
+inferring effects. `preserveIds` keeps individually inspected entries and reading
+anchors separately addressable. Groups use synthetic `activity-group:<first-member-id>`
+identities so group-relative row offsets cannot be mistaken for member-relative
+offsets. A preserved synthetic group ID establishes its start boundary when older
+history is prepended. History bookmark adapters resolve that ID to its first
+canonical member for the source cursor while retaining the synthetic anchor and
+disclosure preferences for restoration. `ConversationGroupingPresentation` retains only
+the current derived groups so unchanged members can reuse renderer measurements;
+it is a presentation cache, not recorded state. `conversationDisplayEntryView`
+supports group disclosure followed by individual call disclosure. Applications
+must include nested disclosure state in their retained rendering identity and
+keep canonical conversation entries as the source for history and inspection.
+
 External editor commands (`VISUAL`, then `EDITOR`) must remain running until all
 of their editor children have finished; use a GUI editor's `--wait` option where
 needed. Wrappers that wait for their editor are supported, but daemonizing or

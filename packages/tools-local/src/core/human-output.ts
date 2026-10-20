@@ -70,6 +70,8 @@ export function renderLocalToolObservation(
       if (output.failures.length)
         content += `\n${output.failures.map((failure) => `${failure.path}: ${failure.message}`).join('\n')}`;
       if (output.coverage === 'partial') content += '\nCoverage: partial';
+      if (output.coverage === 'partial' || output.failures.length > 0 || output.files.some((file) => file.truncated))
+        status = 'warning';
       break;
     }
     case 'search_text': {
@@ -85,6 +87,12 @@ export function renderLocalToolObservation(
               )
       ).join('\n');
       content += `\nResult coverage: ${output.resultCoverage}`;
+      if (output.countCoverage === 'partial') content += '\nCount coverage: partial';
+      if (output.status !== 'completed') content += `\nSearch status: ${output.status}`;
+      if (output.diagnostic !== undefined) content += `\n${output.diagnostic}`;
+      if (output.status !== 'completed' || output.resultCoverage === 'partial' ||
+          output.countCoverage === 'partial' || output.outputTruncated || output.countsCapped)
+        status = 'warning';
       break;
     }
     case 'apply_patch':
@@ -140,6 +148,10 @@ export function renderLocalToolObservation(
           : findFilesOutputSchema.parse(observation.output);
       content = output.entries.map((entry) => entry.path).join('\n');
       content += `\nCoverage: ${output.coverage}`;
+      if (output.coverage === 'partial') {
+        status = 'warning';
+        if (output.causes.length > 0) content += `\n${output.causes.join(', ')}`;
+      }
       break;
     }
     default:

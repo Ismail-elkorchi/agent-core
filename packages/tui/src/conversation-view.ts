@@ -7,7 +7,37 @@ import {
   type InlineContent
 } from '@ismail-elkorchi/terminal-ui/components';
 import { type ConversationEntry, type ConversationReferenceEntry } from './conversation.js';
+import type { ConversationDisplayEntry } from './activity-grouping.js';
+import { column } from '@ismail-elkorchi/terminal-ui/layout';
 import type { MarkdownDocument } from './markdown.js';
+
+/** Display groups use the same exact typed details as their original activity rows. */
+export function conversationDisplayEntryView<Message extends ComponentMessage>(
+  entry: ConversationDisplayEntry,
+  options: Parameters<typeof conversationEntryView<Message>>[1] & {
+    readonly expandedIds?: readonly string[];
+  }
+): Element<Message> {
+  if (entry.kind !== 'activity-group') return conversationEntryView(entry, options);
+  return disclosure({
+    id: entry.id,
+    label: '✓ Completed tools',
+    summary: [{ kind: 'text', text: entry.summary }],
+    expanded: options.expanded,
+    onTransition: () => options.onToggle(entry.toggleId),
+    slots: {
+      content: column(entry.members.map((member) => {
+        const id = `activity-member:${member.id}`;
+        return conversationEntryView(member, {
+          ...options,
+          elementId: id,
+          expanded: options.expandedIds?.includes(id) ?? false,
+          onToggle: () => options.onToggle(id)
+        });
+      }))
+    }
+  });
+}
 
 /** Shared display of recorded facts; expansion never changes their stored or model-facing form. */
 export function conversationEntryView<Message extends ComponentMessage>(
@@ -15,6 +45,8 @@ export function conversationEntryView<Message extends ComponentMessage>(
   options: {
     readonly width: number;
     readonly expanded: boolean;
+    /** Presentation-only identity for a nested copy; source identities remain unchanged. */
+    readonly elementId?: string;
     readonly markdown: (id: string, source: string) => MarkdownDocument;
     readonly onToggle: (id: string) => Message;
     readonly onInspect: (entry: ConversationReferenceEntry) => Message;
@@ -22,7 +54,7 @@ export function conversationEntryView<Message extends ComponentMessage>(
 ): Element<Message> {
   if (entry.kind === 'reference')
     return button({
-      id: entry.id,
+      id: options.elementId ?? entry.id,
       label: `Read recorded entry · ${String(entry.bytes)} bytes`,
       onPress: () => options.onInspect(entry)
     });
@@ -31,20 +63,13 @@ export function conversationEntryView<Message extends ComponentMessage>(
       entry.status
     ];
     return disclosure({
-      id: entry.id,
+      id: options.elementId ?? entry.id,
       label: `${glyph} ${entry.label}`,
       ...(entry.summary === undefined ? {} : { summary: [{ kind: 'text', text: entry.summary }] }),
       expanded: options.expanded,
       slots: {
         content: richText({
-          segments: (entry.details ?? []).flatMap(
-            (detail): InlineContent => [
-              ...(detail.format === 'diff'
-                ? patchSegments(detail.content)
-                : [{ kind: 'text' as const, text: detail.content }]),
-              { kind: 'text', text: '\n\n' }
-            ]
-          ),
+          segments: activitySegments(entry.details),
           wrap: { preserveWords: true }
         })
       },
@@ -97,6 +122,17 @@ export function conversationEntryView<Message extends ComponentMessage>(
     segments: [...segments, { kind: 'text', text: '\n' }],
     wrap: { preserveWords: true }
   });
+}
+
+function activitySegments(details: import('./conversation.js').ConversationActivityEntry['details']): InlineContent {
+  return (details ?? []).flatMap(
+    (detail): InlineContent => [
+      ...(detail.format === 'diff'
+        ? patchSegments(detail.content)
+        : [{ kind: 'text' as const, text: detail.content }]),
+      { kind: 'text', text: '\n\n' }
+    ]
+  );
 }
 
 /** Coloring never changes patch text; additions and removals retain their literal prefixes. */

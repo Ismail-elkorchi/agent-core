@@ -70,6 +70,8 @@ export interface ConversationActivityEntry extends ConversationIdentity {
   readonly id: string;
   readonly kind: 'activity';
   readonly activity: string;
+  /** Exact tool identity, independent of the human-readable label. */
+  readonly toolName?: string;
   readonly label: string;
   readonly status: 'running' | 'complete' | 'success' | 'warning' | 'failed';
   readonly summary?: string;
@@ -210,6 +212,7 @@ function progressEntries(
           id: toolActivityId({ ...event, runId }),
           kind: 'activity',
           activity: 'tool',
+          toolName: event.toolName,
           label: event.toolName,
           status: 'warning',
           summary: `${event.original.summary} Original observation unavailable: ${event.original.message}`,
@@ -415,6 +418,7 @@ export function projectToolDiagnostics(
       runId: diagnostic.runId,
       kind: 'activity',
       activity: 'tool',
+      toolName: diagnostic.toolName,
       label: current?.kind === 'activity' ? current.label : diagnostic.toolName,
       status: diagnostic.observation.kind === 'failure' ? 'failed' : 'warning',
       summary: diagnostic.observation.summary,

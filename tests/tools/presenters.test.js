@@ -50,6 +50,7 @@ test('file content preserves large admissible source text and edit preconditions
     failedFiles: 0,
     returnedBytes: Buffer.byteLength(source)
   };
+  assert.equal(renderLocalToolObservation('read_files', { kind: 'result', output }).status, 'warning');
   const parts = content(readFilesTool, output);
   assert.ok(parts.some((part) => part.type === 'text' && part.text === source));
   assert.match(serializeToolModelContent(parts), /fullFileSha256|nextStartLine/);
@@ -140,6 +141,7 @@ test('overlapping search context appears once in continuous source passages with
   assert.match(parts[1].text, /"a" lines 29-32; match byte ranges by line: 30: 0-6; 31: 0-6/);
   assert.match(parts[0].text, /"resultCoverage":"partial","countCoverage":"complete"/);
   assert.match(parts[0].text, /"omittedResultCount":2/);
+  assert.equal(renderLocalToolObservation('search_text', { kind: 'result', output }).status, 'warning');
   const human = renderLocalToolObservation('search_text', { kind: 'result', output }).details[0].content;
   assert.equal(human.split('needle α').length - 1, 1);
 });
@@ -198,4 +200,34 @@ test('tool schemas describe search-relative globs and expose only supported life
   assert.match(searchTextTool.jsonSchema.properties.path.description, /do not bound traversal/);
   assert.equal(execCommandTool.jsonSchema.properties.lifetime, undefined);
   assert.match(execCommandTool.jsonSchema.properties.outputTokenBudget.description, /excerpts or pages/);
+});
+
+
+test('exploration presentation distinguishes incomplete coverage from legitimate empty results', () => {
+  const search = {
+    query: 'absent', status: 'completed', mode: 'files', results: [],
+    resultCoverage: 'complete', countCoverage: 'complete', examinedFileCount: 2,
+    matchingFileCount: 0, matchingLineCount: 0, occurrenceCount: 0, omittedResultCount: 0,
+    countsCapped: false, omittedResultCountIsLowerBound: false, outputTruncated: false,
+    perFileOmissions: []
+  };
+  assert.equal(renderLocalToolObservation('search_text', { kind: 'result', output: search }).status, undefined);
+  assert.equal(renderLocalToolObservation('search_text', { kind: 'result', output: { ...search, countCoverage: 'partial' } }).status, 'warning');
+  const interrupted = renderLocalToolObservation('search_text', { kind: 'result', output: { ...search, status: 'aborted', diagnostic: 'Cancelled before completion.' } });
+  assert.equal(interrupted.status, 'warning');
+  assert.match(interrupted.details[0].content, /Cancelled before completion/);
+  const list = {
+    path: '.', entries: [], coverage: 'complete', causes: [],
+    counts: { visited: 0, returned: 0, omitted: { count: 0, relation: 'exact' } },
+    omitted: { ignoreFiles: { count: 0, relation: 'exact' } }, omissions: [], omissionSamples: []
+  };
+  for (const [name, output] of [
+    ['list_directory', { ...list, depth: { requested: 1, effective: 1, hostMaximum: 10 } }],
+    ['find_files', { ...list, hostMaximumDepth: 10, patterns: ['**/*'] }]
+  ]) {
+    assert.equal(renderLocalToolObservation(name, { kind: 'result', output }).status, undefined);
+    const partial = renderLocalToolObservation(name, { kind: 'result', output: { ...output, coverage: 'partial', causes: ['unreadable'] } });
+    assert.equal(partial.status, 'warning');
+    assert.match(partial.details[0].content, /unreadable/);
+  }
 });
